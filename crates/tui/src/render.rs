@@ -4982,6 +4982,20 @@ fn draw_link_picker(f: &mut Frame, app: &App) {
 /// `active` controls whether the focused row is highlighted (a form
 /// embedded in a pane whose focus is elsewhere passes `false`).
 fn form_field_lines(form: &crate::form::Form, t: Theme, active: bool) -> Vec<Line<'static>> {
+    form_field_lines_in(form, t, active, usize::MAX)
+}
+
+/// Field rows wrapped to `width` columns: a note that does not fit beside its
+/// value continues on the next line UNDER the note column, not at the modal's
+/// left edge (driven live 2026-09-05: "http://10.0.0.2:8080/v1 — or leave
+/// empty" ran on from column 0 and read as a second field).
+fn form_field_lines_in(
+    form: &crate::form::Form,
+    t: Theme,
+    active: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
     let mut lines: Vec<Line> = Vec::new();
     for (i, field) in form.fields.iter().enumerate() {
         let focused = active && i == form.focused;
@@ -5023,18 +5037,38 @@ fn form_field_lines(form: &crate::form::Form, t: Theme, active: bool) -> Vec<Lin
                 Style::default().fg(if focused { t.accent } else { t.text }),
             ),
         ];
+        let value_width: usize = value_spans.iter().map(|sp| sp.content.width()).sum();
         spans.extend(value_spans);
+        let mut continuation: Vec<Line> = Vec::new();
         if let Some(note) = &field.note {
-            spans.push(Span::styled(
-                format!("  {note}"),
-                Style::default().fg(t.muted),
-            ));
+            // "  ▸ " + the 18-column label + the value, then two spaces.
+            let note_col = 4 + 18 + value_width + 2;
+            let room = width.saturating_sub(note_col);
+            let pieces = if room >= 12 {
+                wrap_plain(note, room)
+            } else {
+                vec![note.clone()]
+            };
+            let mut pieces = pieces.into_iter();
+            if let Some(first) = pieces.next() {
+                spans.push(Span::styled(
+                    format!("  {first}"),
+                    Style::default().fg(t.muted),
+                ));
+            }
+            for piece in pieces {
+                continuation.push(Line::from(vec![
+                    Span::raw(" ".repeat(note_col)),
+                    Span::styled(piece, Style::default().fg(t.muted)),
+                ]));
+            }
         }
         let mut row = Line::from(spans);
         if focused {
             row = row.style(Style::default().add_modifier(Modifier::REVERSED));
         }
         lines.push(row);
+        lines.extend(continuation);
     }
     lines
 }
@@ -5051,16 +5085,18 @@ fn draw_form_pane(f: &mut Frame, app: &App) {
     // other overlay, so it cannot land on the prompt box or the sidebar.
     let screen = f.area();
     let full = overlay_bounds(screen, false);
-    let height = (form.fields.len() as u16 + 5).min(full.height);
     let width = (screen.width * 64 / 100).max(40).min(full.width);
-    let x = full.x + (full.width.saturating_sub(width)) / 2;
-    let y = full.y + (full.height.saturating_sub(height)) / 2;
-    let area = Rect::new(x, y, width, height);
-    f.render_widget(Clear, area);
 
+    // The modal is as tall as its lines. A fixed fields+5 cut the key hints
+    // off the bottom whenever one note wrapped.
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));
-    lines.extend(form_field_lines(form, t, true));
+    lines.extend(form_field_lines_in(
+        form,
+        t,
+        true,
+        width.saturating_sub(2) as usize,
+    ));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         format!(
@@ -5069,6 +5105,11 @@ fn draw_form_pane(f: &mut Frame, app: &App) {
         ),
         Style::default().fg(t.muted),
     )));
+    let height = (lines.len() as u16 + 2).min(full.height);
+    let x = full.x + (full.width.saturating_sub(width)) / 2;
+    let y = full.y + (full.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+    f.render_widget(Clear, area);
 
     let para = Paragraph::new(lines)
         .style(Style::default().bg(t.overlay_bg))

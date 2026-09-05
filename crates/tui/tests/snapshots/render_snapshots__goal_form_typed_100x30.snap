@@ -1,6 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1749
+assertion_line: 1783
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
@@ -11,15 +11,15 @@ expression: rendered
                                                                    │
                                                                    │
                                                                    │
-                                                                   │
  ┌ Set goal ────────────────────────────────────────────────────┐  │
  │                                                              │  │
  │  ▸ Standing goal     map the NiTi phase diagram  sent to the │  │
- │agent each turn; empty clears                                 │  │
+ │                                                  agent each  │  │
+ │                                                  turn; empty │  │
+ │                                                  clears      │  │
  │                                                              │  │
+ │  ↑↓ move · Space/←→ adjust · ↵ set goal · Esc                │  │
  └──────────────────────────────────────────────────────────────┘  │
-                                                                   │
-                                                                   │
                                                                    │
                                                                    │
                                                                    │

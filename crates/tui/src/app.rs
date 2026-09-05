@@ -7796,6 +7796,44 @@ mod tests {
         assert!(last.contains("never parses"), "{last}");
     }
 
+    /// Driven live 2026-09-05: the fallback form's long notes ran on from the
+    /// modal's left edge and the key-hint footer was cut off the bottom.
+    #[test]
+    fn a_long_field_note_wraps_under_its_column_and_the_footer_survives() {
+        let mut app = fresh();
+        app.open_fallback_add_form();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("↵ add"),
+            "the key hints must survive a wrapped note:\n{screen}"
+        );
+        for row in rows
+            .iter()
+            .filter(|r| r.contains("leave empty") || r.contains("usual variable"))
+        {
+            let after_border = row
+                .find('│')
+                .map(|i| &row[i + '│'.len_utf8()..])
+                .unwrap_or(row);
+            let indent = after_border.len() - after_border.trim_start().len();
+            assert!(
+                indent >= 6,
+                "a note line must sit under the note column, not at the edge: {row:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_key_window_offers_the_search_source_keys() {
         // "Set SEMANTIC_SCHOLAR_API_KEY for a dedicated pool" is only advice
