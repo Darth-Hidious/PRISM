@@ -139,7 +139,8 @@ DONE `2f5c97fa`: parity batch 4 — schedule list/create/cancel, discourse list/
 DONE: view panel wraps long lines (was cut at the edge).
 DONE `4078e6b0`: panels wrap at spaces. DONE (tools): MACE tier accepts every fcc/bcc/hcp element (tables derived from ASE); LPBF map's evidence class follows property_sources (unsourced → RED, gaps named).
 DONE: disk — /tmp/panel-target debug wiped (46 GB) + brew/npm/uv caches; 52 GB free.
-NEXT: remaining research items — CALPHAD provisioning honesty (Ni-base TDB), read-to-store design note, source-language note; CONTEXT.md trim at session end.
+DONE `45b8086b`: QE is a standard run — `prism provision qe` builds pw.x (7.4.1) into ~/.prism/qe + PseudoDojo set with manifest; runtime + qe_run/qe_status tools; `prism qe status|settings|run`; palette QE status/settings/run; `/tools reload` hot reload; PROMOTE + KEEP WORKING directives. Live: Si scf 4.3 s.
+NEXT: settings hub tiles; credits/tok resets; destructive → forced human approval; own-inference fallbacks; model router; SSO scope (platform side).
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
