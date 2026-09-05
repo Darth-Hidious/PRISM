@@ -146,19 +146,35 @@ pub static KEYMAP: &[KeyBinding] = &[
         category: "Workspace sidebar",
     },
     // ── Approvals ───────────────────────────────────────────────────
+    // Enter is deliberately absent: it sends messages, it never approves.
     KeyBinding {
         keys: "y",
-        description: "Approve the pending tool",
+        description: "Allow the pending call",
         category: "Approvals",
     },
     KeyBinding {
         keys: "a",
-        description: "Allow all tools for this session",
+        description: "Allow the tool for the session (a destructive call: this call only)",
         category: "Approvals",
     },
     KeyBinding {
         keys: "n",
-        description: "Deny the pending tool",
+        description: "Deny the pending call",
+        category: "Approvals",
+    },
+    KeyBinding {
+        keys: "Esc",
+        description: "Deny the pending call — the outcome that changes nothing",
+        category: "Approvals",
+    },
+    KeyBinding {
+        keys: "type yes",
+        description: "Unlock a destructive call — y is accepted only after the field matches",
+        category: "Approvals",
+    },
+    KeyBinding {
+        keys: "↑↓ / PgUp PgDn",
+        description: "Scroll the arguments block",
         category: "Approvals",
     },
     // ── Input editing ───────────────────────────────────────────────

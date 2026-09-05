@@ -1640,9 +1640,10 @@ fn tool_start_still_pushes_same_visible_behavior() {
     });
     let last = app.messages.last().unwrap();
     assert!(matches!(last.role, Role::Tool));
-    // The visible text is still "Running sample_material" — preview is NOT
-    // shown in the current behavior (that's for the tool-card patch).
-    assert_eq!(last.text, "Running sample_material");
+    // The row names the tool AND the object of the call: the backend's
+    // preview follows a bare verb so the reader sees what is being run
+    // before the result lands.
+    assert_eq!(last.text, "Running sample_material — {...}");
 }
 
 // ── Workspace detail modal (Enter) ───────────────────────────────────

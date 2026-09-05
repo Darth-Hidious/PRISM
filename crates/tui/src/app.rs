@@ -542,6 +542,58 @@ pub struct TouchedFile {
     pub msg_index: usize,
 }
 
+/// Tools that run a cell on the notebook kernel the human shares.
+pub(crate) fn is_notebook_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "notebook_exec" | "notebook_run" | "run_python_notebook"
+    )
+}
+
+/// Render a prompt's `tool_args` for the approval popup: what the call will
+/// DO. A notebook tool shows its full cell verbatim (the kernel is shared with
+/// the human, so line two matters as much as line one); every other tool
+/// shows one `key: value` line per argument, keys sorted so the block reads
+/// the same way every time. `None` when there is nothing to show.
+fn render_tool_args(tool_name: &str, args: Option<&Value>) -> Option<String> {
+    let args = args?;
+    if is_notebook_tool(tool_name) {
+        let code = args.get("code")?.as_str()?;
+        let reset = args.get("reset").and_then(Value::as_bool).unwrap_or(false);
+        let mut preview = String::new();
+        if reset {
+            preview.push_str("[resets the shared kernel first — all variables lost]\n");
+        }
+        preview.push_str(code);
+        // NOT sanitize_for_render: that DELETES bare `\r` (which CPython runs
+        // as a newline), so hidden code could execute while the popup showed
+        // one benign line. This renderer shows the SAME line structure the
+        // kernel executes.
+        return Some(sanitize_code_for_preview(&preview));
+    }
+    let body = match args {
+        Value::Null => return None,
+        Value::Object(map) if map.is_empty() => return None,
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            keys.iter()
+                .map(|k| {
+                    let v = match &map[*k] {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    // A multi-line value keeps its lines under its key.
+                    format!("{k}: {}", v.replace('\n', "\n  "))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        other => other.to_string(),
+    };
+    Some(sanitize_code_for_preview(&body))
+}
+
 /// Tools whose results are treated as file modifications.
 pub(crate) fn is_file_tool(name: &str) -> bool {
     matches!(
@@ -842,12 +894,20 @@ pub struct App {
     /// Why THIS call must be decided by a human (destructive tripwire). While
     /// set, 'a' approves this one call and whitelists nothing.
     pub approval_reason: Option<String>,
-    /// Full code of a pending `notebook_exec` approval (from the prompt's
-    /// `tool_args`). The kernel is SHARED with the human, so the popup must
-    /// show EXACTLY what they are approving — a 60-char first-line preview
-    /// could hide `print(api_key)` on line two. `None` for other tools.
-    pub approval_code: Option<String>,
-    /// Scroll offset into the approval popup's code block.
+    /// What the pending call will DO, rendered from the prompt's `tool_args`
+    /// for the popup's scrollable block. For a notebook tool this is the full
+    /// cell code: the kernel is SHARED with the human, so the popup must show
+    /// EXACTLY what they are approving — a 60-char first-line preview could
+    /// hide `print(api_key)` on line two. For every other tool it is one
+    /// `key: value` line per argument, so the human approves a command, a
+    /// path or an object, never just a tool name. `None` when the prompt
+    /// carried no arguments.
+    pub approval_args: Option<String>,
+    /// What the human has typed into the popup's unlock field. Only a
+    /// destructive call (`approval_reason` is `Some`) has the field: `y` is
+    /// accepted once this reads `yes` or the tool's name.
+    pub approval_typed: String,
+    /// Scroll offset into the approval popup's arguments block.
     pub approval_scroll: u16,
     /// Max code-block scroll, recomputed by the renderer each frame
     /// (wrapped lines − viewport), same pattern as `view_max_scroll`.
@@ -1146,7 +1206,8 @@ impl App {
             blockers: Vec::new(),
             needs_human_modal: None,
             approval_reason: None,
-            approval_code: None,
+            approval_args: None,
+            approval_typed: String::new(),
             approval_scroll: 0,
             approval_max_scroll: std::cell::Cell::new(0),
             should_quit: false,
@@ -3104,18 +3165,33 @@ impl App {
             return;
         };
         let tool = tool.clone();
+        // Enter is deliberately NOT an answer. It is the most common key in
+        // the app (send), and a reader who finishes a sentence while a prompt
+        // is up must never approve a call by it. `y` says yes; on a
+        // destructive call `y` counts only after the unlock field matches,
+        // and until then every letter (a `y` included) is typed into the
+        // field.
+        let unlocked = self.approval_unlocked();
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            KeyCode::Char('y') | KeyCode::Char('Y') if unlocked => {
                 let _ = self.backend.send_approval("y", &tool);
                 self.clear_approval();
                 self.push_system(&format!("[approved {tool}]"));
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            // `n` denies while the field is empty; once the human has begun
+            // typing an unlock word (a tool name can contain an `n`) it is a
+            // letter, and Esc is the deny key.
+            KeyCode::Esc => {
                 let _ = self.backend.send_approval("n", &tool);
                 self.clear_approval();
                 self.push_system(&format!("[denied {tool}]"));
             }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
+            KeyCode::Char('n') | KeyCode::Char('N') if self.approval_typed.is_empty() => {
+                let _ = self.backend.send_approval("n", &tool);
+                self.clear_approval();
+                self.push_system(&format!("[denied {tool}]"));
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') if unlocked => {
                 if self.approval_reason.is_some() {
                     // A destructive call is approved once, by a human, and
                     // never turned into a standing permission.
@@ -3146,16 +3222,45 @@ impl App {
                     .saturating_add(5)
                     .min(self.approval_max_scroll.get());
             }
+            // The unlock field of a destructive call. Printable keys only;
+            // one line, so it can never grow past the popup.
+            KeyCode::Backspace if self.approval_reason.is_some() => {
+                self.approval_typed.pop();
+            }
+            KeyCode::Char(c)
+                if self.approval_reason.is_some()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && self.approval_typed.chars().count() < 64 =>
+            {
+                self.approval_typed.push(c);
+            }
             _ => {}
         }
     }
 
-    /// Resolve the pending approval: drop the prompt, its code preview, and
-    /// the scroll state together so they can never desync.
+    /// Whether `y` may answer the pending prompt. A call without a reason is
+    /// answerable at once; a destructive call only after the human has typed
+    /// `yes` or the tool's name into the popup's field.
+    pub fn approval_unlocked(&self) -> bool {
+        let Some(_) = &self.approval_reason else {
+            return true;
+        };
+        let Some((tool, _)) = &self.approval_pending else {
+            return false;
+        };
+        let typed = self.approval_typed.trim();
+        typed.eq_ignore_ascii_case("yes") || (!tool.is_empty() && typed.eq_ignore_ascii_case(tool))
+    }
+
+    /// Resolve the pending approval: drop the prompt, its arguments, the
+    /// unlock field and the scroll state together so they can never desync.
     fn clear_approval(&mut self) {
         self.approval_pending = None;
         self.approval_reason = None;
-        self.approval_code = None;
+        self.approval_args = None;
+        self.approval_typed.clear();
         self.approval_scroll = 0;
         self.approval_max_scroll.set(0);
         self.focus = Focus::Input;
@@ -6605,11 +6710,11 @@ impl App {
                 tool_name,
                 verb,
                 agent,
+                preview,
                 ..
             } => {
                 self.clear_thinking_pulse();
-                // `..` ignores call_id, preview, approval_required —
-                // current behavior only pushes a tool-start line.
+                // `..` ignores call_id and approval_required.
                 // Sanitize tool_name and verb before formatting —
                 // both come from the backend and could contain
                 // control sequences.
@@ -6621,11 +6726,30 @@ impl App {
                 // web — …") which is displayed verbatim. Only a bare/legacy
                 // "Running" verb gets the tool name appended — appending it
                 // unconditionally produced lines like "Running web web".
-                let text = if clean_verb.is_empty() || clean_verb == "Running" {
+                let mut text = if clean_verb.is_empty() || clean_verb == "Running" {
                     format!("Running {clean_name}")
                 } else {
                     clean_verb
                 };
+                // The backend folds its `preview` (the object of the call: a
+                // command, a query, a path) into the verbs it knows, as
+                // "<verb> — <detail>". Every other tool's verb is bare, so
+                // the row would name the tool and not what it is doing.
+                // Append the preview once, clipped, so the reader sees the
+                // object before the result lands.
+                if let Some(preview) = preview.as_deref().map(sanitize_for_render)
+                    && !preview.trim().is_empty()
+                    && !text.contains(" — ")
+                {
+                    let preview = preview.trim();
+                    text.push_str(" — ");
+                    if preview.chars().count() > 80 {
+                        text.extend(preview.chars().take(79));
+                        text.push('…');
+                    } else {
+                        text.push_str(preview);
+                    }
+                }
                 self.push_message(ChatLine {
                     role: Role::Tool,
                     text,
@@ -6740,30 +6864,10 @@ impl App {
                 // the ChatLine.
                 let clean_name = sanitize_for_render(&tool_name);
                 let clean_msg = sanitize_for_render(&message);
-                // notebook_exec runs arbitrary code on the kernel SHARED with
-                // the human — surface the FULL cell in the popup so consent
-                // is informed, not "Allow notebook_exec?" blind. Other tools
-                // keep the compact prompt.
-                self.approval_code = matches!(
-                    clean_name.as_str(),
-                    "notebook_exec" | "notebook_run" | "run_python_notebook"
-                )
-                .then(|| {
-                    let args = tool_args.as_ref()?;
-                    let code = args.get("code")?.as_str()?;
-                    let reset = args.get("reset").and_then(Value::as_bool).unwrap_or(false);
-                    let mut preview = String::new();
-                    if reset {
-                        preview.push_str("[resets the shared kernel first — all variables lost]\n");
-                    }
-                    preview.push_str(code);
-                    // NOT sanitize_for_render: that DELETES bare `\r` (which
-                    // CPython runs as a newline), so hidden code could execute
-                    // while the popup showed one benign line. This renderer
-                    // shows the SAME line structure the kernel executes.
-                    Some(sanitize_code_for_preview(&preview))
-                })
-                .flatten();
+                // The popup shows WHAT the call will do, for every tool:
+                // "Allow execute_bash?" blind is a name, not a command.
+                self.approval_args = render_tool_args(&clean_name, tool_args.as_ref());
+                self.approval_typed.clear();
                 self.approval_scroll = 0;
                 self.approval_max_scroll.set(0);
                 self.approval_pending = Some((clean_name.clone(), clean_msg.clone()));
@@ -10307,6 +10411,11 @@ mod tests {
                 .contains("'rm'")
         );
 
+        // A destructive call is locked until the human types the unlock word.
+        for c in "yes".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert!(app.approval_unlocked(), "typing yes unlocks the prompt");
         app.handle_key(KeyEvent::from(KeyCode::Char('a')));
         // The fake backend answers "y" with a result card and "a" with a
         // permissions notice — so the first notification says which reply
@@ -10360,7 +10469,64 @@ mod tests {
                     + "\n"
             })
             .collect();
-        assert!(screen.contains("⚠ 'execute_bash' can write"), "{screen}");
+        assert!(
+            screen.contains("⚠ reversible: no · 'execute_bash' can write"),
+            "{screen}"
+        );
+    }
+
+    /// Enter is the most common key in the app — it sends. A reader who
+    /// finishes a sentence while a prompt is up must not approve a tool by
+    /// it. Only `y` answers yes.
+    #[test]
+    fn enter_never_answers_an_approval() {
+        let mut app = fresh();
+        app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+            tool_name: "compute_submit".into(),
+            message: "Allow compute_submit?".into(),
+            call_id: None,
+            tool_args: Some(serde_json::json!({ "image": "vasp:6.5" })),
+            tool_description: None,
+            requires_approval: Some(true),
+            permission_mode: None,
+            choices: vec![],
+            prompt_type: None,
+            reason: None,
+        });
+        app.handle_key(key(KeyCode::Enter));
+        assert!(
+            app.approval_pending.is_some(),
+            "Enter must not answer an approval prompt"
+        );
+        assert!(
+            !app.messages.iter().any(|m| m.text.contains("[approved")),
+            "nothing was approved"
+        );
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.approval_pending.is_none(), "y still allows");
+    }
+
+    /// A destructive call (the prompt carries a reason) is not approved by
+    /// Enter, nor by a bare `y`: the human types the unlock word first, and
+    /// only then does `y` send the approval.
+    #[test]
+    fn a_destructive_prompt_is_not_approved_by_enter_or_a_bare_y() {
+        let mut app = fresh();
+        app.apply_agent_msg(forced_rm_prompt());
+        app.handle_key(key(KeyCode::Enter));
+        assert!(
+            app.approval_pending.is_some(),
+            "Enter must not approve a destructive call"
+        );
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(
+            app.approval_pending.is_some(),
+            "a bare y must not approve a destructive call"
+        );
+        assert!(
+            !app.messages.iter().any(|m| m.text.contains("[approved")),
+            "nothing was approved"
+        );
     }
 
     #[test]
@@ -10754,7 +10920,7 @@ mod tests {
             reason: None,
         });
         assert_eq!(
-            app.approval_code.as_deref(),
+            app.approval_args.as_deref(),
             Some("import os\nprint(os.environ['SECRET'])"),
             "the popup must carry the FULL cell code, not a 60-char preview"
         );
@@ -10762,7 +10928,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('y')));
         assert!(app.approval_pending.is_none());
         assert!(
-            app.approval_code.is_none(),
+            app.approval_args.is_none(),
             "answering must clear the code preview with the prompt"
         );
     }
@@ -10782,7 +10948,7 @@ mod tests {
             prompt_type: None,
             reason: None,
         });
-        let preview = app.approval_code.as_deref().expect("code preview present");
+        let preview = app.approval_args.as_deref().expect("code preview present");
         assert!(
             preview.contains("resets the shared kernel"),
             "a reset=true exec must be flagged in the preview: {preview}"
@@ -10790,14 +10956,16 @@ mod tests {
         assert!(preview.contains("x = 1"));
     }
 
+    /// Every tool's prompt names the object of the call — one `key: value`
+    /// line per argument — so the human approves an action, not a name.
     #[test]
-    fn non_notebook_approval_has_no_code_preview() {
+    fn non_notebook_approval_shows_its_arguments() {
         let mut app = fresh();
         app.apply_agent_msg(AgentMsg::ApprovalPrompt {
             tool_name: "compute_submit".into(),
             message: "Allow compute_submit?".into(),
             call_id: None,
-            tool_args: Some(serde_json::json!({ "code": "not a notebook" })),
+            tool_args: Some(serde_json::json!({ "image": "vasp:6.5", "gpus": 2 })),
             tool_description: None,
             requires_approval: Some(true),
             permission_mode: None,
@@ -10805,9 +10973,111 @@ mod tests {
             prompt_type: None,
             reason: None,
         });
+        assert_eq!(
+            app.approval_args.as_deref(),
+            Some("gpus: 2\nimage: vasp:6.5"),
+            "arguments render as key: value lines"
+        );
+    }
+
+    #[test]
+    fn a_prompt_without_arguments_has_no_arguments_block() {
+        let mut app = fresh();
+        app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+            tool_name: "compute_submit".into(),
+            message: "Allow compute_submit?".into(),
+            call_id: None,
+            tool_args: None,
+            tool_description: None,
+            requires_approval: Some(true),
+            permission_mode: None,
+            choices: vec![],
+            prompt_type: None,
+            reason: None,
+        });
+        assert!(app.approval_args.is_none());
+    }
+
+    /// `n` and Esc deny a destructive call at any point; Esc even after the
+    /// human began typing the unlock word.
+    #[test]
+    fn a_destructive_prompt_is_denied_by_n_and_by_esc() {
+        let mut app = fresh();
+        app.apply_agent_msg(forced_rm_prompt());
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(app.approval_pending.is_none(), "n denies");
         assert!(
-            app.approval_code.is_none(),
-            "only notebook_exec gets the code panel"
+            app.messages
+                .iter()
+                .any(|m| m.text.contains("[denied execute_bash]")),
+            "the denial is written into the transcript"
+        );
+
+        let mut app = fresh();
+        app.apply_agent_msg(forced_rm_prompt());
+        for c in "ye".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.approval_typed, "ye");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.approval_pending.is_none(), "Esc denies mid-typing");
+        assert!(
+            app.approval_typed.is_empty(),
+            "the field is cleared with the prompt"
+        );
+    }
+
+    /// Typing the tool's name unlocks the call as `yes` does. The name here
+    /// contains an `a`, which must land in the field, not whitelist anything.
+    #[test]
+    fn the_tool_name_also_unlocks_a_destructive_call() {
+        let mut app = fresh();
+        app.apply_agent_msg(forced_rm_prompt());
+        for c in "execute_bash".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.approval_pending.is_some(), "typing alone sends nothing");
+        assert!(app.approval_unlocked());
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.approval_pending.is_none());
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.text.contains("[approved execute_bash]")),
+            "y after the unlock approves"
+        );
+    }
+
+    /// The tool-start row names the object of the call when the backend's
+    /// verb did not already: "Running sample_material — {\"n\": 10}".
+    #[test]
+    fn tool_start_row_shows_the_preview_once() {
+        let mut app = fresh();
+        app.apply_agent_msg(AgentMsg::ToolStart {
+            tool_name: "sample_material".into(),
+            verb: "Running".into(),
+            call_id: None,
+            preview: Some("{\"n\": 10}".into()),
+            approval_required: None,
+            agent: None,
+        });
+        assert_eq!(
+            app.messages.last().unwrap().text,
+            "Running sample_material — {\"n\": 10}"
+        );
+
+        // A verb that already carries its detail is not doubled.
+        app.apply_agent_msg(AgentMsg::ToolStart {
+            tool_name: "execute_bash".into(),
+            verb: "Running a command — $ ls".into(),
+            call_id: None,
+            preview: Some("$ ls".into()),
+            approval_required: None,
+            agent: None,
+        });
+        assert_eq!(
+            app.messages.last().unwrap().text,
+            "Running a command — $ ls"
         );
     }
 

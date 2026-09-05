@@ -5,19 +5,20 @@ expression: rendered
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
 · PRISM ready                                                      │ [Act] Sto Too Fil Obj Str Art
                                                                    │
-❯ You                                                              │  1. prompt "run compute" •
-▌ run compute                                                      │
-                                                                   │
-· compute_submit: Allow compute_submit?                            │
+❯ You                                                              │  1. prompt "remove the build… •
+▌ remove the build directory                                       │
                                                                    │
 ┌────────────────────────────────────────────────────────────────┐ │
 │  ⚠ APPROVAL REQUIRED                                           │ │
 │                                                                │ │
-│  Tool: compute_submit  —  Allow compute_submit?                │ │
+│  Tool: execute_bash  —  Allow execute_bash?                    │ │
+│  ⚠ reversible: no · 'execute_bash' can write and the call      │ │
+│    names 'rm'                                                  │ │
 │┌ Arguments — review before answering ─────────────────────────┐│ │
-││image: vasp:6.5                                               ││ │
+││command: rm -rf build                                         ││ │
 │└──────────────────────────────────────────────────────────────┘│ │
-│  [y] Allow   [a] Allow all   [n/Esc] Deny                      │ │
+│  unlock (type yes or execute_bash): ▏                          │ │
+│  [y] Allow once · after unlock   [n/Esc] Deny                  │ │
 └────────────────────────────────────────────────────────────────┘ │
                                                                    │
                                                                    │
@@ -25,9 +26,8 @@ expression: rendered
                                                                    │
                                                                    │
                                                                    │
-                                                                   │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
-│tool approval pending…  (y allow · a allow all · n/Esc deny)    │ │
+│approval pending…  (type yes · then y allow once · n/Esc deny)  │ │
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │

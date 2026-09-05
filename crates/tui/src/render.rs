@@ -1509,10 +1509,15 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
     } else {
         let text = app.input.lines().join(" ");
         let display = if text.is_empty() {
-            // Mode-aware hint: while an approval modal has focus, Enter
-            // approves the tool — telling the user "↵ send" there is a lie.
+            // Mode-aware hint: while an approval modal has focus, Enter does
+            // nothing (it never approves) — telling the user "↵ send" there
+            // is a lie. Spell the keys that ARE live instead.
             if app.focus == Focus::Approval {
-                "tool approval pending…  (y allow · a always allow this tool · n deny)".to_string()
+                if app.approval_reason.is_some() {
+                    "approval pending…  (type yes · then y allow once · n/Esc deny)".to_string()
+                } else {
+                    "tool approval pending…  (y allow · a allow all · n/Esc deny)".to_string()
+                }
             } else {
                 "type a message…  (press i to focus · ↵ send)".to_string()
             }
@@ -5673,13 +5678,128 @@ fn draw_needs_human_modal(f: &mut Frame, app: &App) {
 fn draw_approval_popup(f: &mut Frame, app: &App) {
     let t = app.theme();
     let (tool, message) = app.approval_pending.as_ref().unwrap();
+    let unlocked = app.approval_unlocked();
 
-    // When the prompt carries code (notebook_exec — arbitrary Python on the
-    // kernel SHARED with the human), the popup must show the WHOLE cell so
-    // the human can read exactly what they approve. Wrapped, bounded height,
-    // scrollable with ↑/↓ when it doesn't fit.
-    if let Some(code) = &app.approval_code {
-        let area = overlay_area(f, 72, 70);
+    // Header: banner, the tool and its question, and for a destructive call
+    // the answer to "can this be undone?" together with why a human is asked.
+    // Reason lines are pre-wrapped so their count is known before layout.
+    let header = |width: usize| -> Vec<Line> {
+        let mut lines = vec![
+            Line::from(vec![Span::styled(
+                "  ⚠ APPROVAL REQUIRED  ",
+                Style::default()
+                    .fg(t.overlay_bg)
+                    .bg(t.approval)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  Tool: "),
+                Span::styled(
+                    tool.clone(),
+                    Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  —  "),
+                Span::styled(message.clone(), Style::default().fg(t.text)),
+            ]),
+        ];
+        if let Some(reason) = &app.approval_reason {
+            let text = format!("reversible: no · {reason}");
+            for (i, l) in wrap_plain(&text, width.saturating_sub(4).max(8))
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if i == 0 { "  ⚠ " } else { "    " };
+                lines.push(Line::from(vec![
+                    Span::styled(lead, Style::default().fg(t.warn)),
+                    Span::styled(l, Style::default().fg(t.warn)),
+                ]));
+            }
+        }
+        lines
+    };
+
+    // The unlock field of a destructive call: one line, a cursor while it is
+    // locked and a check once the word matches. The check is a glyph, so the
+    // state reads without colour.
+    let field: Option<Line> = app.approval_reason.as_ref().map(|_| {
+        let mut spans = vec![
+            Span::styled(
+                format!("  unlock (type yes or {tool}): "),
+                Style::default().fg(t.muted),
+            ),
+            Span::styled(
+                app.approval_typed.clone(),
+                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if unlocked {
+            spans.push(Span::styled(" ✓", Style::default().fg(t.ok)));
+        } else {
+            spans.push(Span::styled("▏", Style::default().fg(t.accent)));
+        }
+        Line::from(spans)
+    });
+
+    // Legend: every live key and only live keys, for the state the popup is
+    // in. Enter is never listed because Enter never answers.
+    let legend = |scroll_hint: Option<String>| -> Line {
+        let mut hints = Vec::new();
+        match (&app.approval_reason, unlocked) {
+            (None, _) => hints.extend([
+                Span::raw("  [y] "),
+                Span::styled("Allow", Style::default().fg(t.ok)),
+                Span::raw("   [a] "),
+                Span::styled("Allow all", Style::default().fg(t.warn)),
+            ]),
+            (Some(_), true) => hints.extend([
+                Span::raw("  [y/a] "),
+                Span::styled("Allow once", Style::default().fg(t.ok)),
+            ]),
+            (Some(_), false) => hints.extend([
+                Span::raw("  [y] "),
+                Span::styled("Allow once · after unlock", Style::default().fg(t.muted)),
+            ]),
+        }
+        if app.approval_typed.is_empty() {
+            hints.extend([
+                Span::raw("   [n/Esc] "),
+                Span::styled("Deny", Style::default().fg(t.err)),
+            ]);
+        } else {
+            hints.extend([
+                Span::raw("   [Esc] "),
+                Span::styled("Deny", Style::default().fg(t.err)),
+                Span::raw("   [⌫] "),
+                Span::styled("edit", Style::default().fg(t.muted)),
+            ]);
+        }
+        if let Some(hint) = scroll_hint {
+            hints.push(Span::styled(hint, Style::default().fg(t.muted)));
+        }
+        Line::from(hints)
+    };
+
+    // When the prompt carries arguments the popup shows them ALL — a command,
+    // a path, an object, or for a notebook tool the whole cell (arbitrary
+    // Python on the kernel SHARED with the human) — so the human reads
+    // exactly what they approve. Wrapped, bounded height, scrollable with
+    // ↑/↓ when it doesn't fit.
+    if let Some(args) = &app.approval_args {
+        let mut area = overlay_area(f, 72, 70);
+        // Manual wrap so the scroll bound is exact (Paragraph::wrap gives no
+        // rendered-line count on stable ratatui). The block sits inside two
+        // borders, so its text is four columns narrower than the popup.
+        let wrapped = wrap_plain(args, area.width.saturating_sub(4).max(1) as usize);
+        let head = header(area.width.saturating_sub(2) as usize);
+        let field_rows = u16::from(field.is_some());
+        // As tall as its content, never past the bound: one argument line
+        // does not earn a dozen empty rows.
+        let wanted = 2 + head.len() as u16 + wrapped.len().max(1) as u16 + 2 + field_rows + 1;
+        if wanted < area.height {
+            area.y += (area.height - wanted) / 2;
+            area.height = wanted;
+        }
         f.render_widget(Clear, area);
 
         let outer = Block::default()
@@ -5691,49 +5811,27 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // banner + tool/message
-                Constraint::Min(3),    // code block
+                Constraint::Length(head.len() as u16),
+                Constraint::Min(3), // arguments block
+                Constraint::Length(field_rows),
                 Constraint::Length(1), // key hints
             ])
             .split(inner);
+        f.render_widget(Paragraph::new(head), rows[0]);
 
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from(vec![Span::styled(
-                    "  ⚠ APPROVAL REQUIRED  ",
-                    Style::default()
-                        .fg(t.overlay_bg)
-                        .bg(t.approval)
-                        .add_modifier(Modifier::BOLD),
-                )]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::raw("  Tool: "),
-                    Span::styled(
-                        tool.clone(),
-                        Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  —  "),
-                    Span::styled(message.clone(), Style::default().fg(t.text)),
-                ]),
-            ]),
-            rows[0],
-        );
-
-        let code_block = Block::default()
+        let title = if crate::app::is_notebook_tool(tool) {
+            " Cell code — review before answering "
+        } else {
+            " Arguments — review before answering "
+        };
+        let args_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(t.divider))
-            .title(Span::styled(
-                " Cell code — review before answering ",
-                Style::default().fg(t.muted),
-            ));
-        let code_area = code_block.inner(rows[1]);
-        f.render_widget(code_block, rows[1]);
+            .title(Span::styled(title, Style::default().fg(t.muted)));
+        let args_area = args_block.inner(rows[1]);
+        f.render_widget(args_block, rows[1]);
 
-        // Manual wrap so the scroll bound is exact (Paragraph::wrap gives no
-        // rendered-line count on stable ratatui).
-        let wrapped = wrap_plain(code, code_area.width.max(1) as usize);
-        let visible = code_area.height as usize;
+        let visible = args_area.height as usize;
         let max_scroll = wrapped.len().saturating_sub(visible) as u16;
         app.approval_max_scroll.set(max_scroll);
         let scroll = app.approval_scroll.min(max_scroll) as usize;
@@ -5743,80 +5841,33 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
             .take(visible)
             .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(t.text))))
             .collect();
-        f.render_widget(Paragraph::new(lines), code_area);
+        f.render_widget(Paragraph::new(lines), args_area);
 
-        let mut hints = vec![
-            Span::raw("  [y] "),
-            Span::styled("Allow", Style::default().fg(t.ok)),
-            Span::raw("   [a] "),
-            Span::styled("Allow all", Style::default().fg(t.warn)),
-            Span::raw("   [n] "),
-            Span::styled("Deny", Style::default().fg(t.err)),
-        ];
-        if max_scroll > 0 {
-            hints.push(Span::styled(
-                format!(
-                    "   ↑/↓ scroll code ({}/{})",
-                    scroll + visible.min(wrapped.len()),
-                    wrapped.len()
-                ),
-                Style::default().fg(t.muted),
-            ));
+        if let Some(field) = field {
+            f.render_widget(Paragraph::new(field), rows[2]);
         }
-        f.render_widget(Paragraph::new(Line::from(hints)), rows[2]);
+        let scroll_hint = (max_scroll > 0).then(|| {
+            format!(
+                "   ↑/↓ scroll ({}/{})",
+                scroll + visible.min(wrapped.len()),
+                wrapped.len()
+            )
+        });
+        f.render_widget(Paragraph::new(legend(scroll_hint)), rows[3]);
         return;
     }
 
-    // The popup is as tall as its lines: a fixed 20% of a 30-row terminal
-    // clipped everything below the tool name — the message, the reason, and
-    // the keys the reader is meant to press.
-    let width_hint = overlay_area(f, 60, 20).width.saturating_sub(4) as usize;
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  ⚠ APPROVAL REQUIRED  ",
-            Style::default()
-                .fg(t.overlay_bg)
-                .bg(t.approval)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("  Tool: "),
-            Span::styled(
-                tool,
-                Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(message, Style::default().fg(t.text)),
-        ]),
-        Line::from(""),
-    ];
-    if let Some(reason) = &app.approval_reason {
-        for (i, l) in wrap_plain(reason, width_hint.saturating_sub(2).max(8))
-            .into_iter()
-            .enumerate()
-        {
-            let lead = if i == 0 { "  ⚠ " } else { "    " };
-            lines.push(Line::from(vec![
-                Span::styled(lead, Style::default().fg(t.warn)),
-                Span::styled(l, Style::default().fg(t.warn)),
-            ]));
-        }
-    } else {
-        lines.push(Line::from(""));
+    // No arguments to show. The popup is as tall as its lines: a fixed 20% of
+    // a 30-row terminal clipped everything below the tool name — the message,
+    // the reason, and the keys the reader is meant to press.
+    let width_hint = overlay_area(f, 60, 20).width.saturating_sub(2) as usize;
+    let mut lines = vec![Line::from("")];
+    lines.extend(header(width_hint));
+    lines.push(Line::from(""));
+    if let Some(field) = field {
+        lines.push(field);
     }
-    lines.extend([Line::from(vec![
-        Span::raw("  [y] "),
-        Span::styled("Allow", Style::default().fg(t.ok)),
-        Span::raw("   [a] "),
-        Span::styled("Allow all", Style::default().fg(t.warn)),
-        Span::raw("   [n] "),
-        Span::styled("Deny", Style::default().fg(t.err)),
-    ])]);
+    lines.push(legend(None));
     let mut area = overlay_area(f, 60, 20);
     let height = (lines.len() as u16 + 2).min(f.area().height);
     area.y = area

@@ -445,6 +445,71 @@ fn snapshot_approval_required_popup_100x30() {
     insta::assert_snapshot!("approval_required_popup_100x30", rendered);
 }
 
+/// Snapshot: an `execute_bash` prompt names the command it asks about, inside
+/// the popup, and spells every live key. The human approves an action, not a
+/// tool name. Plain text: the legend must read without colour.
+#[test]
+fn snapshot_approval_execute_bash_popup_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("clean the build");
+    app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+        tool_name: "execute_bash".into(),
+        call_id: Some("call-9".into()),
+        message: "Allow execute_bash?".into(),
+        tool_args: Some(serde_json::json!({ "command": "cargo clean -p prism-tui" })),
+        tool_description: Some("Run a shell command".into()),
+        requires_approval: Some(true),
+        permission_mode: Some("full_access".into()),
+        choices: vec!["y".into(), "n".into(), "a".into()],
+        prompt_type: Some("approval".into()),
+        reason: None,
+    });
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    assert!(
+        rendered.contains("command: cargo clean -p prism-tui"),
+        "the popup must show the command being approved:\n{rendered}"
+    );
+    for legend in ["[y] Allow", "[a] Allow all", "[n/Esc] Deny"] {
+        assert!(
+            rendered.contains(legend),
+            "the legend must spell {legend}:\n{rendered}"
+        );
+    }
+    insta::assert_snapshot!("approval_execute_bash_popup_100x30", rendered);
+}
+
+/// Snapshot: a destructive `execute_bash` prompt states that the call is not
+/// reversible and why, shows the command, and asks for the unlock word before
+/// `y` is accepted.
+#[test]
+fn snapshot_approval_destructive_popup_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("remove the build directory");
+    app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+        tool_name: "execute_bash".into(),
+        call_id: Some("call-10".into()),
+        message: "Allow execute_bash?".into(),
+        tool_args: Some(serde_json::json!({ "command": "rm -rf build" })),
+        tool_description: Some("Run a shell command".into()),
+        requires_approval: Some(true),
+        permission_mode: Some("full_access".into()),
+        choices: vec!["y".into(), "n".into(), "a".into()],
+        prompt_type: Some("approval".into()),
+        reason: Some("'execute_bash' can write and the call names 'rm'".into()),
+    });
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    assert!(rendered.contains("command: rm -rf build"), "{rendered}");
+    assert!(rendered.contains("reversible: no"), "{rendered}");
+    assert!(rendered.contains("[n/Esc] Deny"), "{rendered}");
+    insta::assert_snapshot!("approval_destructive_popup_100x30", rendered);
+}
+
 /// Snapshot: `notebook_exec` approval popup shows the FULL cell code — the
 /// kernel is shared with the human, so consent must be informed (a 60-char
 /// first-line preview could hide `print(api_key)` on line two).

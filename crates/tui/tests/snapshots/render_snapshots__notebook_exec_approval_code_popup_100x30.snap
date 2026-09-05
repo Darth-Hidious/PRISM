@@ -1,34 +1,33 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 490
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
 · PRISM ready                                                      │ [Act] Sto Too Fil Obj Str Art
+                                                                   │
+❯ You                                                              │  1. prompt "analyze the data" •
+▌ analyze the data                                                 │
+                                                                   │
+· notebook_exec: Allow notebook_exec?                              │
 ┌────────────────────────────────────────────────────────────────┐ │
-│  ⚠ APPROVAL REQUIRED                                           │ │  1. prompt "analyze the data" •
+│  ⚠ APPROVAL REQUIRED                                           │ │
 │                                                                │ │
 │  Tool: notebook_exec  —  Allow notebook_exec?                  │ │
 │┌ Cell code — review before answering ─────────────────────────┐│ │
 ││import os                                                     ││ │
 ││secrets = {k: v for k, v in os.environ.items()}               ││ │
 ││print(secrets)                                                ││ │
-││                                                              ││ │
-││                                                              ││ │
-││                                                              ││ │
-││                                                              ││ │
-││                                                              ││ │
-││                                                              ││ │
-││                                                              ││ │
-││                                                              ││ │
-││                                                              ││ │
-││                                                              ││ │
 │└──────────────────────────────────────────────────────────────┘│ │
-│  [y] Allow   [a] Allow all   [n] Deny                          │ │
+│  [y] Allow   [a] Allow all   [n/Esc] Deny                      │ │
 └────────────────────────────────────────────────────────────────┘ │
                                                                    │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
-│tool approval pending…  (y allow · a always allow this tool · n │ │
+│tool approval pending…  (y allow · a allow all · n/Esc deny)    │ │
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
