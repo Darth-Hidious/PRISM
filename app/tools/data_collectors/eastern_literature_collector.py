@@ -216,10 +216,23 @@ class EasternLiteratureCollector(DataCollector):
                             deadline_s: Optional[float] = None) -> Dict:
         """Per-source outcomes alongside results, so a gated, skipped, late or
         failed source is named rather than showing up as a thinner list."""
-        if not query:
-            return {"results": [], "source_status": {}, "needs_human": []}
         sources = list(sources or self.DEFAULT_SOURCES)
         langs = self._queries_by_language(query, queries)
+        if not langs:
+            # Nothing to search with — say so per source. An empty status dict
+            # read as "the tool is broken" (measured 2026-09-05: five retries).
+            return {
+                "results": [],
+                "source_status": {
+                    src: "error: no query given — pass `query` or translations in `queries`"
+                    for src in sources
+                },
+                "needs_human": [],
+            }
+        if not query:
+            # Translations alone are a query: the base is the English one if
+            # given, else the first translation, so language routing still works.
+            query = langs.get("en") or next(iter(langs.values()))
         # What the agent cannot obtain itself — a licence, an account — with
         # the page where a human gets it. Announced to the human, not buried
         # in a status string.

@@ -105,9 +105,15 @@ class TestCollectorContract:
         assert set(c.supported_params()) == {"query", "max_results", "sources", "queries"}
 
     def test_empty_query_returns_empty(self):
+        """No query and no translations: nothing is searched, and every
+        requested source SAYS so — an empty status read as 'the tool is broken'
+        in the SX500 run."""
         c = EasternLiteratureCollector()
         assert c.collect(query="") == []
-        assert c.collect_with_status(query="") == {"results": [], "source_status": {}, "needs_human": []}
+        out = c.collect_with_status(query="", sources=["cyberleninka", "openalex"])
+        assert out["results"] == [] and out["needs_human"] == []
+        assert set(out["source_status"]) == {"cyberleninka", "openalex"}
+        assert all(v.startswith("error: no query given") for v in out["source_status"].values()), out
 
     def test_gated_source_names_the_blocker(self):
         """A licensed source must report WHY it is unavailable. An empty list
@@ -811,3 +817,27 @@ class TestArchiveRelevance:
         assert "mediatype:texts" in params["q"], params["q"]
         assert [h["title"] for h in hits] == ["搪瓷涂层700℃长期抗高温氧化行为研究"]
         assert err and "1 off-topic dropped" in err, err
+
+
+class TestTranslationsAlone:
+    def test_translations_alone_are_a_query(self):
+        """Measured in the SX500 run 2026-09-05: the model passed `queries`
+        ({"ru": …}) and left `query` empty; the collector returned nothing with
+        an EMPTY status, and the model wrote "tool defect" after five tries.
+        Translations are a query. Nothing at all is an error that says so."""
+        seen = {}
+
+        def cyber(query, n):
+            seen["cyberleninka"] = query
+            return [], "ok (0 results)"
+
+        c = EasternLiteratureCollector()
+        with patch.object(EasternLiteratureCollector, "_search_cyberleninka", side_effect=cyber):
+            out = c.collect_with_status(query="", sources=["cyberleninka"],
+                                        queries={"ru": "жаропрочный сплав"}, deadline_s=5)
+        assert seen["cyberleninka"] == "жаропрочный сплав"
+        assert out["source_status"]["cyberleninka"].startswith("ok")
+
+        nothing = c.collect_with_status(query="", sources=["cyberleninka"], queries={"ru": "  "})
+        assert nothing["results"] == []
+        assert nothing["source_status"].get("cyberleninka", "").startswith("error: no query"), nothing
