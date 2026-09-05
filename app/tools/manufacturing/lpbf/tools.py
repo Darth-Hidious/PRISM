@@ -1,6 +1,7 @@
 """PRISM scientific-tool wrappers for LPBF process screens."""
 
 from __future__ import annotations
+from app.tools.evidence import EvidenceSource, stamp_evidence
 
 import math
 
@@ -31,10 +32,50 @@ def _lpbf_missing_error() -> dict:
     )
 
 
+# The thermophysical inputs whose provenance decides the result's evidence
+# class. Process settings (powers, hatch, layer, beam, preheat) are the
+# caller's own choices, not facts about a material.
+_THERMOPHYSICAL_PROPERTIES = (
+    "solidus_temperature_k",
+    "liquidus_temperature_k",
+    "thermal_conductivity_w_mk",
+    "density_kg_m3",
+    "specific_heat_j_kgk",
+    "latent_heat_j_kg",
+    "absorptivity",
+)
+
+
 def _run_printability_map(**kwargs) -> dict:
     if not check_lpbf_available():
         return _lpbf_missing_error()
-    return generate_printability_map(**kwargs)
+    # Where the numbers came from decides what the map is worth. Live on
+    # 2026-09-02 the screen ran on properties the model supplied from memory
+    # and came back with no evidence class at all. The tool cannot know the
+    # numbers; it can know whether each arrived with a source, and say so.
+    sources = kwargs.pop("property_sources", None) or {}
+    out = generate_printability_map(**kwargs)
+    if not isinstance(out, dict) or "error" in out:
+        return out
+    unsourced = [
+        name
+        for name in _THERMOPHYSICAL_PROPERTIES
+        if not str(sources.get(name, "")).strip()
+    ]
+    stamp_evidence(
+        out,
+        EvidenceSource.MODEL_ASSERTION if unsourced else EvidenceSource.LITERATURE_EXTRACTION,
+    )
+    out["property_sources"] = {k: v for k, v in sources.items() if str(v).strip()}
+    out["unsourced_properties"] = unsourced
+    if unsourced:
+        out["evidence_note"] = (
+            "screening over unsourced inputs: "
+            + ", ".join(unsourced)
+            + " arrived without a source. Pass property_sources={name: citation} "
+            "for datasheet or measured values; the class rises to research."
+        )
+    return out
 
 
 def _run_kou_index(**kwargs) -> dict:
@@ -120,6 +161,16 @@ _PRINTABILITY_PROPERTIES = {
         "maximum": 1,
         "description": "Caller-supplied effective laser absorptivity in (0, 1].",
     },
+    "property_sources": {
+        "type": "object",
+        "additionalProperties": {"type": "string"},
+        "description": (
+            "Where each thermophysical value came from — {property_name: citation}, "
+            "e.g. a datasheet, handbook table or measurement. Every one of the seven "
+            "sourced → evidence class research; any missing → indeterminate (RED), "
+            "with the gaps named. A value recalled from memory has no source."
+        ),
+    },
     "lof_overlap_threshold": _positive_number(
         "Tunable semi-ellipse overlap boundary. Default 1.0 from the geometric "
         "coverage condition described by Tang, Pistorius, and Beuth (2017)."
@@ -160,8 +211,9 @@ _PRINTABILITY_DESCRIPTION = (
     "39-48); keyholing uses normalized enthalpy (King et al., JMPT 214, 2014, "
     "2915-2925); balling uses the ideal Plateau-Rayleigh length/width limit. "
     "Every thermophysical property is required from the caller; no alloy "
-    "constants are supplied. Thresholds are tunable and require experimental "
-    "calibration before process qualification."
+    "constants are supplied, and the result's evidence class says whether each "
+    "arrived with a source (property_sources) or not. Thresholds are tunable "
+    "and require experimental calibration before process qualification."
 )
 
 _KOU_DESCRIPTION = (

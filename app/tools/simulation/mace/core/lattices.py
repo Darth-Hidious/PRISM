@@ -75,6 +75,57 @@ GROUND_STATE_PHASE: dict[str, str] = {
 PHASES = ("bcc", "fcc", "hcp")
 
 
+def _extend_from_ase_reference_states() -> None:
+    """Widen the tables to every element whose ground state is a simple metal
+    lattice, from ASE's experimental reference states.
+
+    Measured 2026-09-02 in a live research session: the MACE tier refused
+    Ni/Co/Cr, and a superalloy proxy had to be relaxed by hand in the notebook
+    kernel. The gate was never the model — MACE-MP-0 and MACE-MH-1 are trained
+    on the whole periodic table — but these ten-row hand tables.
+
+    The element's own structure takes ASE's lattice constant; a phase it does
+    not adopt in nature is estimated at EQUAL ATOMIC VOLUME (the hand values
+    above follow the same rule: Fe bcc 2.87 → fcc 3.62 vs 3.65 listed). These
+    are starting guesses for relaxation, never reported properties. Elements
+    with complex ground states (α-Mn, diamond Si, bct Sn, …) are not added; a
+    request for them fails with the unsupported-element message, which is the
+    honest answer. Hand values stay authoritative where present.
+    """
+    try:
+        from ase.data import atomic_numbers, chemical_symbols, reference_states
+    except Exception:  # pragma: no cover — ASE is a hard dependency of this tier
+        return
+    for symbol in chemical_symbols[1:]:
+        ref = reference_states[atomic_numbers[symbol]]
+        if not ref:
+            continue
+        symmetry = ref.get("symmetry")
+        a = ref.get("a")
+        if symmetry not in PHASES or not a:
+            continue
+        if symmetry == "hcp":
+            coa = float(ref.get("c/a") or COA_IDEAL)
+            v_atom = (3**0.5 / 4.0) * a * a * (coa * a)
+        elif symmetry == "fcc":
+            v_atom = a**3 / 4.0
+        else:  # bcc
+            v_atom = a**3 / 2.0
+        derived = {
+            "bcc": (2.0 * v_atom) ** (1.0 / 3.0),
+            "fcc": (4.0 * v_atom) ** (1.0 / 3.0),
+            "hcp": (4.0 * v_atom / (3**0.5 * COA_IDEAL)) ** (1.0 / 3.0),
+        }
+        derived[symmetry] = float(a)
+        A_BCC.setdefault(symbol, round(derived["bcc"], 3))
+        A_FCC.setdefault(symbol, round(derived["fcc"], 3))
+        A_HCP.setdefault(symbol, round(derived["hcp"], 3))
+        GROUND_STATE_PHASE.setdefault(symbol, symmetry)
+
+
+_extend_from_ase_reference_states()
+
+
 def lookup_a(element: str, phase: str) -> float:
     """Look up starting lattice parameter for one element in one phase."""
     table = {"bcc": A_BCC, "fcc": A_FCC, "hcp": A_HCP}[phase]

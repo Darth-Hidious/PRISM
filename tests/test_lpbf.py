@@ -300,3 +300,61 @@ def test_lpbf_tools_carry_scientific_tool_contract():
     assert set(_synthetic_material()).issubset(
         set(printability.input_schema["required"])
     )
+
+
+# ---------------------------------------------------------------------------
+# Where the numbers came from decides what the result is worth.
+#
+# Measured 2026-09-02 in a live research session: the printability screen ran
+# on "k=11 W/m·K, ρ=8400, cp=500, L=270 kJ/kg, T_s/T_l=1613/1678 K" that the
+# model supplied from memory, and the map came back with no evidence class at
+# all — a screening-grade result over unsourced inputs read the same as one
+# over datasheet values. The tool cannot know the numbers; it can know whether
+# each one arrived with a source, and say so in the class the card shows.
+# ---------------------------------------------------------------------------
+
+_THERMOPHYSICAL = [
+    "solidus_temperature_k",
+    "liquidus_temperature_k",
+    "thermal_conductivity_w_mk",
+    "density_kg_m3",
+    "specific_heat_j_kgk",
+    "latent_heat_j_kg",
+    "absorptivity",
+]
+
+
+def _printability_call():
+    from app.tools.manufacturing.lpbf.tools import _run_printability_map
+
+    process = _classification_inputs()
+    power = process.pop("power_w")
+    velocity = process.pop("scan_velocity_m_per_s")
+    return _run_printability_map, dict(
+        powers_w=[power], scan_velocities_m_per_s=[velocity], **process
+    )
+
+
+def test_a_fully_sourced_map_is_literature_evidence():
+    run, kwargs = _printability_call()
+    sources = {name: "Special Metals INCONEL 718 datasheet SMC-045 (2007)" for name in _THERMOPHYSICAL}
+    out = run(property_sources=sources, **kwargs)
+    assert out["evidence_class"] == "research", out.get("evidence_class")
+    assert out["unsourced_properties"] == []
+    assert out["property_sources"] == sources
+
+
+def test_an_unsourced_map_says_so_in_its_class():
+    run, kwargs = _printability_call()
+    out = run(**kwargs)
+    assert out["evidence_class"] == "indeterminate", out.get("evidence_class")
+    assert out["evidence_color"] == "red"
+    assert sorted(out["unsourced_properties"]) == sorted(_THERMOPHYSICAL)
+
+
+def test_a_partly_sourced_map_names_the_gaps():
+    run, kwargs = _printability_call()
+    out = run(property_sources={"density_kg_m3": "ASM Handbook Vol. 2"}, **kwargs)
+    assert out["evidence_class"] == "indeterminate"
+    assert "density_kg_m3" not in out["unsourced_properties"]
+    assert "latent_heat_j_kg" in out["unsourced_properties"]

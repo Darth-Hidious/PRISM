@@ -337,8 +337,11 @@ _COMPOSITION_SCHEMA = {
     "description": (
         "Composition as INTEGER ATOM COUNTS per element; the counts must sum "
         "to n_atoms. Example for n_atoms=64: {\"atoms\": {\"Fe\": 54, "
-        "\"Al\": 10}}. NOT atomic fractions. Supported elements: Al, Fe, Hf, "
-        "Mo, Nb, Ta, Ti, V, W, Zr (refractory/structural set)."
+        "\"Al\": 10}}. NOT atomic fractions. Supported elements: every "
+        "element whose ground state is fcc, bcc or hcp (Ni, Co, Cr, Cu, Fe, "
+        "Al, Ti, W, Mo, Nb, Ta, Re, Mg, Pt, … — the model covers the periodic "
+        "table; the gate is a starting lattice parameter). Complex ground "
+        "states (Si, Mn, Sn, C) are refused by name."
     ),
     "properties": {
         "atoms": {

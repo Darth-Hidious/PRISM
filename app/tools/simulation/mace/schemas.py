@@ -49,10 +49,12 @@ Dtype = Literal["float32", "float64"]
 
 
 # Allowed alloying elements — defines schema-level validity for compositions.
-# Mirrors mace_core.lattices.A_BCC (the widest table).
-ALLOWED_ELEMENTS = frozenset(
-    {"Al", "Fe", "Hf", "Mo", "Nb", "Ta", "Ti", "V", "W", "Zr"}
-)
+# Derived from the lattice tables, not a second list that drifts: the only
+# reason an element is unsupported is that no starting lattice parameter
+# exists for it (complex ground states — α-Mn, diamond Si, bct Sn, …).
+from app.tools.simulation.mace.core.lattices import supported_elements as _supported
+
+ALLOWED_ELEMENTS = frozenset(_supported())
 
 
 class _Base(BaseModel):
