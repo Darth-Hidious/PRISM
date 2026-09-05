@@ -437,3 +437,77 @@ def test_a_crash_before_output_keeps_the_exit_code_and_stderr(tmp_path):
     assert "not enough slots" in out["reason"], out["reason"]
     assert out["provenance"]["returncode"] == 3
     assert "not enough slots" in out["provenance"]["stderr_tail"]
+
+
+# ---------------------------------------------------------------------------
+# Cutoffs come from the pseudopotential set's own hints, and say so
+# ---------------------------------------------------------------------------
+
+def _fake_pw_and_pseudo(tmp_path, hints_ha=None):
+    """A pw.x that writes nothing and exits 0, and a pseudo set for Si whose
+    MANIFEST carries (or lacks) PseudoDojo hints in Ha."""
+    import json
+    fake = tmp_path / "pw.x"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    pseudo = tmp_path / "pseudo"; pseudo.mkdir()
+    (pseudo / "Si.upf").write_text("<UPF version=\"2.0.1\"></UPF>")
+    manifest = {"set": "test set"}
+    if hints_ha is not None:
+        manifest["hints_ha"] = hints_ha
+    (pseudo / "MANIFEST.json").write_text(json.dumps(manifest))
+    return fake, pseudo
+
+
+def _settings(fake, pseudo, **over):
+    base = {"pw_path": str(fake), "pseudo_dir": str(pseudo), "ecutwfc_ry": None, "ecutrho_ratio": 4.0,
+            "kspacing_inv_angstrom": 0.5, "smearing": "mv", "degauss_ry": 0.01, "nproc": 1, "mpirun": None}
+    base.update(over)
+    return base
+
+
+def test_hint_files_are_parsed_into_per_element_cutoffs_in_hartree(tmp_path):
+    import json
+    from app.tools.simulation.qe.provision import hints_from_djrepo_dir
+
+    (tmp_path / "Ni.djrepo").write_text(json.dumps(
+        {"hints": {"high": {"ecut": 55.0}, "low": {"ecut": 45.0}, "normal": {"ecut": 49.0}}, "md5": "x"}))
+    (tmp_path / "Al.djrepo").write_text(json.dumps({"hints": {"normal": {"ecut": 20.0}}}))
+    hints = hints_from_djrepo_dir(tmp_path)
+    assert hints["Ni"] == {"low": 45.0, "normal": 49.0, "high": 55.0}
+    assert hints["Al"]["normal"] == 20.0
+
+
+def test_the_cutoff_comes_from_the_sets_own_hints(tmp_path):
+    """Run 2 of the SX500 research (2026-09-05): Ni3Al relaxed at 60 Ry with
+    PseudoDojo NC pseudopotentials whose own hint for Ni is 49 Ha = 98 Ry.
+    The stress was -337 GPa at the known lattice constant and the cell
+    collapsed by a quarter. The cutoff must follow the set's hints."""
+    from app.tools.simulation.qe.runtime import qe_run
+
+    fake, pseudo = _fake_pw_and_pseudo(tmp_path, hints_ha={"Si": {"low": 16.0, "normal": 20.0, "high": 24.0}})
+    out = qe_run(si_structure(), calculation="scf", settings=_settings(fake, pseudo), workdir=tmp_path / "run")
+    cut = out["provenance"]["cutoffs"]
+    assert cut["ecutwfc"] == 40.0, cut          # 20 Ha, normal accuracy, in Ry
+    assert cut["ecutrho"] == 160.0, cut
+    assert "hint" in cut["source"].lower() and "Si" in cut["source"], cut
+    assert "ecutwfc          = 40.0" in (tmp_path / "run" / "pw.in").read_text()
+
+
+def test_without_hints_the_fallback_cutoff_is_declared_unverified(tmp_path):
+    from app.tools.simulation.qe.runtime import qe_run
+
+    fake, pseudo = _fake_pw_and_pseudo(tmp_path, hints_ha=None)
+    out = qe_run(si_structure(), calculation="scf", settings=_settings(fake, pseudo), workdir=tmp_path / "run")
+    cut = out["provenance"]["cutoffs"]
+    assert cut["ecutwfc"] == 60.0, cut
+    assert "unverified" in cut["source"] and "Si" in cut["source"], cut
+
+
+def test_an_explicit_cutoff_wins_over_the_hints(tmp_path):
+    from app.tools.simulation.qe.runtime import qe_run
+
+    fake, pseudo = _fake_pw_and_pseudo(tmp_path, hints_ha={"Si": {"normal": 20.0}})
+    out = qe_run(si_structure(), calculation="scf", settings=_settings(fake, pseudo, ecutwfc_ry=80.0), workdir=tmp_path / "run")
+    cut = out["provenance"]["cutoffs"]
+    assert cut["ecutwfc"] == 80.0 and "caller" in cut["source"], cut

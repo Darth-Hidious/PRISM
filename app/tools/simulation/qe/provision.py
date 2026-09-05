@@ -21,12 +21,16 @@ import tempfile
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Optional
 
 QE_REPO = "https://gitlab.com/QEF/q-e.git"
 QE_TAG = "qe-7.4.1"
 PSEUDO_SET = "pseudo-dojo-nc-sr-04-pbe-standard"
 PSEUDO_URL = "https://www.pseudo-dojo.org/pseudos/nc-sr-04_pbe_standard_upf.tgz"
+# The same set's per-element cutoff hints (low/normal/high, in Ha). Measured
+# 2026-09-05: without them PRISM ran Ni3Al at 60 Ry against a Ni hint of
+# 49 Ha (98 Ry) and produced a -337 GPa stress at the known lattice constant.
+PSEUDO_HINTS_URL = PSEUDO_URL.replace("_upf.tgz", "_djrepo.tgz")
 PSEUDO_LICENSE = (
     "CC BY 4.0 (PseudoDojo; van Setten et al., Comput. Phys. Commun. 226, 39 (2018), "
     "doi:10.1016/j.cpc.2018.01.012)"
@@ -81,19 +85,58 @@ def plan() -> dict[str, Any]:
     }
 
 
-def write_manifest(directory: Path, *, url: str, sha256: str, upf_count: int) -> Path:
+def hints_from_djrepo_dir(directory: Path) -> dict[str, dict[str, float]]:
+    """Per-element cutoff hints (Ha) from PseudoDojo's `.djrepo` files:
+    `{"Ni": {"low": 45.0, "normal": 49.0, "high": 55.0}}`. Files without a
+    `hints` block are skipped, never guessed."""
+    out: dict[str, dict[str, float]] = {}
+    for path in sorted(Path(directory).glob("*.djrepo")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        hints = data.get("hints") or {}
+        parsed = {level: float(hints[level]["ecut"]) for level in ("low", "normal", "high")
+                  if isinstance(hints.get(level), dict) and "ecut" in hints[level]}
+        if parsed:
+            out[path.stem.split("-")[0].split("_")[0]] = parsed
+    return out
+
+
+def fetch_hints(log: list[str]) -> dict[str, dict[str, float]]:
+    """Download the set's hint files and parse them. Failure is reported, not
+    hidden: an empty dict means the manifest carries no hints and every run
+    says its cutoff is unverified."""
+    log.append(f"fetch {PSEUDO_HINTS_URL}")
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "djrepo.tgz"
+        with urllib.request.urlopen(PSEUDO_HINTS_URL, timeout=600) as resp, open(archive, "wb") as fh:
+            shutil.copyfileobj(resp, fh)
+        with tarfile.open(archive) as tf:
+            tf.extractall(tmp, filter="data")
+        return hints_from_djrepo_dir(Path(tmp))
+
+
+def write_manifest(directory: Path, *, url: str, sha256: str, upf_count: int,
+                   hints_ha: Optional[Mapping[str, Mapping[str, float]]] = None) -> Path:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "MANIFEST.json"
-    path.write_text(json.dumps({
+    manifest: dict[str, Any] = {
         "set": "PseudoDojo NC SR v0.4, PBE, standard accuracy",
         "source_url": url,
         "sha256_of_archive": sha256,
         "license": PSEUDO_LICENSE,
         "fetched_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "upf_count": upf_count,
-        "note": "Norm-conserving ONCVPSP pseudopotentials. PRISM's default ecutwfc for this set is 60 Ry, overridable per run.",
-    }, indent=2))
+        "note": "Norm-conserving ONCVPSP pseudopotentials. Each run's ecutwfc comes from the set's own "
+                "per-element hints (`hints_ha`, normal accuracy, Ha -> Ry); a species without a hint "
+                "falls back to 60 Ry and the run's provenance says so.",
+    }
+    if hints_ha:
+        manifest["hints_ha"] = {el: dict(v) for el, v in sorted(hints_ha.items())}
+        manifest["hints_source_url"] = PSEUDO_HINTS_URL
+    path.write_text(json.dumps(manifest, indent=2))
     return path
 
 
@@ -118,8 +161,13 @@ def fetch_pseudopotentials(log: list[str]) -> dict[str, Any]:
         tf.extractall(target, filter="data")
     archive.unlink()
     count = len(list(target.glob("*.upf")))
-    manifest = write_manifest(target, url=PSEUDO_URL, sha256=sha, upf_count=count)
-    return {"directory": str(target), "upf_count": count, "manifest": str(manifest)}
+    try:
+        hints = fetch_hints(log)
+    except Exception as exc:  # the set is usable without hints; the manifest says they are missing
+        log.append(f"hints unavailable: {exc}")
+        hints = {}
+    manifest = write_manifest(target, url=PSEUDO_URL, sha256=sha, upf_count=count, hints_ha=hints)
+    return {"directory": str(target), "upf_count": count, "manifest": str(manifest), "hinted_elements": len(hints)}
 
 
 def run(*, dry_run: bool = False) -> dict[str, Any]:

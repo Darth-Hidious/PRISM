@@ -35,11 +35,17 @@ RY_TO_EV = 13.605693122994
 
 DEFAULT_PSEUDO_SET = "pseudo-dojo-nc-sr-04-pbe-standard"
 
+# When no hint exists for a species and the caller gave no cutoff. Measured
+# 2026-09-05: 60 Ry against PseudoDojo's Ni hint of 49 Ha (98 Ry) gave a
+# -337 GPa stress at the experimental lattice constant. Hence a fallback that
+# is always declared "unverified", never a silent default.
+FALLBACK_ECUTWFC_RY = 60.0
+
 DEFAULTS: dict[str, Any] = {
-    # PseudoDojo NC SR v0.4 "standard" hints cluster around 40-45 Ha for the
-    # normal accuracy; 60 Ry is a conservative single default for screening
-    # runs and is overridable per run and in `[qe]`.
-    "ecutwfc_ry": 60.0,
+    # None = derive from the pseudopotential set's own per-element hints
+    # (MANIFEST.json `hints_ha`, normal accuracy, Ha -> Ry). A number here or
+    # per run is an explicit choice and wins.
+    "ecutwfc_ry": None,
     "ecutrho_ratio": 4.0,
     "kspacing_inv_angstrom": 0.15,
     "smearing": "mv",
@@ -170,7 +176,10 @@ def settings(config: Mapping[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = dict(DEFAULTS)
     for key in DEFAULTS:
         if key in config and config[key] is not None:
-            out[key] = type(DEFAULTS[key])(config[key]) if not isinstance(DEFAULTS[key], str) else str(config[key])
+            if DEFAULTS[key] is None:
+                out[key] = float(config[key])
+            else:
+                out[key] = type(DEFAULTS[key])(config[key]) if not isinstance(DEFAULTS[key], str) else str(config[key])
     nproc = config.get("nproc")
     out["nproc"] = int(nproc) if nproc else max(1, os.cpu_count() or 1)
     pw = find_pw_x(config)
@@ -181,6 +190,26 @@ def settings(config: Mapping[str, Any]) -> dict[str, Any]:
     mpirun = find_mpirun()
     out["mpirun"] = str(mpirun) if mpirun else None
     return out
+
+
+def cutoff_for(species: list[str], pseudo_dir: Path, explicit: Optional[float]) -> tuple[float, str]:
+    """The wavefunction cutoff (Ry) for these species and where it came from:
+    the caller's number; else the set's own hints (the largest 'normal'
+    hint over the species, Ha -> Ry, rounded up); else a fallback that is
+    declared unverified."""
+    if explicit is not None:
+        return float(explicit), "caller"
+    hints = pseudo_manifest(Path(pseudo_dir)).get("hints_ha") or {}
+    missing = [el for el in species if not (hints.get(el) or {}).get("normal")]
+    if missing:
+        return FALLBACK_ECUTWFC_RY, (
+            f"fallback {FALLBACK_ECUTWFC_RY:g} Ry — no cutoff hint for {', '.join(missing)} in the set's "
+            "manifest; convergence unverified (run_convergence_test, or pass ecutwfc_ry)"
+        )
+    per = {el: float(hints[el]["normal"]) for el in species}
+    ecut_ry = float(math.ceil(max(per.values()) * 2.0))
+    detail = ", ".join(f"{el} {ha:g} Ha" for el, ha in sorted(per.items()))
+    return ecut_ry, f"the set's hints, normal accuracy ({detail}); largest, in Ry"
 
 
 def kpoints_for(structure, kspacing_inv_angstrom: float) -> tuple[int, int, int]:
@@ -249,8 +278,8 @@ def qe_run(
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    ecutwfc = float(settings["ecutwfc_ry"])
-    cutoffs = {"ecutwfc": ecutwfc, "ecutrho": ecutwfc * float(settings["ecutrho_ratio"])}
+    ecutwfc, cutoff_source = cutoff_for(species, Path(pseudo_dir), settings.get("ecutwfc_ry"))
+    cutoffs = {"ecutwfc": ecutwfc, "ecutrho": ecutwfc * float(settings["ecutrho_ratio"]), "source": cutoff_source}
     kpts = kpoints_for(structure, float(settings["kspacing_inv_angstrom"]))
     system_extra = {"occupations": "smearing", "smearing": str(settings["smearing"]), "degauss": float(settings["degauss_ry"])}
     merged_extra: dict[str, dict] = {"system": system_extra}
