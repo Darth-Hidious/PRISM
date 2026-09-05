@@ -72,7 +72,8 @@ pub async fn fetch_page(
                 err.context(
                     "Semantic Scholar's shared unauthenticated pool is exhausted; set \
                  SEMANTIC_SCHOLAR_API_KEY for a dedicated pool \
-                 (https://www.semanticscholar.org/product/api#api-key-form)",
+                 (https://www.semanticscholar.org/product/api#api-key-form) — in the \
+                 TUI: Ctrl-P → Search sources & keys",
                 )
             } else {
                 err

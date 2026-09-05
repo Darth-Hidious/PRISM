@@ -257,6 +257,12 @@ async fn semantic_scholar_429_names_the_api_key_remedy() {
         msg.contains("SEMANTIC_SCHOLAR_API_KEY"),
         "the failure must name the remedy: {msg}"
     );
+    // The remedy must be reachable from where the reader is: the TUI's
+    // command palette has a Settings entry for exactly this key.
+    assert!(
+        msg.contains("Search sources & keys"),
+        "the message names the palette entry that sets the key: {msg}"
+    );
     assert!(msg.contains("HTTP 429"), "the raw status survives: {msg}");
 }
 
