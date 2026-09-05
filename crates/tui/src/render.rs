@@ -181,6 +181,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_settings_hub(f, app);
     } else if app.palette.open {
         draw_command_palette(f, app);
+    // A wall's modal sits under the palette: a reader who opened the palette
+    // chose it, and the wall is listed there too.
+    } else if app.needs_human_modal.is_some() {
+        draw_needs_human_modal(f, app);
     } else if app.form.is_some() {
         draw_form_pane(f, app);
     } else if app.knowledge.open {
@@ -1610,6 +1614,9 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
     // builders skip, clip and expand entries, so counting lines from outside
     // would drift the moment any of them changed.
     let mut rows: PanelRows = Vec::new();
+    // Everything before this line is the header (title, marks, tab strip):
+    // it stays put while the list under it scrolls to follow the selection.
+    let list_start = lines.len();
     match app.workspace_tab {
         WorkspaceTab::Tools => build_tools_lines(app, t, &mut lines, &mut rows, w),
         WorkspaceTab::Activity => build_activity_lines(app, t, &mut lines, &mut rows, w),
@@ -1625,6 +1632,45 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
             build_artifact_lines(app, t, &mut lines, &mut rows, w, available);
         }
     }
+
+    // The header's height and how far the list is scrolled so the selected
+    // entry is on screen. Measured 2026-09-05: the list was drawn from its top
+    // whatever was selected, so ↓ past the fold moved nothing visible and the
+    // sidebar read as unscrollable.
+    let wrapped_rows = |from: usize, to: usize| -> u16 {
+        if to <= from {
+            0
+        } else {
+            Paragraph::new(lines[from..to].to_vec())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width) as u16
+        }
+    };
+    let head_rows = wrapped_rows(0, list_start.min(lines.len())).min(inner.height);
+    let body_height = inner.height.saturating_sub(head_rows);
+    let selected_entry = rows
+        .iter()
+        .map(|(_, i)| *i)
+        .filter(|i| *i <= app.workspace_selected)
+        .max();
+    let list_scroll: u16 = match selected_entry.and_then(|sel| rows.iter().find(|(_, i)| *i == sel))
+    {
+        Some((sel_line, _)) if body_height > 0 => {
+            let top = wrapped_rows(list_start.min(*sel_line), *sel_line);
+            let next_line = rows
+                .iter()
+                .find(|(l, _)| *l > *sel_line)
+                .map(|(l, _)| *l)
+                .unwrap_or(lines.len());
+            let bottom = wrapped_rows(list_start.min(next_line), next_line).max(top + 1);
+            if bottom > body_height {
+                (bottom - body_height).min(top)
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
 
     // Record what landed where, before `lines` is moved into the paragraph.
     //
@@ -1658,7 +1704,12 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
         let screen_row = |line: usize| -> Option<u16> {
             let line = line.min(lines.len());
             let offset = row_of.iter().find(|(at, _)| *at == line)?.1;
-            (offset < inner.height).then_some(inner.y + offset)
+            if line < list_start {
+                return (offset < head_rows).then_some(inner.y + offset);
+            }
+            let in_body = offset.saturating_sub(head_rows);
+            (in_body >= list_scroll && in_body - list_scroll < body_height)
+                .then(|| inner.y + head_rows + (in_body - list_scroll))
         };
 
         let mut map = app.hit_map.borrow_mut();
@@ -1732,10 +1783,22 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let para = Paragraph::new(lines)
+    let list_start = list_start.min(lines.len());
+    let body_lines = lines.split_off(list_start);
+    let head = Paragraph::new(lines)
         .style(Style::default().bg(t.panel))
         .wrap(Wrap { trim: false });
-    f.render_widget(para, inner);
+    f.render_widget(head, Rect::new(inner.x, inner.y, inner.width, head_rows));
+    if body_height > 0 {
+        let body = Paragraph::new(body_lines)
+            .style(Style::default().bg(t.panel))
+            .wrap(Wrap { trim: false })
+            .scroll((list_scroll, 0));
+        f.render_widget(
+            body,
+            Rect::new(inner.x, inner.y + head_rows, inner.width, body_height),
+        );
+    }
 }
 
 /// Which entry each built panel line belongs to: `(line index, entry index)`,
@@ -5524,6 +5587,89 @@ fn draw_notebook_pane(f: &mut Frame, app: &App) {
     );
 }
 
+/// A licence or key wall, as a modal with its three actions. The agent
+/// cannot pass it; the human can, and this says how without a hunt.
+fn draw_needs_human_modal(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let Some(blocker) = app.needs_human_modal.and_then(|i| app.blockers.get(i)) else {
+        return;
+    };
+    let area = overlay_area(f, 64, 45);
+    f.render_widget(Clear, area);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.approval));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "  A HUMAN IS NEEDED  ",
+            Style::default()
+                .fg(t.overlay_bg)
+                .bg(t.approval)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("source  ", Style::default().fg(t.muted)),
+            Span::styled(
+                blocker.source.clone(),
+                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("obtain  ", Style::default().fg(t.muted)),
+            Span::styled(blocker.what.clone(), Style::default().fg(t.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("where   ", Style::default().fg(t.muted)),
+            Span::styled(
+                blocker.url.clone(),
+                Style::default()
+                    .fg(t.accent)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("why     ", Style::default().fg(t.muted)),
+            Span::styled(blocker.reason.clone(), Style::default().fg(t.dim)),
+        ]),
+        Line::from(""),
+    ];
+    let mut hints = vec![
+        Span::styled(" o ", Style::default().fg(t.overlay_bg).bg(t.accent)),
+        Span::styled(" open the link   ", Style::default().fg(t.text)),
+    ];
+    if blocker.env_var.is_some() {
+        hints.push(Span::styled(
+            " p ",
+            Style::default().fg(t.overlay_bg).bg(t.accent),
+        ));
+        hints.push(Span::styled(
+            format!(
+                " paste the key ({})   ",
+                blocker.env_var.unwrap_or_default()
+            ),
+            Style::default().fg(t.text),
+        ));
+    }
+    hints.push(Span::styled(
+        " l ",
+        Style::default().fg(t.overlay_bg).bg(t.muted),
+    ));
+    hints.push(Span::styled(
+        " later — stays under Ctrl-P → Needs a human",
+        Style::default().fg(t.dim),
+    ));
+    lines.push(Line::from(hints));
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(t.overlay_bg))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
 fn draw_approval_popup(f: &mut Frame, app: &App) {
     let t = app.theme();
     let (tool, message) = app.approval_pending.as_ref().unwrap();
@@ -6434,6 +6580,58 @@ mod tests {
             max,
             "a reply that outgrows the screen is followed to its tail, not left below the fold"
         );
+    }
+
+    /// Selecting an entry below the fold scrolls the list to it while the
+    /// header (title and tab strip) stays. Before, the list was drawn from
+    /// its top whatever was selected (owner, 2026-09-05: "the workspace is
+    /// not scrollable").
+    #[test]
+    fn the_workspace_list_follows_its_selection_and_keeps_its_header() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.sidebar_visible.set(true);
+        for i in 0..40 {
+            app.apply_agent_msg(crate::msg::AgentMsg::ToolCard {
+                tool_name: "web".into(),
+                content: format!("{i} results"),
+                card_type: "search".into(),
+                elapsed_ms: Some(10),
+                call_id: Some(format!("c{i}")),
+                provenance_id: None,
+                data: None,
+                agent: None,
+            });
+        }
+        app.workspace_tab = WorkspaceTab::Activity;
+        app.focus = Focus::Workspace;
+        app.workspace_selected = 35;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("36. tool"),
+            "the selected entry (36.) is on screen:\n{text}"
+        );
+        assert!(
+            !text.contains(" 1. tool"),
+            "the top of the list scrolled away:\n{text}"
+        );
+        assert!(text.contains("Workspace"), "the header stayed:\n{text}");
+        assert!(text.contains("Act"), "the tab strip stayed:\n{text}");
+    }
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 
     /// The collapsed-reasoning affordance must read as an instruction, never

@@ -512,6 +512,9 @@ pub struct ApiKeyWindow {
     pub new_url: String,
     /// Which of (name, url, key) has focus while `adding`.
     pub field_idx: usize,
+    /// Opened from the "needs a human" modal: a saved key is followed by a
+    /// tool reload so the running tool server sees it without a restart.
+    pub reload_after_save: bool,
 }
 
 /// One row of the Workspace *Activity* tab, tied back to the transcript
@@ -766,6 +769,25 @@ pub struct Blocker {
     pub what: String,
     pub url: String,
     pub reason: String,
+    /// The environment variable that would unlock this source, when it is a
+    /// key rather than an account (`None`: only the link helps).
+    pub env_var: Option<&'static str>,
+}
+
+/// Which saved key unlocks a source the agent named. Only sources whose key
+/// the API-key window can store are listed; an account wall (CNKI, a
+/// subscription) has no key to paste and gets `None`.
+pub fn key_env_for_source(source: &str) -> Option<&'static str> {
+    let s = source.to_ascii_lowercase();
+    if s.contains("patent") || s.contains("lens") {
+        Some("LENS_API_TOKEN")
+    } else if s.contains("semantic") || s == "s2" {
+        Some("SEMANTIC_SCHOLAR_API_KEY")
+    } else if s.contains("materials_project") || s.contains("materials project") || s == "mp" {
+        Some("MP_API_KEY")
+    } else {
+        None
+    }
 }
 
 /// Keys offered in the API-key window, in display order: LLM providers, then
@@ -783,6 +805,7 @@ pub const API_PROVIDERS: &[(&str, &str)] = &[
     ("Cohere", "COHERE_API_KEY"),
     ("Semantic Scholar", "SEMANTIC_SCHOLAR_API_KEY"),
     ("Lens.org", "LENS_API_TOKEN"),
+    ("Materials Project", "MP_API_KEY"),
     ("Patent table", "PRISM_PATENT_TABLE"),
 ];
 
@@ -812,6 +835,10 @@ pub struct App {
     /// hit and cannot obtain. One per source; the palette entry "Needs a
     /// human" lists them with their links.
     pub blockers: Vec<Blocker>,
+    /// The blocker shown in the "needs a human" modal, by index into
+    /// `blockers`. Opened when a wall is first reported; `l` puts it off,
+    /// `o` opens the link, `p` goes to the key window for its variable.
+    pub needs_human_modal: Option<usize>,
     /// Why THIS call must be decided by a human (destructive tripwire). While
     /// set, 'a' approves this one call and whitelists nothing.
     pub approval_reason: Option<String>,
@@ -991,6 +1018,11 @@ pub struct App {
     /// `RefCell` because `draw` takes `&App` — the renderer records regions as
     /// it paints, and mouse handling reads them back on the next event.
     pub hit_map: std::cell::RefCell<crate::hit_map::HitMap>,
+    /// Where the workspace sidebar was drawn last frame, so the wheel over it
+    /// moves the workspace and not the transcript underneath. Measured
+    /// 2026-09-05: the wheel over the sidebar scrolled the chat, and the
+    /// sidebar read as unscrollable.
+    pub workspace_area: std::cell::Cell<Option<ratatui::layout::Rect>>,
     /// What the pointer is over, or `None`. Drives hover; recomputed on move.
     pub hovered: Option<crate::hit_map::HitTarget>,
     /// Terminal graphics capability, discovered once and then reused.
@@ -1112,6 +1144,7 @@ impl App {
             turn_in_progress: false,
             approval_pending: None,
             blockers: Vec::new(),
+            needs_human_modal: None,
             approval_reason: None,
             approval_code: None,
             approval_scroll: 0,
@@ -1172,6 +1205,7 @@ impl App {
             ref_fetch_rpc_id: None,
             anchor_user_turn: std::cell::Cell::new(false),
             hit_map: std::cell::RefCell::new(crate::hit_map::HitMap::default()),
+            workspace_area: std::cell::Cell::new(None),
             hovered: None,
             image_view: std::cell::OnceCell::new(),
             modal: None,
@@ -1257,6 +1291,22 @@ impl App {
         // a closed palette lets the global Ctrl-C exit.
         if self.palette.open {
             self.handle_palette_key(key);
+            return;
+        }
+
+        // A licence / key wall's modal: three actions, nothing typed into
+        // anything else while it is up. Ctrl-P still reaches the palette
+        // (handled above), Ctrl-C still quits.
+        if self.needs_human_modal.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+            } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('p')
+            {
+                self.open_palette();
+            } else {
+                self.handle_needs_human_key(key);
+            }
             return;
         }
 
@@ -1525,8 +1575,8 @@ impl App {
     /// works the way people expect without hunting for a focus mode.
     pub fn handle_mouse(&mut self, ev: MouseEvent) {
         match ev.kind {
-            MouseEventKind::ScrollUp => self.mouse_scroll(-3),
-            MouseEventKind::ScrollDown => self.mouse_scroll(3),
+            MouseEventKind::ScrollUp => self.mouse_scroll_at(ev.column, ev.row, -3),
+            MouseEventKind::ScrollDown => self.mouse_scroll_at(ev.column, ev.row, 3),
             // `ev.column`/`ev.row` used to be read nowhere in the crate: every
             // move, press and drag arrived and was dropped, so the pointer
             // could not refer to anything. Both arms below answer the same
@@ -2070,6 +2120,7 @@ impl App {
     #[must_use]
     pub fn overlay_open(&self) -> bool {
         self.approval_pending.is_some()
+            || self.needs_human_modal.is_some()
             || self.palette.open
             || self.form.is_some()
             || self.knowledge.open
@@ -2095,6 +2146,55 @@ impl App {
     /// Route a mouse-wheel delta to the scrollable surface that is active:
     /// the which-key panel when it's open, otherwise the chat transcript.
     /// (`delta > 0` scrolls down toward newer content.)
+    /// The wheel scrolls what is under the pointer: over the workspace it
+    /// moves the workspace selection one entry per notch; anywhere else it
+    /// scrolls the transcript as before.
+    pub fn mouse_scroll_at(&mut self, column: u16, row: u16, delta: i32) {
+        let over_workspace = self.workspace_area.get().is_some_and(|r| {
+            column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
+        });
+        if over_workspace && !self.overlay_open() {
+            self.focus = Focus::Workspace;
+            self.workspace_step(if delta < 0 { -1 } else { 1 });
+            return;
+        }
+        self.mouse_scroll(delta);
+    }
+
+    /// Move the workspace selection by `step` entries (negative = up),
+    /// clamped to the active tab's list. The renderer scrolls the list so the
+    /// selection stays in view.
+    pub fn workspace_step(&mut self, step: i32) {
+        if step < 0 {
+            self.workspace_selected = self.workspace_selected.saturating_sub((-step) as usize);
+        } else {
+            let last = self.workspace_last_index();
+            self.workspace_selected = self
+                .workspace_selected
+                .saturating_add(step as usize)
+                .min(last);
+        }
+        self.workspace_expanded = false;
+    }
+
+    /// Index of the last entry in the active workspace tab.
+    fn workspace_last_index(&self) -> usize {
+        match self.workspace_tab {
+            WorkspaceTab::Artifacts => match &self.artifact_store {
+                ArtifactStoreState::Ready(artifacts) => artifacts.len().saturating_sub(1),
+                ArtifactStoreState::Loading | ArtifactStoreState::Unavailable(_) => 0,
+            },
+            WorkspaceTab::Story => self.story.len().saturating_sub(1),
+            WorkspaceTab::Structures => match &self.structure_store {
+                StructuresStoreState::Ready(structures) => structures.len().saturating_sub(1),
+                StructuresStoreState::Loading | StructuresStoreState::Unavailable(_) => 0,
+            },
+            WorkspaceTab::Activity => self.derive_activity().len().saturating_sub(1),
+            WorkspaceTab::Tools => self.tool_catalog.len().saturating_sub(1),
+            _ => usize::MAX,
+        }
+    }
+
     fn mouse_scroll(&mut self, delta: i32) {
         if self.which_key.open {
             let max = self.whichkey_max_scroll.get();
@@ -2295,34 +2395,10 @@ impl App {
         match key.code {
             KeyCode::Left | KeyCode::Char('h') => self.workspace_prev_tab(),
             KeyCode::Right | KeyCode::Char('l') => self.workspace_next_tab(),
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.workspace_selected = self.workspace_selected.saturating_sub(1);
-                self.workspace_expanded = false;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.workspace_selected = match self.workspace_tab {
-                    WorkspaceTab::Artifacts => match &self.artifact_store {
-                        ArtifactStoreState::Ready(artifacts) => self
-                            .workspace_selected
-                            .saturating_add(1)
-                            .min(artifacts.len().saturating_sub(1)),
-                        ArtifactStoreState::Loading | ArtifactStoreState::Unavailable(_) => 0,
-                    },
-                    WorkspaceTab::Story => self
-                        .workspace_selected
-                        .saturating_add(1)
-                        .min(self.story.len().saturating_sub(1)),
-                    WorkspaceTab::Structures => match &self.structure_store {
-                        StructuresStoreState::Ready(structures) => self
-                            .workspace_selected
-                            .saturating_add(1)
-                            .min(structures.len().saturating_sub(1)),
-                        StructuresStoreState::Loading | StructuresStoreState::Unavailable(_) => 0,
-                    },
-                    _ => self.workspace_selected.saturating_add(1),
-                };
-                self.workspace_expanded = false;
-            }
+            KeyCode::Up | KeyCode::Char('k') => self.workspace_step(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.workspace_step(1),
+            KeyCode::PageUp => self.workspace_step(-10),
+            KeyCode::PageDown => self.workspace_step(10),
             KeyCode::Enter => self.open_workspace_detail(),
             KeyCode::Char(' ') => {
                 self.workspace_expanded = !self.workspace_expanded;
@@ -2659,6 +2735,45 @@ impl App {
     /// pass, with what to obtain and the link. PRISM never opens a browser
     /// itself; the link is shown for the human to open (Ctrl-P → Links also
     /// lists it from the transcript).
+    /// `o` opens the link, `p` goes to the key window on this source's
+    /// variable (when it has one), `l` / Esc puts it off — the wall stays
+    /// listed under Ctrl-P → Needs a human.
+    fn handle_needs_human_key(&mut self, key: KeyEvent) {
+        let Some(idx) = self.needs_human_modal else {
+            return;
+        };
+        let Some(blocker) = self.blockers.get(idx).cloned() else {
+            self.needs_human_modal = None;
+            return;
+        };
+        match key.code {
+            KeyCode::Char('o') | KeyCode::Enter => {
+                let url = blocker.url.clone();
+                self.open_in_browser(&url);
+            }
+            KeyCode::Char('p') if blocker.env_var.is_some() => {
+                let env_var = blocker.env_var.unwrap_or_default();
+                self.needs_human_modal = None;
+                self.open_apikey_window();
+                if let Some(i) = API_PROVIDERS.iter().position(|(_, e)| *e == env_var) {
+                    self.apikey_window.provider_idx = i;
+                }
+                self.apikey_window.reload_after_save = true;
+                self.push_system(&format!(
+                    "Paste the key for {env_var} and press Enter; the tool server reloads with it, then ask the agent to search again."
+                ));
+            }
+            KeyCode::Char('l') | KeyCode::Esc => {
+                self.needs_human_modal = None;
+                self.toast(
+                    format!("{} stays under Ctrl-P → Needs a human", blocker.source),
+                    ToastKind::Info,
+                );
+            }
+            _ => {}
+        }
+    }
+
     pub fn open_needs_human_panel(&mut self) {
         let body = if self.blockers.is_empty() {
             "Nothing is waiting on a human right now.\n\nWhen the agent hits a licence, account or \
@@ -5093,6 +5208,7 @@ impl App {
         self.apikey_window.new_name.clear();
         self.apikey_window.new_url.clear();
         self.apikey_window.field_idx = 0;
+        self.apikey_window.reload_after_save = false;
         self.apikey_window.open = true;
     }
 
@@ -5307,6 +5423,13 @@ impl App {
                             }
                             self.toast(format!("saved {env_var}"), ToastKind::Ok);
                             self.apikey_window.key_input.clear();
+                            if self.apikey_window.reload_after_save {
+                                self.apikey_window.reload_after_save = false;
+                                self.dispatch_command("tools.reload");
+                                self.push_system(&format!(
+                                    "{env_var} saved; the tool server is reloading with it. Ask the agent to search again."
+                                ));
+                            }
                         }
                         Err(e) => self.toast(format!("save failed: {e}"), ToastKind::Err),
                     }
@@ -6404,6 +6527,7 @@ impl App {
                     return;
                 }
                 let blocker = Blocker {
+                    env_var: key_env_for_source(&source),
                     source: source.clone(),
                     what: sanitize_for_render(&what),
                     url: sanitize_for_render(&url),
@@ -6421,6 +6545,10 @@ impl App {
                     ToastKind::Warn,
                 );
                 self.blockers.push(blocker);
+                // One modal at a time; the palette lists every wall.
+                if self.needs_human_modal.is_none() && self.approval_pending.is_none() {
+                    self.needs_human_modal = Some(self.blockers.len() - 1);
+                }
             }
             AgentMsg::Activity { id, text, done } => {
                 self.activities.retain(|(k, _)| *k != id);
@@ -8452,6 +8580,124 @@ mod tests {
             !app.activities.iter().any(|(k, _)| k == "thinking"),
             "cleared by visible text"
         );
+    }
+
+    /// The wheel over the sidebar moves the sidebar; over the transcript it
+    /// scrolls the transcript. Before, every notch went to the transcript and
+    /// the workspace read as unscrollable (owner, 2026-09-05).
+    #[test]
+    fn the_wheel_over_the_workspace_moves_its_selection() {
+        let mut app = fresh();
+        for i in 0..12 {
+            app.apply_agent_msg(AgentMsg::ToolCard {
+                tool_name: "web".into(),
+                content: format!("{i} results"),
+                card_type: "search".into(),
+                elapsed_ms: Some(10),
+                call_id: Some(format!("c{i}")),
+                provenance_id: None,
+                data: None,
+                agent: None,
+            });
+        }
+        app.workspace_tab = WorkspaceTab::Activity;
+        let entries = app.derive_activity().len();
+        assert!(entries >= 12, "{entries} activity entries");
+        app.workspace_area
+            .set(Some(ratatui::layout::Rect::new(80, 0, 40, 30)));
+        app.mouse_scroll_at(90, 10, 3);
+        app.mouse_scroll_at(90, 10, 3);
+        assert_eq!(app.workspace_selected, 2, "two notches down = two entries");
+        assert_eq!(app.focus, Focus::Workspace);
+        app.mouse_scroll_at(90, 10, -3);
+        assert_eq!(app.workspace_selected, 1);
+        app.mouse_scroll_at(10, 10, 3);
+        assert_eq!(
+            app.workspace_selected, 1,
+            "a notch over the transcript leaves the workspace alone"
+        );
+        for _ in 0..80 {
+            app.mouse_scroll_at(90, 10, 3);
+        }
+        assert_eq!(
+            app.workspace_selected,
+            entries - 1,
+            "clamped to the last entry"
+        );
+    }
+
+    fn wall(source: &str, url: &str) -> AgentMsg {
+        AgentMsg::NeedsHuman {
+            source: source.into(),
+            what: "a token".into(),
+            url: url.into(),
+            reason: "no backend configured".into(),
+        }
+    }
+
+    /// A wall is a modal with three actions, not a toast pointing at a menu.
+    #[test]
+    fn a_wall_opens_a_modal_and_later_keeps_it_listed() {
+        let mut app = fresh();
+        app.apply_agent_msg(wall(
+            "patents",
+            "https://www.lens.org/lens/user/subscriptions",
+        ));
+        assert_eq!(app.needs_human_modal, Some(0), "the modal is up");
+        assert!(app.overlay_open());
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.needs_human_modal, None, "later closes it");
+        assert_eq!(
+            app.blockers.len(),
+            1,
+            "…and it stays listed for the palette"
+        );
+    }
+
+    /// `p` goes straight to the key window on the variable that unlocks the
+    /// source, and a saved key is followed by a tool reload.
+    #[test]
+    fn paste_the_key_lands_on_the_right_variable_and_reloads_tools() {
+        let mut app = fresh();
+        app.apply_agent_msg(wall(
+            "patents",
+            "https://www.lens.org/lens/user/subscriptions",
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(app.apikey_window.open, "the key window is open");
+        assert_eq!(
+            API_PROVIDERS[app.apikey_window.provider_idx].1,
+            "LENS_API_TOKEN"
+        );
+        assert!(app.apikey_window.reload_after_save);
+        assert_eq!(
+            key_env_for_source("cnki"),
+            None,
+            "an account wall has no key to paste"
+        );
+        assert_eq!(
+            key_env_for_source("semantic_scholar"),
+            Some("SEMANTIC_SCHOLAR_API_KEY")
+        );
+    }
+
+    /// `o` opens the wall's link; with PRISM_NO_BROWSER the URL goes to the
+    /// transcript so the reader can still reach it.
+    #[test]
+    fn open_the_link_sends_the_reader_to_the_wall() {
+        let mut app = fresh();
+        let _guard = env_guard("PRISM_NO_BROWSER", "1");
+        app.apply_agent_msg(wall(
+            "patents",
+            "https://www.lens.org/lens/user/subscriptions",
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let last = app
+            .messages
+            .last()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        assert!(last.contains("lens.org"), "{last}");
     }
 
     #[test]

@@ -43,6 +43,7 @@ pub mod knowledge;
 pub mod latex;
 pub mod markdown;
 pub mod marks;
+pub mod mouse_reassembly;
 pub mod msg;
 pub mod notebook;
 pub mod refs;
@@ -346,6 +347,17 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     use tokio::time::{Duration, interval};
     let mut events = EventStream::new();
     let mut tick = interval(Duration::from_millis(100));
+    // Mouse reports whose escape byte arrives alone are put back together
+    // here instead of being typed into the prompt (see mouse_reassembly.rs).
+    let mut reassembler = crate::mouse_reassembly::SgrReassembler::default();
+    fn dispatch(app: &mut app::App, ev: Event) {
+        match ev {
+            Event::Key(key) => app.handle_key(key),
+            Event::Mouse(m) => app.handle_mouse(m),
+            Event::Paste(text) => app.handle_paste(&text),
+            _ => {}
+        }
+    }
 
     // Install SIGINT handler — sets a flag the loop checks each iteration.
     // On Unix, we use a raw libc::sigaction handler for reliable signal
@@ -442,13 +454,15 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         #[cfg(not(unix))]
         {
             tokio::select! {
-                _ = tick.tick() => { app.prune_toasts(); }
+                _ = tick.tick() => {
+                    app.prune_toasts();
+                    for ev in reassembler.flush(std::time::Instant::now()) {
+                        dispatch(&mut app, ev);
+                    }
+                }
                 Some(Ok(ev)) = events.next() => {
-                    match ev {
-                        Event::Key(key) => app.handle_key(key),
-                        Event::Mouse(m) => app.handle_mouse(m),
-                        Event::Paste(text) => app.handle_paste(&text),
-                        _ => {}
+                    for ev in reassembler.feed(ev, std::time::Instant::now()) {
+                        dispatch(&mut app, ev);
                     }
                 }
                 Some(msg) = app.backend.recv() => {
@@ -464,14 +478,16 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         {
             tokio::select! {
                 // Render tick — fires every 100ms for animations + toast expiry.
-                _ = tick.tick() => { app.prune_toasts(); }
+                _ = tick.tick() => {
+                    app.prune_toasts();
+                    for ev in reassembler.flush(std::time::Instant::now()) {
+                        dispatch(&mut app, ev);
+                    }
+                }
                 // Terminal events (keyboard, resize, etc.)
                 Some(Ok(ev)) = events.next() => {
-                    match ev {
-                        Event::Key(key) => app.handle_key(key),
-                        Event::Mouse(m) => app.handle_mouse(m),
-                        Event::Paste(text) => app.handle_paste(&text),
-                        _ => {}
+                    for ev in reassembler.feed(ev, std::time::Instant::now()) {
+                        dispatch(&mut app, ev);
                     }
                 }
                 // Agent backend messages
