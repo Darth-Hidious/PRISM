@@ -212,6 +212,13 @@ def cutoff_for(species: list[str], pseudo_dir: Path, explicit: Optional[float]) 
     return ecut_ry, f"the set's hints, normal accuracy ({detail}); largest, in Ry"
 
 
+def omp_threads_for(nproc: int, cores: int) -> int:
+    """OpenMP threads per MPI rank so that ranks x threads fits the cores.
+    Measured 2026-09-05: unset, an MPI+OpenMP pw.x ran 12 ranks x 12 threads
+    on 12 cores and managed one SCF iteration in thirty minutes."""
+    return max(1, max(1, cores) // max(1, nproc))
+
+
 def kpoints_for(structure, kspacing_inv_angstrom: float) -> tuple[int, int, int]:
     """Monkhorst-Pack grid from a reciprocal spacing (Å⁻¹): ceil(|b_i| / spacing), at least 1.
 
@@ -302,9 +309,14 @@ def qe_run(
     cmd = [str(pw), "-in", str(in_path)]
     if launcher and nproc > 1:
         cmd = [str(launcher), "-np", str(nproc)] + cmd
+    ranks = nproc if launcher and nproc > 1 else 1
+    omp_threads = omp_threads_for(ranks, os.cpu_count() or 1)
+    env = {**os.environ, "OMP_NUM_THREADS": str(omp_threads)}
     started = time.monotonic()
     with open(out_path, "w") as fh:
-        proc = subprocess.run(cmd, stdout=fh, stderr=subprocess.PIPE, text=True, cwd=str(workdir))
+        proc = subprocess.run(
+            cmd, stdout=fh, stderr=subprocess.PIPE, text=True, cwd=str(workdir), env=env
+        )
     elapsed = time.monotonic() - started
     parsed = parse_output(out_path)
     result: dict[str, Any] = dict(parsed)
@@ -337,6 +349,7 @@ def qe_run(
         "smearing": system_extra,
         "calculation": calculation,
         "nproc": nproc if launcher and nproc > 1 else 1,
+        "omp_threads_per_rank": omp_threads,
         "returncode": proc.returncode,
         "stderr_tail": stderr_tail,
         "wall_seconds": round(elapsed, 3),

@@ -547,3 +547,29 @@ def test_qe_run_accepts_the_structure_the_way_its_schema_invites():
     assert "object" in schema["properties"]["structure"]["type"], schema["properties"]["structure"]
     desc = schema["properties"]["structure"]["description"].lower()
     assert "lookup" not in desc and "refused" in desc, f"no promise the loader cannot keep: {desc}"
+
+
+def test_mpi_ranks_get_one_openmp_thread_each(tmp_path):
+    """pw.x here is an MPI+OpenMP build. Launched as 12 ranks with the thread
+    count unset, each rank spawned 12 threads: 144 threads on 12 cores, one
+    SCF iteration in thirty minutes (2026-09-05), while the same input with
+    OMP_NUM_THREADS=1 finished in 28 s. The wrapper sets the threads per rank
+    so ranks x threads never exceeds the cores it was given."""
+    from app.tools.simulation.qe.runtime import qe_run, omp_threads_for
+
+    assert omp_threads_for(nproc=12, cores=12) == 1
+    assert omp_threads_for(nproc=4, cores=12) == 3
+    assert omp_threads_for(nproc=1, cores=12) == 12
+    assert omp_threads_for(nproc=24, cores=12) == 1
+    # The child sees it: a fake pw.x that reports its environment.
+    fake = tmp_path / "pw.x"
+    fake.write_text("#!/bin/sh\necho \"OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset}\"\nexit 0\n")
+    fake.chmod(0o755)
+    pseudo = tmp_path / "pseudo"; pseudo.mkdir()
+    (pseudo / "Si.upf").write_text("<UPF version=\"2.0.1\"></UPF>")
+    settings = {"pw_path": str(fake), "pseudo_dir": str(pseudo), "ecutwfc_ry": 30.0, "ecutrho_ratio": 4.0,
+                "kspacing_inv_angstrom": 0.5, "smearing": "mv", "degauss_ry": 0.01, "nproc": 1, "mpirun": None}
+    out = qe_run(si_structure(), calculation="scf", settings=settings, workdir=tmp_path / "run", mpirun=None)
+    written = (tmp_path / "run" / "pw.out").read_text()
+    assert "OMP_NUM_THREADS=unset" not in written, written
+    assert out["provenance"]["omp_threads_per_rank"] >= 1
