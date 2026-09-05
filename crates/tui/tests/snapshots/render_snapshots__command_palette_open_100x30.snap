@@ -1,6 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1011
+assertion_line: 1016
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
@@ -21,7 +21,7 @@ expression: rendered
 │    Assertions to re-verify By verification status opens a form │ │
 │    Bind terms              Free-text names onto … opens a form │ │
 │    Browse web page         Read a URL as text (H… opens a form │ │
-│  … 88 more — ↓ to scroll or type to filter                     │ │
+│  … 91 more — ↓ to scroll or type to filter                     │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
                                                                    │

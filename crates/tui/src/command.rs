@@ -727,6 +727,30 @@ pub static CATALOG: &[Command] = &[
         suggested: false,
     },
     Command {
+        id: "model.fallback.add",
+        title: "Add fallback model",
+        description: "A target tried when the model cannot answer",
+        category: "Session",
+        keybind: "/use fallback add",
+        suggested: false,
+    },
+    Command {
+        id: "model.fallback.list",
+        title: "Fallback models",
+        description: "The fallbacks, in the order tried",
+        category: "Session",
+        keybind: "/use fallback list",
+        suggested: false,
+    },
+    Command {
+        id: "model.fallback.clear",
+        title: "Clear fallback models",
+        description: "Drop every fallback target",
+        category: "Session",
+        keybind: "/use fallback clear",
+        suggested: false,
+    },
+    Command {
         id: "mcp.show",
         title: "MCP servers",
         description: "External MCP setup & status",
@@ -969,6 +993,9 @@ pub fn fuzzy_sorted(query: &str) -> Vec<&'static Command> {
 /// catalog so an entry without an effect fails the build's tests.
 pub fn effect(id: &str) -> String {
     let s = match id {
+        "model.fallback.add" => "opens a form",
+        "model.fallback.list" => "runs /use fallback list",
+        "model.fallback.clear" => "runs /use fallback clear",
         "sci.properties" | "sci.simulate" | "sci.predict" => "fills the prompt",
         "sci.research"
         | "browse.open"

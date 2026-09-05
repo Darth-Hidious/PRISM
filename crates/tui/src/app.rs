@@ -657,6 +657,8 @@ pub struct LinkPicker {
 /// enum is the dispatch table from "user pressed Enter" to an action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FormTarget {
+    /// Add a fallback chat target (palette `model.fallback.add`).
+    FallbackAdd,
     /// Set/clear the standing session goal (palette `goal.set`).
     Goal,
     /// Deep-research launch (palette `sci.research`) — composes a
@@ -3121,6 +3123,15 @@ impl App {
                     ToastKind::Info,
                 );
             }
+            FormTarget::FallbackAdd => match fallback_add_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
             FormTarget::SkillRun => match skill_run_command(&pane.form) {
                 Ok(cmd) => {
                     let _ = self.backend.send_command(&cmd);
@@ -3639,6 +3650,26 @@ impl App {
     /// Palette `node.up` — bring this machine online as a compute node.
     /// Submit dispatches `/node up ...`; the backend spawns and supervises
     /// the daemon in-process (tracked child, stoppable via `node.stop`).
+    /// Palette `model.fallback.add` — a target tried when the chat target
+    /// cannot answer. Exactly one of a local URL or a provider id.
+    pub fn open_fallback_add_form(&mut self) {
+        let form = Form::new(
+            "Add fallback model",
+            "add",
+            vec![
+                FormField::text("url", "Local URL", "").with_note(
+                    "an OpenAI-compatible server, e.g. http://10.0.0.2:8080/v1 — or leave empty",
+                ),
+                FormField::text("provider", "Provider", "")
+                    .with_note("a registry id, e.g. groq — or leave empty"),
+                FormField::text("model", "Model", ""),
+                FormField::text("api_key_env", "Key env var", "")
+                    .with_note("provider only; empty uses the provider's usual variable"),
+            ],
+        );
+        self.open_form(form, FormTarget::FallbackAdd);
+    }
+
     pub fn open_node_up_form(&mut self) {
         let form = Form::new(
             "Node up — connect this machine",
@@ -5434,6 +5465,13 @@ impl App {
             "links.open" => self.open_link_picker(),
             "cost.show" => self.modal = Some(Modal::Cost),
             "model.show" => self.open_model_picker(),
+            "model.fallback.add" => self.open_fallback_add_form(),
+            "model.fallback.list" => {
+                let _ = self.backend.send_command("/use fallback list");
+            }
+            "model.fallback.clear" => {
+                let _ = self.backend.send_command("/use fallback clear");
+            }
             "compute.gpus" => self.open_gpu_picker(),
             "nodes.show" => self.open_node_picker(),
             "node.up" => self.open_node_up_form(),
@@ -7391,6 +7429,37 @@ fn marketplace_install_command(form: &crate::form::Form) -> Result<String, &'sta
 /// Build `/node up [--name <name>] [--broadcast]` from the `node.up` form.
 /// An empty name is fine — the daemon falls back to the hostname — so this
 /// never fails validation.
+/// Build `/use fallback add …` from the `model.fallback.add` form: exactly one
+/// of `--url`/`--provider`, and a model.
+fn fallback_add_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let url = form.text_value("url").trim().to_string();
+    let provider = form.text_value("provider").trim().to_string();
+    let model = form.text_value("model").trim().to_string();
+    let key_env = form.text_value("api_key_env").trim().to_string();
+    if model.is_empty() {
+        return Err("name the model");
+    }
+    let mut args = vec!["use".to_string(), "fallback".to_string(), "add".to_string()];
+    match (url.is_empty(), provider.is_empty()) {
+        (false, true) => {
+            args.push("--url".to_string());
+            args.push(url);
+        }
+        (true, false) => {
+            args.push("--provider".to_string());
+            args.push(provider);
+            if !key_env.is_empty() {
+                args.push("--api-key-env".to_string());
+                args.push(key_env);
+            }
+        }
+        _ => return Err("fill exactly one of Local URL or Provider"),
+    }
+    args.push("--model".to_string());
+    args.push(model);
+    Ok(build_slash_command(&args))
+}
+
 fn node_up_command(form: &crate::form::Form) -> String {
     let mut args = vec!["node".to_string(), "up".to_string()];
     let name = form.text_value("name").trim().to_string();
@@ -7652,6 +7721,54 @@ mod tests {
         assert_eq!(
             app.apikey_window.provider_idx, 0,
             "the LLM-key entry keeps its first tab"
+        );
+    }
+
+    #[test]
+    fn fallback_models_are_reachable_from_the_palette() {
+        let mut app = fresh();
+        app.dispatch_command("model.fallback.add");
+        assert!(matches!(
+            app.form.as_ref().map(|f| &f.target),
+            Some(FormTarget::FallbackAdd)
+        ));
+    }
+
+    fn fallback_form(url: &str, provider: &str, model: &str, key_env: &str) -> crate::form::Form {
+        crate::form::Form::new(
+            "Add fallback model",
+            "add",
+            vec![
+                FormField::text("url", "Local URL", url),
+                FormField::text("provider", "Provider", provider),
+                FormField::text("model", "Model", model),
+                FormField::text("api_key_env", "Key env var", key_env),
+            ],
+        )
+    }
+
+    #[test]
+    fn the_fallback_form_composes_the_use_command() {
+        assert_eq!(
+            fallback_add_command(&fallback_form("http://10.0.0.2:8080/v1", "", "qwen", ""))
+                .unwrap(),
+            "/use fallback add --url http://10.0.0.2:8080/v1 --model qwen"
+        );
+        assert_eq!(
+            fallback_add_command(&fallback_form("", "groq", "qwen", "GROQ_KEY")).unwrap(),
+            "/use fallback add --provider groq --api-key-env GROQ_KEY --model qwen"
+        );
+        assert!(
+            fallback_add_command(&fallback_form("http://x/v1", "groq", "qwen", "")).is_err(),
+            "one of url/provider, not both"
+        );
+        assert!(
+            fallback_add_command(&fallback_form("", "", "qwen", "")).is_err(),
+            "one of url/provider, not neither"
+        );
+        assert!(
+            fallback_add_command(&fallback_form("http://x/v1", "", "", "")).is_err(),
+            "a model is required"
         );
     }
 

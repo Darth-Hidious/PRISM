@@ -62,6 +62,14 @@ pub enum UseAction {
     List,
     Show,
     Reset,
+    /// Append a fallback target: tried, in order, when the chat target
+    /// cannot answer. A marc27 target is refused (its credentials are session
+    /// state the fallback path does not hold).
+    FallbackAdd(ChatTarget),
+    /// Print the fallback list.
+    FallbackList,
+    /// Drop every fallback.
+    FallbackClear,
 }
 
 /// Result returned to the caller. Stays as data so the CLI surface and
@@ -83,6 +91,21 @@ pub struct UseOutcome {
 /// Apply the action. If `live_target` is `Some`, hot-swaps the running
 /// bridge so the next chat turn uses the new upstream. Pass `None`
 /// when running before prism boots (the shell `prism use` path) —
+/// The fallback list as the reader sees it: numbered, in the order tried, or
+/// how to add one.
+fn fallbacks_message(cfg: &chat_config::PrismConfig) -> String {
+    if cfg.fallbacks.is_empty() {
+        return "Fallbacks: none — `prism use fallback add --url <server> --model <id>` or \
+                `--provider <id> --model <id>`"
+            .to_string();
+    }
+    let mut out = String::from("Fallbacks (tried in order when the chat target cannot answer):");
+    for (i, target) in cfg.fallbacks.iter().enumerate() {
+        out.push_str(&format!("\n  {}. {}", i + 1, target.human_full()));
+    }
+    out
+}
+
 /// config is saved and the next launch picks it up.
 pub async fn apply(
     action: UseAction,
@@ -90,6 +113,40 @@ pub async fn apply(
     marc27_logged_in: bool,
 ) -> Result<UseOutcome> {
     let mut cfg = chat_config::load().unwrap_or_default();
+
+    // The fallback actions edit the list and leave the chat target alone.
+    match &action {
+        UseAction::FallbackAdd(target) => {
+            if matches!(target, ChatTarget::Marc27 { .. }) {
+                anyhow::bail!(
+                    "a marc27 target cannot be a fallback: its credentials are session state \
+                     the fallback path does not hold. Name a local server (--url) or a \
+                     registry provider (--provider)."
+                );
+            }
+            cfg.fallbacks.push(target.clone());
+            chat_config::save(&cfg)?;
+            return Ok(UseOutcome {
+                new_target: cfg.chat.clone(),
+                message: fallbacks_message(&cfg),
+            });
+        }
+        UseAction::FallbackList => {
+            return Ok(UseOutcome {
+                new_target: cfg.chat.clone(),
+                message: fallbacks_message(&cfg),
+            });
+        }
+        UseAction::FallbackClear => {
+            cfg.fallbacks.clear();
+            chat_config::save(&cfg)?;
+            return Ok(UseOutcome {
+                new_target: cfg.chat.clone(),
+                message: fallbacks_message(&cfg),
+            });
+        }
+        _ => {}
+    }
 
     let next = match action {
         UseAction::Marc27 { model } => ChatTarget::Marc27 { model },
@@ -205,13 +262,17 @@ pub async fn apply(
             return Ok(UseOutcome {
                 new_target: cfg.chat.clone(),
                 message: format!(
-                    "Chat:  \x1b[1m{}\x1b[0m\nTools: {tools_state}",
+                    "Chat:  \x1b[1m{}\x1b[0m\nTools: {tools_state}\n{fallbacks}",
                     cfg.chat.human_full(),
-                    tools_state = tools_state_line(marc27_logged_in)
+                    tools_state = tools_state_line(marc27_logged_in),
+                    fallbacks = fallbacks_message(&cfg)
                 ),
             });
         }
         UseAction::Reset => ChatTarget::Marc27 { model: None },
+        UseAction::FallbackAdd(_) | UseAction::FallbackList | UseAction::FallbackClear => {
+            unreachable!("handled above")
+        }
     };
 
     cfg.chat = next.clone();
@@ -493,6 +554,56 @@ mod tests {
             _tmp: tmp,
             _guard: guard,
         }
+    }
+
+    #[tokio::test]
+    async fn fallbacks_add_list_clear_roundtrip() {
+        let _h = isolated_home();
+        let local = ChatTarget::Local {
+            url: "http://10.0.0.2:8080/v1".into(),
+            model: "qwen".into(),
+            api_key: None,
+        };
+        let provider = ChatTarget::Provider {
+            provider: "groq".into(),
+            model: "llama".into(),
+            api_key_env: None,
+        };
+        apply(UseAction::FallbackAdd(local.clone()), None, true)
+            .await
+            .unwrap();
+        let out = apply(UseAction::FallbackAdd(provider.clone()), None, true)
+            .await
+            .unwrap();
+        assert!(out.message.contains("1. "), "{}", out.message);
+        assert!(out.message.contains("2. "), "{}", out.message);
+        assert_eq!(
+            chat_config::load().unwrap().fallbacks,
+            vec![local, provider]
+        );
+        // The chat target itself is untouched.
+        assert_eq!(out.new_target, ChatTarget::Marc27 { model: None });
+        // `show` names them too.
+        let shown = apply(UseAction::Show, None, true).await.unwrap();
+        assert!(shown.message.contains("Fallbacks"), "{}", shown.message);
+
+        let cleared = apply(UseAction::FallbackClear, None, true).await.unwrap();
+        assert!(cleared.message.contains("none"), "{}", cleared.message);
+        assert!(chat_config::load().unwrap().fallbacks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_marc27_fallback_is_refused() {
+        let _h = isolated_home();
+        let err = apply(
+            UseAction::FallbackAdd(ChatTarget::Marc27 { model: None }),
+            None,
+            true,
+        )
+        .await
+        .expect_err("marc27 cannot be a fallback");
+        assert!(format!("{err:#}").contains("session state"), "{err:#}");
+        assert!(chat_config::load().unwrap().fallbacks.is_empty());
     }
 
     #[tokio::test]

@@ -1748,6 +1748,10 @@ enum DiscourseCommands {
 /// pinned model (PRISM's compiled-in default).
 #[derive(Debug, Subcommand)]
 enum UseCommands {
+    /// Fallback targets tried, in order, when the chat target cannot answer
+    /// (`prism use fallback add|list|clear`).
+    #[command(subcommand)]
+    Fallback(FallbackCommands),
     /// Stay on the hosted route, but pin a specific upstream model
     /// (`gpt-5.5`, `claude-sonnet-4`, `mistral-large-latest`, …).
     /// The platform's own vendor keys stay there — PRISM only passes
@@ -1803,6 +1807,28 @@ enum UseCommands {
     Show,
     /// Reset chat target back to the hosted route (the default).
     Reset,
+}
+
+#[derive(Debug, Subcommand)]
+enum FallbackCommands {
+    /// Append a fallback. Name exactly one of --url (a local OpenAI-compatible
+    /// server) or --provider (a registry provider id).
+    Add {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: String,
+        /// Provider only: the env var holding its key (default: the
+        /// provider's usual variable).
+        #[arg(long)]
+        api_key_env: Option<String>,
+    },
+    /// Print the fallback list in the order tried.
+    List,
+    /// Drop every fallback.
+    Clear,
 }
 
 #[derive(Debug, Clone)]
@@ -12958,6 +12984,31 @@ async fn handle_use_command(command: UseCommands) -> Result<()> {
         UseCommands::List => use_command::UseAction::List,
         UseCommands::Show => use_command::UseAction::Show,
         UseCommands::Reset => use_command::UseAction::Reset,
+        UseCommands::Fallback(FallbackCommands::Add {
+            url,
+            provider,
+            model,
+            api_key_env,
+        }) => {
+            let target = match (url, provider) {
+                (Some(url), None) => chat_config::ChatTarget::Local {
+                    url,
+                    model,
+                    api_key: None,
+                },
+                (None, Some(provider)) => chat_config::ChatTarget::Provider {
+                    provider,
+                    model,
+                    api_key_env,
+                },
+                _ => anyhow::bail!(
+                    "name exactly one of --url (a local server) or --provider (a registry provider)"
+                ),
+            };
+            use_command::UseAction::FallbackAdd(target)
+        }
+        UseCommands::Fallback(FallbackCommands::List) => use_command::UseAction::FallbackList,
+        UseCommands::Fallback(FallbackCommands::Clear) => use_command::UseAction::FallbackClear,
     };
     // We're running before prism boots, so there's no live bridge to
     // hot-swap — only the persisted config matters. Detect whether the
