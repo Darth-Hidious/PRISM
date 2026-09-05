@@ -62,6 +62,45 @@ pub fn call_timeout() -> Option<std::time::Duration> {
     )
 }
 
+/// Margin added to a tool's own promise before PRISM stops waiting: the
+/// tool's subprocess is killed at its deadline and the result still has to be
+/// serialised and written.
+pub const PROMISE_MARGIN_SECS: u64 = 60;
+
+/// Tools that run code in a subprocess with a deadline of their own:
+/// (name, default seconds when the call gives none, hard maximum).
+const PROMISING_TOOLS: &[(&str, u64, u64)] =
+    &[("execute_python", 60, 300), ("execute_bash", 60, 300)];
+
+/// How long to wait for this call. A tool that promises to finish within N
+/// seconds (explicitly in its `timeout` argument, or by its documented
+/// default) is waited for N plus [`PROMISE_MARGIN_SECS`]; a tool that
+/// promises nothing keeps the operator's ceiling, which may be none.
+///
+/// Measured 2026-09-05: an execute_python call never answered — the server
+/// sat on a condition variable with no child process — and with no ceiling
+/// the agent waited on the pipe for the rest of the session. Scientific work
+/// is still allowed to be slow: only a tool's own promise bounds the wait.
+#[must_use]
+pub fn ceiling_for_call(
+    tool: &str,
+    args: &Value,
+    operator_ceiling: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let Some((_, default_secs, max_secs)) = PROMISING_TOOLS.iter().find(|(n, _, _)| *n == tool)
+    else {
+        return operator_ceiling;
+    };
+    let promised = args
+        .get("timeout")
+        .and_then(|v| v.as_f64())
+        .filter(|s| *s > 0.0)
+        .map_or(*default_secs, |s| s.ceil() as u64)
+        .min(*max_secs);
+    let own = std::time::Duration::from_secs(promised + PROMISE_MARGIN_SECS);
+    Some(operator_ceiling.map_or(own, |op| op.min(own)))
+}
+
 /// [`call_timeout`]'s decision, separated from the environment so it is
 /// testable without mutating global state.
 #[must_use]
@@ -301,14 +340,16 @@ impl ToolServerHandle {
         self.call(&req).await
     }
 
-    /// Call a named tool with the given arguments.
+    /// Call a named tool with the given arguments. The wait is bounded by the
+    /// tool's own promise when it makes one (see [`ceiling_for_call`]).
     pub async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value, PythonBridgeError> {
+        let ceiling = ceiling_for_call(name, &args, call_timeout());
         let req = serde_json::json!({
             "method": "call_tool",
             "tool": name,
             "args": args,
         });
-        self.call(&req).await
+        self.call_with_timeout(&req, ceiling).await
     }
 
     /// Set the artifact recorder's authoritative session identifier.
@@ -702,5 +743,61 @@ for line in sys.stdin:
         // SAFETY: as above.
         unsafe { std::env::remove_var("PRISM_PARENT_ONLY_SECRET") };
         worker.shutdown().await.expect("shutdown worker");
+    }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Run 2 of the SX500 research (2026-09-05): an execute_python call the
+    /// tool itself would have ended within 60 s never answered, and with no
+    /// ceiling the agent waited on the pipe for the rest of the session. A
+    /// tool that promises to finish in N seconds is waited for N + a margin;
+    /// a tool that promises nothing keeps the operator's rule.
+    #[test]
+    fn the_tools_own_promise_bounds_the_wait() {
+        let explicit =
+            ceiling_for_call("execute_python", &serde_json::json!({"timeout": 120}), None);
+        assert_eq!(
+            explicit,
+            Some(Duration::from_secs(120 + PROMISE_MARGIN_SECS))
+        );
+        let implicit = ceiling_for_call(
+            "execute_python",
+            &serde_json::json!({"code": "print(1)"}),
+            None,
+        );
+        assert_eq!(
+            implicit,
+            Some(Duration::from_secs(60 + PROMISE_MARGIN_SECS)),
+            "code.py's default is 60 s"
+        );
+        let bash = ceiling_for_call("execute_bash", &serde_json::json!({"timeout": 30}), None);
+        assert_eq!(bash, Some(Duration::from_secs(30 + PROMISE_MARGIN_SECS)));
+        assert_eq!(
+            ceiling_for_call("qe_run", &serde_json::json!({}), None),
+            None,
+            "no promise, no ceiling"
+        );
+        assert_eq!(
+            ceiling_for_call(
+                "qe_run",
+                &serde_json::json!({}),
+                Some(Duration::from_secs(900))
+            ),
+            Some(Duration::from_secs(900)),
+            "the operator's ceiling still applies to a tool without a promise"
+        );
+        assert_eq!(
+            ceiling_for_call(
+                "execute_python",
+                &serde_json::json!({"timeout": 5000}),
+                None
+            ),
+            Some(Duration::from_secs(300 + PROMISE_MARGIN_SECS)),
+            "a promise above the tool's own maximum is read as that maximum"
+        );
     }
 }
