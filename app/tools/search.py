@@ -21,6 +21,7 @@ first because it has a richer description.
 """
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -188,6 +189,7 @@ def _eastern_search_impl(**kwargs) -> dict:
         query=kwargs.get("query", ""),
         max_results=kwargs.get("max_results", 20),
         sources=kwargs.get("sources"),
+        queries=kwargs.get("queries"),
     )
     results = out["results"]
     for r in results:
@@ -260,6 +262,40 @@ def _declare_literature_sources(outcome: dict) -> list[dict]:
 _literature_search_impl.declare_sources = _declare_literature_sources
 
 
+def _declare_eastern_sources(status: dict) -> list[dict]:
+    """The eastern collector's per-source lines, in the shape the source table
+    reads. `ok (N …)` is an answer with a count; blocked / skipped / timeout /
+    error carry the reason and `count: None` — no answer is not zero results.
+    Without this the table showed nothing for a Russian or Chinese search."""
+    fetched = utc_now_iso()
+    rows = []
+    for name, line in (status or {}).items():
+        line = str(line or "")
+        if line.startswith("ok"):
+            m = re.match(r"ok \((\d+)", line)
+            rows.append({
+                "source": name,
+                "kind": "non-Western literature metadata",
+                "count": int(m.group(1)) if m else 0,
+                "fetched": fetched,
+                "status": "ok",
+                "record": {"status": "ok", "detail": line},
+            })
+            continue
+        state = line.split(":", 1)[0].strip().lower()
+        if state not in ("blocked", "skipped", "timeout", "error"):
+            state = "error"
+        rows.append({
+            "source": name,
+            "kind": "non-Western literature metadata",
+            "count": None,
+            "fetched": fetched,
+            "status": state,
+            "record": {"status": state, "error": line or "no status reported"},
+        })
+    return rows
+
+
 def _prior_art_search(**kwargs) -> dict:
     """Federated prior-art lookup.
 
@@ -315,12 +351,14 @@ def _prior_art_search(**kwargs) -> dict:
                 query=query,
                 max_results=max_results,
                 sources=kwargs.get("eastern_sources"),
+                queries=kwargs.get("queries"),
             )
             out["eastern"] = east.get("results", [])
             out["counts"]["eastern"] = east.get("count", 0)
             # Gated sources (CNKI, eLIBRARY, Wanfang) report here by name so
             # "no Chinese results" is never mistaken for "nothing published".
             out["eastern_source_status"] = east.get("source_status", {})
+            out["sources"].extend(_declare_eastern_sources(out["eastern_source_status"]))
         except Exception as exc:
             out["eastern_error"] = str(exc)
 
@@ -403,9 +441,14 @@ def create_search_tools(registry: ToolRegistry) -> None:
             "Federated prior-art search across scientific literature "
             "(arXiv, Semantic Scholar), patents (whichever patent backend the "
             "operator configured), AND non-Western "
-            "sources (CyberLeninka's Russian aerospace-materials journals, "
+            "sources (OpenAlex filtered to Chinese/Russian/Japanese-language "
+            "literature, CyberLeninka's Russian aerospace-materials journals, "
             "NASA Technical Translations of Soviet work, J-STAGE Japanese "
-            "metallurgy, scanned Soviet handbooks on Internet Archive). Use "
+            "metallurgy, scanned handbooks on Internet Archive). For 'eastern' "
+            "or 'both', TRANSLATE the query yourself and pass `queries` "
+            "({'ru': …, 'zh': …, 'ja': …}): each source only receives a "
+            "language it indexes, and a source with no usable query is "
+            "reported as skipped with the language it needs. Use "
             "this for any 'what has been published / patented about X?' "
             "question. The `source` flag selects 'papers' (default), "
             "'patents', 'eastern', or 'both'. Returns a uniform shape "
@@ -459,10 +502,24 @@ def create_search_tools(registry: ToolRegistry) -> None:
                     "items": {"type": "string"},
                     "description": (
                         "Optional override for the `eastern` backend list "
-                        "(default: cyberleninka, ntrs_translations, jstage, "
-                        "internet_archive). Naming a gated source (elibrary, "
-                        "cnki, wanfang) returns the credential it needs rather "
-                        "than an empty list."
+                        "(default: openalex, cyberleninka, ntrs_translations, "
+                        "jstage, internet_archive). Naming a gated source "
+                        "(elibrary, cnki, wanfang) returns the credential it "
+                        "needs rather than an empty list."
+                    ),
+                },
+                "queries": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": (
+                        "The query translated by you into the languages of the "
+                        "eastern sources, keyed by ISO code: {'ru': 'жаропрочный "
+                        "сплав покрытие', 'zh': '高温合金 涂层', 'ja': '耐熱合金 "
+                        "コーティング'}. Russian reaches CyberLeninka and "
+                        "OpenAlex(ru); Chinese reaches OpenAlex(zh) and archive "
+                        "scans; Japanese reaches J-STAGE and OpenAlex(ja). "
+                        "Without a translation the source is skipped and says "
+                        "so — supply it and search again."
                     ),
                 },
                 "max_results": {

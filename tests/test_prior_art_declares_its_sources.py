@@ -139,3 +139,38 @@ def test_the_search_result_itself_carries_an_evidence_class(monkeypatch):
     out = search._prior_art_search(query="anything", source="papers", max_results=1)
     assert out.get("evidence_class") == "research", out.get("evidence_class")
     assert out.get("evidence_color") == "orange"
+
+
+def test_the_eastern_branch_declares_its_sources(monkeypatch):
+    """The eastern branch put its per-source outcome in `eastern_source_status`
+    only, so the source table showed nothing for a Russian/Chinese search — the
+    same blank the papers branch had. Every eastern source consulted is a row:
+    ok with a count; blocked/skipped/timeout/error with the reason and no count."""
+    import app.tools.search as search
+
+    monkeypatch.setattr(search, "_eastern_search_impl", lambda **kw: {
+        "results": [], "count": 0, "source": "eastern_literature",
+        "source_status": {
+            "openalex:zh": "ok (5 of 2123; language:zh; query in zh)",
+            "cyberleninka": "skipped: needs a Russian query — pass queries={'ru': …}",
+            "cnki": "blocked: CNKI (中国知网): licence required. Not collected.",
+            "jstage": "timeout: no answer within 45s",
+            "internet_archive": "error: HTTPError: 503",
+        },
+    })
+    out = search._prior_art_search(query="高温合金 涂层", source="eastern", max_results=5)
+    rows = {r["source"]: r for r in out["sources"]}
+    assert set(rows) == {"openalex:zh", "cyberleninka", "cnki", "jstage", "internet_archive"}
+    assert rows["openalex:zh"]["status"] == "ok" and rows["openalex:zh"]["count"] == 5
+    for name, state in (("cyberleninka", "skipped"), ("cnki", "blocked"),
+                        ("jstage", "timeout"), ("internet_archive", "error")):
+        assert rows[name]["status"] == state, rows[name]
+        assert rows[name]["count"] is None, "no answer is not zero results"
+        assert rows[name]["record"]["error"], rows[name]
+    assert all(r["kind"] for r in out["sources"])
+    # The model's translations are passed through to the collector.
+    seen = {}
+    monkeypatch.setattr(search, "_eastern_search_impl",
+                        lambda **kw: seen.update(kw) or {"results": [], "count": 0, "source_status": {}})
+    search._prior_art_search(query="x", source="eastern", queries={"zh": "高温合金"})
+    assert seen["queries"] == {"zh": "高温合金"}

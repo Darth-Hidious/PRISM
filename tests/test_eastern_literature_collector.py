@@ -81,6 +81,13 @@ ARCHIVE_JSON = {"response": {"docs": [{
 }]}}
 
 
+@pytest.fixture(autouse=True)
+def _isolated_eastern_cache(tmp_path, monkeypatch):
+    """Every test gets its own harvest cache: a page cached by one test must
+    never answer the next test's 'network failed' scenario."""
+    monkeypatch.setenv("PRISM_EASTERN_CACHE_DIR", str(tmp_path / "eastern-cache"))
+
+
 def _resp(content=None, json_body=None):
     r = MagicMock()
     r.raise_for_status = MagicMock()
@@ -95,7 +102,7 @@ class TestCollectorContract:
     def test_name_and_params(self):
         c = EasternLiteratureCollector()
         assert c.name == "eastern_literature"
-        assert set(c.supported_params()) == {"query", "max_results", "sources"}
+        assert set(c.supported_params()) == {"query", "max_results", "sources", "queries"}
 
     def test_empty_query_returns_empty(self):
         c = EasternLiteratureCollector()
@@ -153,7 +160,8 @@ class TestCollectorContract:
              patch.object(EasternLiteratureCollector, "_search_jstage",
                           return_value=(good, None)):
             out = c.collect_with_status(
-                query="сплав", sources=["cyberleninka", "jstage"])
+                query="сплав", sources=["cyberleninka", "jstage"],
+                queries={"en": "alloy"})  # J-STAGE is only asked in a language it indexes
         assert out["results"] == good, "healthy source's results were discarded"
         assert out["source_status"]["cyberleninka"].startswith("error:")
         assert "backend exploded" in out["source_status"]["cyberleninka"]
@@ -565,3 +573,213 @@ class TestRealSources:
             "ГОСТ сталь", max_results=3)
         assert err is None, err
         assert hits, "Internet Archive returned nothing for 'ГОСТ сталь'"
+
+
+# ── Measured 2026-09-05 on the live sources ──────────────────────────────────
+# English query → CyberLeninka scanned 240 Russian titles in 7.3 s and matched
+# nothing (English stems vs Russian titles); Russian query → J-STAGE ERR_001;
+# Chinese query → no reachable source at all (CyberLeninka 503 with no retry,
+# J-STAGE rejects it, archive.org returned GitHub mirrors). OpenAlex with a
+# language filter answered 2,123 Chinese titles in 0.8 s. The four backends ran
+# one after another. These tests pin the fixes.
+
+import time as _time
+
+OPENALEX_JSON = {
+    "meta": {"count": 2123},
+    "results": [{
+        "id": "https://openalex.org/W1",
+        "display_name": "钛合金表面梯度Al2O3陶瓷涂层的高温抗氧化性能",
+        "publication_year": 2017,
+        "language": "zh",
+        "doi": "https://doi.org/10.1000/zh1",
+        "authorships": [{"author": {"display_name": "张伟"}}],
+        "primary_location": {"source": {"display_name": "材料保护"}},
+    }],
+}
+
+
+class TestRoutingAndSpeed:
+    def test_backends_run_concurrently_within_a_deadline(self):
+        """One slow source must not hold the others hostage, and past the
+        deadline it is NAMED as late — not hung on, not silently dropped."""
+        c = EasternLiteratureCollector()
+
+        def slow(query, n):
+            _time.sleep(3)
+            return [], None
+
+        fast = [{"source": "jstage", "title": JA_TITLE}]
+        with patch.object(EasternLiteratureCollector, "_search_cyberleninka", side_effect=slow), \
+             patch.object(EasternLiteratureCollector, "_search_jstage", return_value=(fast, None)):
+            t0 = _time.time()
+            out = c.collect_with_status(
+                query="耐熱合金の開発", sources=["cyberleninka", "jstage"],
+                queries={"ru": "сплав"}, deadline_s=1.0)
+            elapsed = _time.time() - t0
+        assert elapsed < 2.5, f"the deadline did not bound the call: {elapsed:.1f}s"
+        assert out["results"] == fast
+        assert out["source_status"]["cyberleninka"].startswith("timeout:")
+        assert out["source_status"]["jstage"].startswith("ok")
+
+    def test_a_russian_only_source_is_skipped_without_a_russian_query_and_says_so(self):
+        """CyberLeninka's titles are Russian. Filtering them with English stems
+        cost 7 s and matched nothing — the honest, fast answer is to say what
+        is missing."""
+        c = EasternLiteratureCollector()
+        with patch("app.tools.data_collectors.eastern_literature_collector.requests") as rq:
+            out = c.collect_with_status(query="nickel superalloy coating",
+                                        sources=["cyberleninka"])
+            assert not rq.get.called, "no harvest without a Russian query"
+        status = out["source_status"]["cyberleninka"]
+        assert status.startswith("skipped:"), status
+        assert "Russian" in status and "queries" in status, status
+
+    def test_the_models_translation_reaches_the_source_that_indexes_it(self):
+        seen = {}
+
+        def cyber(query, n):
+            seen["cyberleninka"] = query
+            return [], "ok (0 results)"
+
+        def jstage(query, n):
+            seen["jstage"] = query
+            return [], None
+
+        c = EasternLiteratureCollector()
+        with patch.object(EasternLiteratureCollector, "_search_cyberleninka", side_effect=cyber), \
+             patch.object(EasternLiteratureCollector, "_search_jstage", side_effect=jstage):
+            c.collect_with_status(query="nickel superalloy coating",
+                                  sources=["cyberleninka", "jstage"],
+                                  queries={"ru": "жаропрочный сплав покрытие"})
+        assert seen["cyberleninka"] == "жаропрочный сплав покрытие"
+        # No Japanese query was given: J-STAGE indexes English too, so it gets
+        # the English one rather than nothing.
+        assert seen["jstage"] == "nickel superalloy coating"
+
+    def test_cyrillic_never_goes_to_jstage(self):
+        """J-STAGE answers Cyrillic with ERR_001. Sending it is a wasted
+        round-trip that reads as an error; skipping it names the reason."""
+        c = EasternLiteratureCollector()
+        with patch("app.tools.data_collectors.eastern_literature_collector.requests") as rq:
+            out = c.collect_with_status(query="жаропрочный сплав", sources=["jstage"])
+            assert not rq.get.called
+        status = out["source_status"]["jstage"]
+        assert status.startswith("skipped:"), status
+        assert "Japanese" in status or "English" in status, status
+
+    def test_the_base_query_language_is_detected_from_its_script(self):
+        c = EasternLiteratureCollector()
+        assert c._queries_by_language("жаропрочный сплав", None) == {"ru": "жаропрочный сплав"}
+        assert c._queries_by_language("高温合金 涂层", None) == {"zh": "高温合金 涂层"}
+        # Kanji alone is not detectably Japanese (it is also Chinese); kana is.
+        assert c._queries_by_language("耐熱合金", None) == {"zh": "耐熱合金"}
+        assert c._queries_by_language("耐熱合金の開発", None) == {"ja": "耐熱合金の開発"}
+        merged = c._queries_by_language("nickel superalloy", {"ru": "сплав", "zh": ""})
+        assert merged == {"en": "nickel superalloy", "ru": "сплав"}, "blank translations are dropped"
+
+    def test_cjk_query_tokens_are_not_dropped_for_being_short(self):
+        from app.tools.data_collectors.eastern_literature_collector import _query_tokens
+        assert _query_tokens("高温合金 涂层") == ["高温合金", "涂层"]
+        assert _query_tokens("耐熱合金 コーティング") == ["耐熱合金", "コーティング"]
+
+
+class TestOpenAlex:
+    @patch("app.tools.data_collectors.eastern_literature_collector.requests")
+    def test_language_filter_and_native_title(self, mock_requests):
+        mock_requests.get.return_value = _resp(json_body=OPENALEX_JSON)
+        c = EasternLiteratureCollector()
+        hits, err = c._search_openalex("高温合金 涂层", 5, language="zh")
+        params = mock_requests.get.call_args.kwargs["params"]
+        assert params["filter"] == "language:zh"
+        assert params["search"] == "高温合金 涂层"
+        assert err.startswith("ok (1 of 2123"), err
+        rec = hits[0]
+        assert rec["source"] == "openalex"
+        assert rec["title"] == "钛合金表面梯度Al2O3陶瓷涂层的高温抗氧化性能"
+        assert rec["source_language"] == "zh" and rec["language_basis"] == "declared"
+        assert rec["authors"] == ["张伟"]
+        assert rec["doi"] == "10.1000/zh1"
+        assert rec["journal"] == "材料保护"
+
+    @patch("app.tools.data_collectors.eastern_literature_collector.requests")
+    def test_english_query_is_used_when_no_native_one_and_the_status_says_so(self, mock_requests):
+        mock_requests.get.return_value = _resp(json_body=OPENALEX_JSON)
+        c = EasternLiteratureCollector()
+        out = c.collect_with_status(query="nickel superalloy coating",
+                                    sources=["openalex"], deadline_s=10)
+        status = out["source_status"]["openalex:zh"]
+        assert status.startswith("ok"), status
+        assert "query in en" in status and "queries" in status, status
+
+    @patch("app.tools.data_collectors.eastern_literature_collector.requests")
+    def test_one_request_per_language_with_the_native_query_when_given(self, mock_requests):
+        mock_requests.get.return_value = _resp(json_body=OPENALEX_JSON)
+        c = EasternLiteratureCollector()
+        out = c.collect_with_status(
+            query="nickel superalloy coating", sources=["openalex"], deadline_s=10,
+            queries={"zh": "高温合金 涂层", "ru": "жаропрочный сплав"})
+        sent = {kw["params"]["filter"]: kw["params"]["search"]
+                for _, kw in mock_requests.get.call_args_list}
+        assert sent["language:zh"] == "高温合金 涂层"
+        assert sent["language:ru"] == "жаропрочный сплав"
+        assert sent["language:ja"] == "nickel superalloy coating"
+        assert set(out["source_status"]) == {"openalex:zh", "openalex:ru", "openalex:ja"}
+
+    @patch("app.tools.data_collectors.eastern_literature_collector.requests")
+    def test_no_contact_address_is_invented(self, mock_requests):
+        """OpenAlex's polite pool wants a mailto; PRISM has none to give unless
+        the operator set one. A made-up address is a lie to a third party."""
+        mock_requests.get.return_value = _resp(json_body=OPENALEX_JSON)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PRISM_CONTACT_EMAIL", None)
+            EasternLiteratureCollector()._search_openalex("x", 5, language="zh")
+        assert "mailto" not in mock_requests.get.call_args.kwargs["params"]
+
+
+class TestCyberLeninkaSpeed:
+    @patch("app.tools.data_collectors.eastern_literature_collector.requests")
+    def test_harvested_pages_are_cached_and_reused(self, mock_requests, tmp_path):
+        mock_requests.get.return_value = _resp(content=OAI_XML)
+        with patch.dict(os.environ, {"PRISM_EASTERN_CACHE_DIR": str(tmp_path)}):
+            c = EasternLiteratureCollector()
+            hits, err = c._search_cyberleninka("сплав", max_results=5)
+            first_calls = mock_requests.get.call_count
+            assert hits and first_calls > 0
+            hits2, err2 = c._search_cyberleninka("сплав", max_results=5)
+        assert mock_requests.get.call_count == first_calls, "second search must read the cache"
+        assert hits2[0]["title"] == hits[0]["title"]
+        assert "cache" in err2, err2
+
+    @patch("app.tools.data_collectors.eastern_literature_collector.requests")
+    def test_a_503_is_retried_once(self, mock_requests, tmp_path):
+        import requests as real_requests
+        bad = MagicMock()
+        bad.raise_for_status.side_effect = real_requests.HTTPError("503 Server Error")
+        bad.status_code = 503
+        good = _resp(content=OAI_XML)
+        mock_requests.HTTPError = real_requests.HTTPError
+        mock_requests.exceptions = real_requests.exceptions
+        # one set: first page 503, retry ok, no further pages (no resumptionToken)
+        mock_requests.get.side_effect = [bad, good]
+        with patch.dict(os.environ, {"PRISM_EASTERN_CACHE_DIR": str(tmp_path)}), \
+             patch.object(EasternLiteratureCollector, "CYBERLENINKA_SETS", ("journal_1",)):
+            hits, err = EasternLiteratureCollector()._search_cyberleninka("сплав", max_results=50)
+        assert hits, err
+        assert err.startswith("ok ("), err
+
+
+class TestArchiveRelevance:
+    @patch("app.tools.data_collectors.eastern_literature_collector.requests")
+    def test_texts_only_and_off_topic_hits_are_dropped_and_counted(self, mock_requests):
+        docs = {"response": {"docs": [
+            {"identifier": "a", "title": "搪瓷涂层700℃长期抗高温氧化行为研究", "language": "chi"},
+            {"identifier": "b", "title": "github.com-GitHubDaily-2022-06-11", "language": None},
+        ]}}
+        mock_requests.get.return_value = _resp(json_body=docs)
+        c = EasternLiteratureCollector()
+        hits, err = c._search_archive("高温合金 涂层", max_results=5)
+        params = dict(mock_requests.get.call_args.kwargs["params"])
+        assert "mediatype:texts" in params["q"], params["q"]
+        assert [h["title"] for h in hits] == ["搪瓷涂层700℃长期抗高温氧化行为研究"]
+        assert err and "1 off-topic dropped" in err, err

@@ -17,17 +17,34 @@ Reachable backends (official APIs / documented protocols only):
                      the original language, so no per-record origin is claimed.
   jstage             J-STAGE public WebAPI. Japanese metallurgy (ISIJ, JIM),
                      bilingual ja/en metadata.
-  internet_archive   archive.org advancedsearch — scanned Soviet handbooks and
-                     GOST standards.
+  internet_archive   archive.org advancedsearch, texts only — scanned Soviet
+                     handbooks, GOST standards, Chinese technical scans.
+  openalex           OpenAlex works filtered by language (zh / ru / ja): the
+                     reachable index of Chinese, Russian and Japanese journal
+                     literature — native titles, DOIs, declared language.
+                     Keyless. The only Chinese-language path that answers.
+
+Queries are ROUTED BY LANGUAGE. The caller (the model) supplies translations
+in `queries` ({"ru": …, "zh": …, "ja": …}); each source receives only a
+language it indexes — CyberLeninka's titles are Russian, J-STAGE rejects
+Cyrillic, NTRS translations are English. A source with no usable query is
+SKIPPED and says which language it needs, instead of scanning for seven
+seconds and matching nothing. Sources run concurrently under one deadline; a
+late source is named as late, never waited on forever.
 
 Gated backends are declared, not faked: they return a named error saying what
 credential or licence is required. An unreachable source must never look like
 an empty one.
 """
+import concurrent.futures as cf
 import hashlib
+import json
+import os
 import time
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Optional
+from functools import partial
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -40,7 +57,11 @@ try:  # pragma: no cover - depends on install profile
 except ImportError:  # pragma: no cover
     _xml_fromstring = ET.fromstring
 
-from app.tools.data_collectors.alloy_designations import find_designations, infer_language
+from app.tools.data_collectors.alloy_designations import (
+    detect_script,
+    find_designations,
+    infer_language,
+)
 from app.tools.data_collectors.base_collector import DataCollector
 
 # Sources that exist but cannot be collected without credentials or a licence.
@@ -88,8 +109,21 @@ def _crude_stem(token: str) -> str:
     return token[:6]
 
 
+_SCRIPT_TO_LANG = {"cyrillic": "ru", "han": "zh", "japanese": "ja",
+                   "hangul": "ko", "latin": "en"}
+_LANGUAGE_NAMES = {"ru": "Russian", "zh": "Chinese", "ja": "Japanese",
+                   "ko": "Korean", "en": "English"}
+
+
 def _query_tokens(query: str) -> List[str]:
-    """Stemmed, stopword-free tokens for the local relevance filter."""
+    """Stemmed, stopword-free tokens for the local relevance filter.
+
+    CJK terms are whitespace chunks kept whole: "涂层" (coating) is two
+    characters, and the Latin/Cyrillic 3-character floor dropped it — so a
+    Chinese query had no tokens and matched nothing.
+    """
+    if detect_script(query) in ("han", "japanese", "hangul"):
+        return [t for t in query.split() if t and t not in _STOPWORDS]
     return [_crude_stem(t) for t in query.lower().split()
             if len(t) >= 3 and t not in _STOPWORDS]
 
@@ -103,6 +137,17 @@ class EasternLiteratureCollector(DataCollector):
     name = "eastern_literature"
 
     CYBERLENINKA_OAI = "https://cyberleninka.ru/oai"
+    OPENALEX_API = "https://api.openalex.org/works"
+    OPENALEX_LANGUAGES = ("zh", "ru", "ja")
+    # Which languages each backend can actually be asked in. `None` = any.
+    SOURCE_LANGUAGES: Dict[str, Optional[Tuple[str, ...]]] = {
+        "cyberleninka": ("ru",),
+        "ntrs_translations": ("en",),
+        "jstage": ("ja", "en"),
+        "internet_archive": None,
+    }
+    DEFAULT_DEADLINE_S = 45.0
+    CACHE_TTL_S = 24 * 3600
     NTRS_API = "https://ntrs.nasa.gov/api/citations/search"
     JSTAGE_API = "https://api.jstage.jst.go.jp/searchapi/do"
     ARCHIVE_API = "https://archive.org/advancedsearch.php"
@@ -126,57 +171,120 @@ class EasternLiteratureCollector(DataCollector):
     }
     ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
 
-    DEFAULT_SOURCES = ("cyberleninka", "ntrs_translations", "jstage", "internet_archive")
+    DEFAULT_SOURCES = ("openalex", "cyberleninka", "ntrs_translations", "jstage",
+                       "internet_archive")
     PAGE_DELAY_S = 0.2  # politeness between OAI pages
+
+    def supported_params(self) -> List[str]:
+        return ["query", "max_results", "sources", "queries"]
 
     def collect(self, query: str = "", max_results: int = 20,
                 sources: Optional[List[str]] = None, **kwargs) -> List[Dict]:
-        return self.collect_with_status(query, max_results, sources)["results"]
+        return self.collect_with_status(
+            query, max_results, sources, queries=kwargs.get("queries"))["results"]
+
+    @staticmethod
+    def _queries_by_language(query: str, queries: Optional[Dict[str, str]]) -> Dict[str, str]:
+        """The query in every language we have it: the base query under the
+        language its script says it is, plus the caller's translations (blank
+        ones dropped)."""
+        langs: Dict[str, str] = {}
+        base = (query or "").strip()
+        if base:
+            langs[_SCRIPT_TO_LANG.get(detect_script(base), "en")] = base
+        for lang, text in (queries or {}).items():
+            text = (text or "").strip()
+            if text:
+                langs[str(lang).lower()] = text
+        return langs
 
     def collect_with_status(self, query: str = "", max_results: int = 20,
-                            sources: Optional[List[str]] = None) -> Dict:
-        """Per-source outcomes alongside results, so a gated or failed source is
-        named rather than showing up as a thinner list."""
+                            sources: Optional[List[str]] = None,
+                            queries: Optional[Dict[str, str]] = None,
+                            deadline_s: Optional[float] = None) -> Dict:
+        """Per-source outcomes alongside results, so a gated, skipped, late or
+        failed source is named rather than showing up as a thinner list."""
         if not query:
             return {"results": [], "source_status": {}}
         sources = list(sources or self.DEFAULT_SOURCES)
+        langs = self._queries_by_language(query, queries)
+        deadline = float(deadline_s or os.environ.get("PRISM_EASTERN_DEADLINE_S")
+                         or self.DEFAULT_DEADLINE_S)
         handlers = {
             "cyberleninka": self._search_cyberleninka,
             "ntrs_translations": self._search_ntrs_translations,
             "jstage": self._search_jstage,
             "internet_archive": self._search_archive,
         }
-        per_source: List[List[Dict]] = []
         status: Dict[str, str] = {}
+        jobs: List[Tuple[str, object]] = []  # (status key, zero-arg callable), in order
         for src in sources:
             if src in GATED_SOURCES:
                 status[src] = f"blocked: {GATED_SOURCES[src]}"
+                continue
+            if src == "openalex":
+                for lang in self.OPENALEX_LANGUAGES:
+                    native = lang in langs
+                    q = langs[lang] if native else (langs.get("en") or query)
+                    jobs.append((f"openalex:{lang}",
+                                 partial(self._search_openalex, q, max_results, lang,
+                                         native_query=native)))
                 continue
             handler = handlers.get(src)
             if handler is None:
                 status[src] = f"error: unknown source {src!r}"
                 continue
-            try:
-                hits, err = handler(query, max_results)
-            except Exception as e:
-                # One backend's bug must not discard the sources that already
-                # succeeded, nor erase source_status — which is the only thing
-                # telling the caller a source was skipped rather than empty.
-                status[src] = f"error: {type(e).__name__}: {e}"
+            allowed = self.SOURCE_LANGUAGES.get(src)
+            if allowed is None:
+                jobs.append((src, partial(handler, query, max_results)))
                 continue
-            per_source.append((src, hits))
-            status[src] = err or f"ok ({len(hits)} results)"
+            q = next((langs[lang] for lang in allowed if lang in langs), None)
+            if q is None:
+                names = " or ".join(_LANGUAGE_NAMES.get(l, l) for l in allowed)
+                status[src] = (
+                    f"skipped: needs a {names} query — pass queries={{'{allowed[0]}': …}} "
+                    f"(got {sorted(langs) or 'nothing'}); not searched"
+                )
+                continue
+            jobs.append((src, partial(handler, q, max_results)))
+
+        # Concurrent, under one deadline. A source still running at the
+        # deadline is named as late and abandoned (its own HTTP timeouts end
+        # the thread); it is never allowed to hold the others hostage.
+        per_source: List[Tuple[str, List[Dict]]] = []
+        if jobs:
+            pool = cf.ThreadPoolExecutor(max_workers=len(jobs))
+            futures = {pool.submit(fn): key for key, fn in jobs}
+            done, pending = cf.wait(futures, timeout=deadline)
+            for fut in pending:
+                status[futures[fut]] = f"timeout: no answer within {deadline:g}s"
+            pool.shutdown(wait=False, cancel_futures=True)
+            outcomes: Dict[str, Tuple[List[Dict], Optional[str]]] = {}
+            for fut in done:
+                key = futures[fut]
+                try:
+                    outcomes[key] = fut.result()
+                except Exception as e:
+                    # One backend's bug must not discard the sources that
+                    # already succeeded, nor erase source_status.
+                    status[key] = f"error: {type(e).__name__}: {e}"
+            for key, _ in jobs:
+                if key in outcomes:
+                    hits, err = outcomes[key]
+                    per_source.append((key, hits))
+                    status[key] = err or f"ok ({len(hits)} results)"
 
         merged = self._interleave([h for _, h in per_source], max_results)
         # The per-handler count above is what the source RETURNED; the budget
         # may have trimmed it. Report both, or a status of "ok (20 results)"
         # sitting beside 15 kept records is a lie by omission.
-        kept = {}
+        kept: Dict[str, int] = {}
         for rec in merged:
             kept[rec.get("source")] = kept.get(rec.get("source"), 0) + 1
-        for src, hits in per_source:
-            if hits and kept.get(src, 0) != len(hits):
-                status[src] += f"; {kept.get(src, 0)} kept after max_results trim"
+        for key, hits in per_source:
+            src = key.split(":", 1)[0]
+            if hits and kept.get(src, 0) != len(hits) and not key.startswith("openalex:"):
+                status[key] += f"; {kept.get(src, 0)} kept after max_results trim"
         return {"results": merged, "source_status": status}
 
     @staticmethod
@@ -215,51 +323,175 @@ class EasternLiteratureCollector(DataCollector):
 
     # ------------------------------------------------------------- backends
 
+    def _search_openalex(self, query: str, max_results: int, language: str,
+                         native_query: bool = True):
+        """OpenAlex works filtered to one language — the reachable index of
+        Chinese, Russian and Japanese journal articles, with native titles and
+        the language DECLARED by the record. Keyless; a contact address is
+        sent only if the operator set PRISM_CONTACT_EMAIL (never invented)."""
+        params = {
+            "search": query,
+            "filter": f"language:{language}",
+            "per-page": max(1, min(int(max_results), 50)),
+            "select": "id,display_name,publication_year,language,doi,authorships,"
+                      "primary_location",
+        }
+        mailto = (os.environ.get("PRISM_CONTACT_EMAIL") or "").strip()
+        if mailto:
+            params["mailto"] = mailto
+        try:
+            resp = requests.get(self.OPENALEX_API, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            return [], f"error: {type(e).__name__}: {e} (language:{language})"
+        total = (data.get("meta") or {}).get("count")
+        results: List[Dict] = []
+        for w in (data.get("results") or []):
+            title = (w.get("display_name") or "").strip()
+            if not title:
+                continue
+            doi = (w.get("doi") or "").replace("https://doi.org/", "")
+            authors = [((a.get("author") or {}).get("display_name") or "")
+                       for a in (w.get("authorships") or [])]
+            journal = (((w.get("primary_location") or {}).get("source") or {})
+                       .get("display_name")) or ""
+            results.append(self._enrich({
+                "source": "openalex",
+                "source_id": doi or w.get("id", ""),
+                "title": title,
+                "authors": [a for a in authors if a],
+                "abstract": "",
+                "year": w.get("publication_year"),
+                "doi": doi,
+                "journal": journal,
+                "url": w.get("doi") or w.get("id") or "",
+                "language_filter": language,
+                "type": "paper",
+            }, declared_language=w.get("language") or language))
+        hint = "" if native_query else (
+            f" — pass queries={{'{language}': …}} for a native-title match")
+        return results, (
+            f"ok ({len(results)} of {total if total is not None else '?'}; "
+            f"language:{language}; query in {language if native_query else 'en'}{hint})"
+        )
+
+    # ------------------------------------------------------ harvest cache
+
+    @staticmethod
+    def _cache_dir() -> Path:
+        return Path(os.environ.get("PRISM_EASTERN_CACHE_DIR")
+                    or Path.home() / ".prism" / "cache" / "eastern")
+
+    def _read_cache(self, set_spec: str) -> Optional[Dict]:
+        path = self._cache_dir() / "cyberleninka" / f"{set_spec}.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        ttl = float(os.environ.get("PRISM_EASTERN_CACHE_TTL_S") or self.CACHE_TTL_S)
+        if time.time() - float(data.get("fetched_epoch", 0)) > ttl:
+            return None
+        return data
+
+    def _write_cache(self, set_spec: str, records: List[Dict], scanned: int) -> None:
+        path = self._cache_dir() / "cyberleninka" / f"{set_spec}.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({
+                "fetched_epoch": time.time(), "scanned": scanned, "records": records,
+            }, ensure_ascii=False), encoding="utf-8")
+        except (OSError, TypeError, ValueError):
+            pass  # a cache that cannot be written only costs the next harvest
+
+    @staticmethod
+    def _get_with_retry(url: str, params: Dict, timeout: int):
+        """One retry after a short pause: CyberLeninka answers 503 under load
+        (measured 2026-09-05), and a single 503 ended the whole harvest."""
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except Exception:
+            time.sleep(0.5)
+            resp = requests.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+
+    def _harvest_set(self, set_spec: str, max_pages: int) -> Tuple[List[Dict], int, bool]:
+        """All parsed records of one journal set, from the cache when fresh.
+
+        OAI-PMH has no keyword search, so the harvest is the same for every
+        query; only the local filter differs. Caching it turns a repeat
+        search from seconds of network into milliseconds."""
+        cached = self._read_cache(set_spec)
+        if cached is not None:
+            return cached.get("records") or [], int(cached.get("scanned") or 0), True
+        params = {"verb": "ListRecords", "metadataPrefix": "oai_dc", "set": set_spec}
+        records: List[Dict] = []
+        scanned = 0
+        for page in range(max_pages):
+            if page:
+                time.sleep(self.PAGE_DELAY_S)
+            resp = self._get_with_retry(self.CYBERLENINKA_OAI, params, 30)
+            root = _xml_fromstring(resp.content)
+            for rec in root.findall(".//oai:record", self.OAI_NS):
+                scanned += 1
+                parsed = self._parse_oai_record(rec, set_spec)
+                if parsed:
+                    records.append(parsed)
+            token_el = root.find(".//oai:resumptionToken", self.OAI_NS)
+            if token_el is None or not (token_el.text or "").strip():
+                break
+            params = {"verb": "ListRecords", "resumptionToken": token_el.text.strip()}
+        self._write_cache(set_spec, records, scanned)
+        return records, scanned, False
+
     def _search_cyberleninka(self, query: str, max_results: int,
                              max_pages_per_set: int = 4):
-        """Bounded OAI-PMH harvest, filtered locally.
+        """Bounded OAI-PMH harvest of the curated sets — in parallel, from the
+        cache when fresh — filtered locally.
 
-        OAI-PMH has no keyword search, so we walk resumption tokens for each
-        curated journal set and filter titles. The scan budget is reported in
-        the status string because a bounded scan returning nothing is NOT
-        evidence the source lacks the topic.
+        The scan budget is reported in the status string because a bounded
+        scan returning nothing is NOT evidence the source lacks the topic.
         """
         tokens = _query_tokens(query)
         if not tokens:
             return [], ("error: query has no searchable token "
                         "(3+ characters, not a stopword)")
         results: List[Dict] = []
+        seen_ids = set()
         scanned = 0
-        try:
-            for set_spec in self.CYBERLENINKA_SETS:
-                params = {"verb": "ListRecords", "metadataPrefix": "oai_dc",
-                          "set": set_spec}
-                for page in range(max_pages_per_set):
-                    if len(results) >= max_results:
-                        break
-                    if page:
-                        time.sleep(self.PAGE_DELAY_S)
-                    resp = requests.get(self.CYBERLENINKA_OAI, params=params,
-                                        timeout=30)
-                    resp.raise_for_status()
-                    root = _xml_fromstring(resp.content)
-                    for rec in root.findall(".//oai:record", self.OAI_NS):
-                        scanned += 1
-                        parsed = self._parse_oai_record(rec, set_spec)
-                        if parsed and _matches(parsed["title"], tokens):
-                            results.append(parsed)
-                    token_el = root.find(".//oai:resumptionToken", self.OAI_NS)
-                    if token_el is None or not (token_el.text or "").strip():
-                        break
-                    params = {"verb": "ListRecords",
-                              "resumptionToken": token_el.text.strip()}
-                if len(results) >= max_results:
-                    break
-        except Exception as e:
-            return results, f"error: {type(e).__name__}: {e} (scanned {scanned})"
+        cached_sets = 0
+        errors: List[str] = []
+        harvested: Dict[str, List[Dict]] = {}
+        with cf.ThreadPoolExecutor(max_workers=len(self.CYBERLENINKA_SETS)) as pool:
+            futures = {pool.submit(self._harvest_set, set_spec, max_pages_per_set): set_spec
+                       for set_spec in self.CYBERLENINKA_SETS}
+            for fut in cf.as_completed(futures):
+                try:
+                    records, n, from_cache = fut.result()
+                except Exception as e:
+                    errors.append(f"{futures[fut]}: {type(e).__name__}: {e}")
+                    continue
+                scanned += n
+                cached_sets += int(from_cache)
+                harvested[futures[fut]] = records
+        # Merge in the curated set order, not thread-completion order, so the
+        # same query yields the same list every run.
+        for set_spec in self.CYBERLENINKA_SETS:
+            for rec in harvested.get(set_spec, []):
+                if _matches(rec.get("title", ""), tokens) and rec.get("source_id") not in seen_ids:
+                    seen_ids.add(rec.get("source_id"))
+                    results.append(rec)
+        results = results[:max_results]
+        if errors and scanned == 0:
+            return [], f"error: {'; '.join(errors)} (scanned 0)"
+        cache_note = f"; {cached_sets}/{len(self.CYBERLENINKA_SETS)} sets from cache" if cached_sets else ""
+        err_note = f"; {len(errors)} set(s) failed: {'; '.join(errors)}" if errors else ""
         return results, (
-            f"ok ({len(results)} results; scanned {scanned} records, harvest "
-            f"bounded at {max_pages_per_set} pages/set — empty is not absence)"
+            f"ok ({len(results)} results; scanned {scanned} records{cache_note}, harvest "
+            f"bounded at {max_pages_per_set} pages/set — empty is not absence{err_note})"
         )
 
     def _parse_oai_record(self, rec: ET.Element, set_spec: str) -> Optional[Dict]:
@@ -387,10 +619,15 @@ class EasternLiteratureCollector(DataCollector):
         return results, None
 
     def _search_archive(self, query: str, max_results: int):
-        """archive.org advancedsearch — scanned Soviet handbooks / GOST texts."""
+        """archive.org advancedsearch, texts only — scanned Soviet handbooks,
+        GOST texts, Chinese technical scans. A Chinese query returned GitHub
+        mirrors (measured 2026-09-05): the query is restricted to texts and
+        every hit must carry a query term in its title; the dropped count is
+        reported so a thin list is not mistaken for a thin corpus."""
+        tokens = _query_tokens(query)
         try:
-            params = [("q", query), ("rows", min(max_results, 100)),
-                      ("output", "json")]
+            params = [("q", f"({query}) AND mediatype:texts"),
+                      ("rows", min(max_results, 100)), ("output", "json")]
             params += [("fl[]", f) for f in
                        ("identifier", "title", "year", "language", "creator")]
             resp = requests.get(self.ARCHIVE_API, params=params, timeout=40)
@@ -399,9 +636,14 @@ class EasternLiteratureCollector(DataCollector):
         except Exception as e:
             return [], f"error: {type(e).__name__}: {e}"
         results = []
+        dropped = 0
         for d in docs:
-            if not (d.get("title") or "").strip():
+            title = (d.get("title") or "").strip()
+            if not title:
                 continue  # untitled scan: nothing to identify or extract from
+            if tokens and not _matches(title, tokens):
+                dropped += 1
+                continue
             creator = d.get("creator")
             declared = d.get("language")
             if isinstance(declared, list):
@@ -409,14 +651,12 @@ class EasternLiteratureCollector(DataCollector):
             results.append(self._enrich({
                 "source": "internet_archive",
                 "source_id": f"archive:{d.get('identifier', '')}",
-                "title": d.get("title", "") or "",
+                "title": title,
                 "authors": creator if isinstance(creator, list) else ([creator] if creator else []),
                 "abstract": "",
                 "year": d.get("year"),
                 "url": f"https://archive.org/details/{d.get('identifier', '')}",
                 "type": "scan",
             }, declared_language=declared))
-        return results, None
-
-    def supported_params(self) -> List[str]:
-        return ["query", "max_results", "sources"]
+        status = None if not dropped else f"ok ({len(results)} results; {dropped} off-topic dropped)"
+        return results, status
