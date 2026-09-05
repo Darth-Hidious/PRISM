@@ -128,6 +128,7 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
   DONE `30105116`: activity strip on its own row above the prompt (footer clips at 140 cols).
 DONE `f87cf6f6`: footer word derives from the turn (busy/working/Ready; text-flush wrote Ready mid-turn); footer trims optional groups so "Ctrl-C quit" survives narrow columns.
 DONE `0c5e3ab3`: search digest carries "databases asked" + "branches" lines (model burned 4 recalls to name databases); recall declares durable memory as its source (was SOURCE NOT REPORTED).
+DONE `49793a4e`: summary never carries the tool name (was 'recall: recall: 3 results'); sidebar tool rows carry the result's first line; search results + papers CLI declare evidence class/sources; recall inherits class; home shortcuts are shifted letters; table cells inline-parsed.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
