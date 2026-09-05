@@ -45,6 +45,9 @@ class JobRunner:
         max_workers: int = 4,
     ) -> None:
         self.store = store
+        # Jobs left "running" by a process that no longer exists are ours to
+        # declare, not to inherit as live.
+        self.store.reap_orphans()
         self.backends = backends
         self.cache = CacheStore(Path(cache_root) if cache_root else get_cache_dir())
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mace-mcp-job")

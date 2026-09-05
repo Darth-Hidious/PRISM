@@ -9,6 +9,7 @@ concurrently with reader tools without WAL sidecars on shared filesystems.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -35,7 +36,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     hf_job_url    TEXT,
     provenance_ref TEXT,
     started_at    TEXT NOT NULL,
-    finished_at   TEXT
+    finished_at   TEXT,
+    owner_pid     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(started_at);
@@ -45,12 +47,29 @@ CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(started_at);
 VALID_TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
     "queued": {"submitted", "cancelling", "cancelled", "failed"},
     "submitted": {"running", "cancelling", "cancelled", "failed"},
-    "running": {"succeeded", "failed", "cancelling", "cancelled"},
-    "cancelling": {"cancelled", "succeeded", "failed"},  # late completions allowed
+    "running": {"succeeded", "failed", "cancelling", "cancelled", "interrupted"},
+    "cancelling": {"cancelled", "succeeded", "failed", "interrupted"},  # late completions allowed
     "succeeded": set(),
     "failed": set(),
     "cancelled": set(),
+    "interrupted": set(),
 }
+# Non-terminal states may also be orphaned before they reach "running".
+for _s in ("queued", "submitted"):
+    VALID_TRANSITIONS[_s].add("interrupted")
+
+TERMINAL: set[str] = {"succeeded", "failed", "cancelled", "interrupted"}
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether a process with this pid exists (signal 0; EPERM counts as alive)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class JobStoreError(RuntimeError):
@@ -74,6 +93,10 @@ class JobStore:
             # Avoid WAL/-shm sidecars: job state may live on Lustre/GPFS.
             self._conn.execute("PRAGMA journal_mode=DELETE")
             self._conn.executescript(_SCHEMA)
+            # Stores created before the owner column existed.
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+            if "owner_pid" not in cols:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN owner_pid INTEGER")
 
     # ------------------------------------------------------------------
     def create(
@@ -129,7 +152,12 @@ class JobStore:
             rows = self._conn.execute(q, args).fetchall()
         return [_row_to_record(r) for r in rows]
 
-    def transition(self, job_id: str, new_status: JobStatus) -> None:
+    def transition(
+        self, job_id: str, new_status: JobStatus, owner_pid: int | None | object = ...
+    ) -> None:
+        """Move a job to `new_status`. Taking a job to "running" records the
+        owner process (this one unless `owner_pid` is given explicitly), so a
+        later process can tell a live job from an orphan."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
@@ -146,17 +174,60 @@ class JobStore:
                 raise JobStoreError(
                     f"invalid transition {current!r} -> {new_status!r}"
                 )
-            finished = now_iso() if new_status in {"succeeded", "failed", "cancelled"} else None
+            finished = now_iso() if new_status in TERMINAL else None
             if finished is not None:
                 self._conn.execute(
                     "UPDATE jobs SET status = ?, finished_at = ? WHERE job_id = ?",
                     (new_status, finished, job_id),
+                )
+            elif new_status == "running":
+                owner = os.getpid() if owner_pid is ... else owner_pid
+                self._conn.execute(
+                    "UPDATE jobs SET status = ?, owner_pid = ? WHERE job_id = ?",
+                    (new_status, owner, job_id),
                 )
             else:
                 self._conn.execute(
                     "UPDATE jobs SET status = ? WHERE job_id = ?",
                     (new_status, job_id),
                 )
+
+    def reap_orphans(self, alive=pid_alive) -> list[str]:
+        """Mark every non-terminal job whose owner process is gone (or was
+        never recorded) as "interrupted", with what progress it had reached and
+        the instruction to resubmit. Returns the job ids reaped.
+
+        A fresh runner has no live tasks, so any job it finds "running" belongs
+        to another process; it is left alone only while that process exists.
+        Measured 2026-09-05: three MD jobs stayed "running" at 1150/2000 steps
+        for the rest of the evening after their tool server died, and every
+        poll repeated it."""
+        reaped: list[str] = []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT job_id, status, owner_pid, progress_step, progress_total FROM jobs "
+                "WHERE status IN ('queued', 'submitted', 'running', 'cancelling')"
+            ).fetchall()
+            for row in rows:
+                owner = row["owner_pid"]
+                if owner is not None and alive(int(owner)):
+                    continue
+                where = (
+                    f"pid {owner}" if owner is not None else "an earlier process (no owner recorded)"
+                )
+                error = {
+                    "code": "orphaned",
+                    "error": (
+                        f"interrupted: {where} was running this job and exited at step "
+                        f"{row['progress_step']}/{row['progress_total']}; the job did not finish — resubmit it"
+                    ),
+                }
+                self._conn.execute(
+                    "UPDATE jobs SET status = 'interrupted', error_json = ?, finished_at = ? WHERE job_id = ?",
+                    (json.dumps(error), now_iso(), row["job_id"]),
+                )
+                reaped.append(row["job_id"])
+        return reaped
 
     def update_progress(
         self,
@@ -231,6 +302,7 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
         error=json.loads(row["error_json"]) if row["error_json"] else None,
         started_at=row["started_at"],
         finished_at=row["finished_at"],
+        owner_pid=row["owner_pid"] if "owner_pid" in row.keys() else None,
         hf_job_id=row["hf_job_id"],
         hf_job_url=row["hf_job_url"],
         cache_key=row["cache_key"],

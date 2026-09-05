@@ -43,6 +43,9 @@ JobStatus = Literal[
     "failed",
     "cancelling",
     "cancelled",
+    # The process that owned the job is gone (a tool server killed with its
+    # TUI). Terminal; the job did not finish and must be resubmitted.
+    "interrupted",
 ]
 DevicePref = Literal["auto", "gpu", "cpu"]
 Dtype = Literal["float32", "float64"]
@@ -348,6 +351,10 @@ class JobRecord(_Base):
     error: dict[str, Any] | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    # PID of the process that took the job to "running", so a later process can
+    # tell a live job from an orphan (measured 2026-09-05: three MD jobs stayed
+    # "running" all evening after their tool server died).
+    owner_pid: int | None = None
     hf_job_id: str | None = None
     hf_job_url: str | None = None
     cache_key: str | None = None
