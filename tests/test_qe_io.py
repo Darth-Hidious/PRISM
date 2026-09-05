@@ -415,3 +415,25 @@ def test_bootstrap_contains_gated_qe_registration():
     assert gate_idx < reg_idx
     assert "_sidecar_proxy" not in src[gate_idx:reg_idx]
     assert _registry().list_tools()  # sanity: creation itself works
+
+
+def test_a_crash_before_output_keeps_the_exit_code_and_stderr(tmp_path):
+    """Run 2 of the SX500 research (2026-09-05): mpirun died in 54 ms with an
+    empty pw.out. The parser's generic "no convergence marker" reason won and
+    the exit code and stderr — the only diagnosis — were dropped. They must
+    reach the caller and the provenance block whatever the parser says."""
+    from app.tools.simulation.qe.runtime import qe_run
+
+    fake = tmp_path / "pw.x"
+    fake.write_text("#!/bin/sh\necho 'prterun: not enough slots available' >&2\nexit 3\n")
+    fake.chmod(0o755)
+    pseudo = tmp_path / "pseudo"; pseudo.mkdir()
+    (pseudo / "Si.upf").write_text("<UPF version=\"2.0.1\"></UPF>")
+    settings = {"pw_path": str(fake), "pseudo_dir": str(pseudo), "ecutwfc_ry": 30.0, "ecutrho_ratio": 4.0,
+                "kspacing_inv_angstrom": 0.5, "smearing": "mv", "degauss_ry": 0.01, "nproc": 1, "mpirun": None}
+    out = qe_run(si_structure(), calculation="scf", settings=settings, workdir=tmp_path / "run", mpirun=None)
+    assert out["status"] == "failed" and out["converged"] is False
+    assert "exited 3" in out["reason"], out["reason"]
+    assert "not enough slots" in out["reason"], out["reason"]
+    assert out["provenance"]["returncode"] == 3
+    assert "not enough slots" in out["provenance"]["stderr_tail"]

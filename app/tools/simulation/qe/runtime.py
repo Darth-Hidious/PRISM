@@ -279,8 +279,16 @@ def qe_run(
     elapsed = time.monotonic() - started
     parsed = parse_output(out_path)
     result: dict[str, Any] = dict(parsed)
-    if proc.returncode != 0 and parsed.get("status") != "failed":
-        result = {"status": "failed", "converged": False, "reason": f"pw.x exited {proc.returncode}: {proc.stderr.strip()[:400]}"}
+    stderr_tail = (proc.stderr or "").strip()[-400:]
+    if proc.returncode != 0:
+        # A non-zero exit is the diagnosis; the parser's reason for an empty
+        # or truncated output is only its consequence. Measured 2026-09-05:
+        # mpirun died in 54 ms, the parser said "no convergence marker", and
+        # the exit code and stderr never reached the caller.
+        why = f"pw.x exited {proc.returncode}: {stderr_tail or 'no stderr'}"
+        if parsed.get("status") == "failed" and parsed.get("reason"):
+            why = f"{why} — {parsed['reason']}"
+        result = {"status": "failed", "converged": False, "reason": why}
     if result.get("status") == "failed":
         result["status"] = "failed"
     else:
@@ -300,6 +308,8 @@ def qe_run(
         "smearing": system_extra,
         "calculation": calculation,
         "nproc": nproc if launcher and nproc > 1 else 1,
+        "returncode": proc.returncode,
+        "stderr_tail": stderr_tail,
         "wall_seconds": round(elapsed, 3),
         "input_path": str(in_path),
         "output_path": str(out_path),
