@@ -134,7 +134,8 @@ DONE `f92aea48`: palette rows show what Enter does (was 'palette'); key window o
 DONE `bb3e6fdd`: Magnitude (local inference server, 127.0.0.1:10100/inference/v1) is a keyless loopback provider, swept like Ollama; key-window labels shortened. NOTE: /tmp/panel-target hit 55 GB and filled the disk (linker failed silently) — cleared incremental + stale deps; watch `df`.
 DONE: S2 rate-limit message names the palette entry (Ctrl-P → Search sources & keys).
 DONE `409d0849`: papers engine in the palette (search/sweep/full-text/corpus forms → /papers …, CLI-backed root, JSON presenter); palette titles clipped to their column.
-NEXT: parity batch 3 — ontology, provenance, reverify, matkg, predict (scripts staged).
+DONE `18bb282f`: parity batch 3 — 13 palette entries (ontology list/bind/relations/validate/promote/proposals, provenance stats/failures, reverify list/run/history, matkg load, predict); five new CLI-backed roots; single-body ui.view renders as one tab (was empty for doctor/providers/billing/papers); palette title/hint cells clipped.
+NEXT: remaining parity misses — ingest (CLI path), report, schedule, plugins list, discourse, publish; then live re-test of papers + provenance views.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
