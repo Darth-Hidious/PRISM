@@ -635,6 +635,13 @@ pub enum FormTarget {
     ReverifyHistory,
     MatkgLoad,
     PredictRun,
+    /// The last parity misses (palette `schedule.*`, `discourse.run`,
+    /// `publish.artifact`, `report.bug`).
+    ScheduleCreate,
+    ScheduleCancel,
+    DiscourseRun,
+    Publish,
+    Report,
     /// Read one web page as text via agent-browser (palette `browse.open`).
     /// Submit dispatches `/browse <url>`, which the backend runs through the
     /// SAME `agent-browser` path the agent's `web_browse` tool uses.
@@ -3054,9 +3061,24 @@ impl App {
             | FormTarget::ReverifyRun
             | FormTarget::ReverifyHistory
             | FormTarget::MatkgLoad
-            | FormTarget::PredictRun => {
+            | FormTarget::PredictRun
+            | FormTarget::ScheduleCreate
+            | FormTarget::ScheduleCancel
+            | FormTarget::DiscourseRun
+            | FormTarget::Publish
+            | FormTarget::Report => {
                 let f = &pane.form;
                 let composed = match pane.target {
+                    FormTarget::ScheduleCreate => schedule_create_command(f),
+                    FormTarget::ScheduleCancel => positional_command(
+                        f,
+                        "id",
+                        &["schedule", "cancel"],
+                        "enter the schedule id",
+                    ),
+                    FormTarget::DiscourseRun => discourse_run_command(f),
+                    FormTarget::Publish => publish_command(f),
+                    FormTarget::Report => report_command(f),
                     FormTarget::OntologyBind => positional_command(
                         f,
                         "names",
@@ -3315,6 +3337,65 @@ impl App {
             ],
         );
         self.open_form(form, FormTarget::PredictRun);
+    }
+
+    /// Palette `schedule.create` — a goal and exactly one trigger.
+    pub fn open_schedule_create_form(&mut self) {
+        let form = Form::new(
+            "Create a schedule — wakes a goal back up",
+            "create",
+            vec![
+                FormField::text("goal", "Goal id", "").with_note("from /campaign list"),
+                FormField::text("every", "Every", "").with_note("interval, e.g. 6h"),
+                FormField::text("cron", "Cron", "").with_note("e.g. 0 9 * * 1-5"),
+                FormField::text("at", "At", "").with_note("one time, RFC 3339"),
+            ],
+        );
+        self.open_form(form, FormTarget::ScheduleCreate);
+    }
+
+    /// Palette `discourse.run` — a spec id and optional parameter bindings.
+    pub fn open_discourse_run_form(&mut self) {
+        let form = Form::new(
+            "Run a discourse spec — hosted, billable",
+            "run",
+            vec![
+                FormField::text("spec", "Spec id", "").with_note("from /discourse list"),
+                FormField::text("params", "Params", "").with_note("key=value, key2=value2"),
+            ],
+        );
+        self.open_form(form, FormTarget::DiscourseRun);
+    }
+
+    /// Palette `publish.artifact` — a model, dataset or workflow to a registry.
+    pub fn open_publish_form(&mut self) {
+        let form = Form::new(
+            "Publish an artifact",
+            "publish",
+            vec![
+                FormField::text("path", "Path", "")
+                    .with_note("checkpoint, dataset directory or workflow YAML"),
+                FormField::text("to", "Target", "")
+                    .with_note("huggingface, marc27 (default) or a registry URL"),
+                FormField::text("repo", "Repository", "").with_note("e.g. username/my-model"),
+                FormField::toggle("private", "Private", false),
+            ],
+        );
+        self.open_form(form, FormTarget::Publish);
+    }
+
+    /// Palette `report.bug` — files a report with system context attached.
+    pub fn open_report_form(&mut self) {
+        let form = Form::new(
+            "Report a bug",
+            "send",
+            vec![
+                FormField::text("description", "What happened", ""),
+                FormField::toggle("no_github", "Skip the GitHub issue", false)
+                    .with_note("on = hosted platform only"),
+            ],
+        );
+        self.open_form(form, FormTarget::Report);
     }
 
     /// Palette `workflow.run` — name, optional `--set key=value` pairs, and
@@ -5081,6 +5162,27 @@ impl App {
                 FormTarget::MatkgLoad,
             ),
             "predict.run" => self.open_predict_form(),
+            "schedule.list" => {
+                let _ = self.backend.send_command("/schedule list");
+            }
+            "discourse.list" => {
+                let _ = self.backend.send_command("/discourse list");
+            }
+            "plugins.list" => {
+                let _ = self.backend.send_command("/plugins list");
+            }
+            "schedule.create" => self.open_schedule_create_form(),
+            "schedule.cancel" => self.open_one_field_form(
+                "Cancel a schedule — it never fires again",
+                "cancel",
+                "id",
+                "Schedule id",
+                "from /schedule list",
+                FormTarget::ScheduleCancel,
+            ),
+            "discourse.run" => self.open_discourse_run_form(),
+            "publish.artifact" => self.open_publish_form(),
+            "report.bug" => self.open_report_form(),
             "account.show" => self.open_account(),
             "sessions.show" => self.open_sessions(),
             "tools.show" => self.open_tools_window(),
@@ -6835,6 +6937,77 @@ fn predict_command(form: &crate::form::Form) -> Result<String, &'static str> {
     Ok(build_slash_command(&tokens))
 }
 
+/// `/schedule create --goal <g> --every|--cron|--at <t>`: exactly one trigger.
+fn schedule_create_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let goal = form.text_value("goal").trim().to_string();
+    if goal.is_empty() {
+        return Err("enter the goal to wake");
+    }
+    let triggers: Vec<(&str, String)> = [("--every", "every"), ("--cron", "cron"), ("--at", "at")]
+        .into_iter()
+        .map(|(flag, field)| (flag, form.text_value(field).trim().to_string()))
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    let [(flag, value)] = triggers.as_slice() else {
+        return Err("choose exactly one trigger: every, cron or at");
+    };
+    Ok(build_slash_command(&[
+        "schedule".to_string(),
+        "create".to_string(),
+        "--goal".to_string(),
+        goal,
+        flag.to_string(),
+        value.clone(),
+    ]))
+}
+
+/// `/discourse run <spec> [--param k=v]…` from a comma-separated params field.
+fn discourse_run_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let spec = form.text_value("spec").trim().to_string();
+    if spec.is_empty() {
+        return Err("enter the spec id");
+    }
+    let mut tokens = vec!["discourse".to_string(), "run".to_string(), spec];
+    for pair in form
+        .text_value("params")
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        tokens.push("--param".to_string());
+        tokens.push(pair.to_string());
+    }
+    Ok(build_slash_command(&tokens))
+}
+
+/// `/publish <path> [--to t] [--repo r] [--private]`.
+fn publish_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let path = form.text_value("path").trim().to_string();
+    if path.is_empty() {
+        return Err("enter the artifact path");
+    }
+    let mut tokens = vec!["publish".to_string(), path];
+    push_opt(&mut tokens, "--to", &form.text_value("to"));
+    push_opt(&mut tokens, "--repo", &form.text_value("repo"));
+    if form.toggle_value("private") {
+        tokens.push("--private".to_string());
+    }
+    Ok(build_slash_command(&tokens))
+}
+
+/// `/report <description> [--no-github]`.
+fn report_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let description = form.text_value("description").trim().to_string();
+    if description.is_empty() {
+        return Err("describe what happened");
+    }
+    let mut tokens = vec!["report".to_string(), description];
+    if form.toggle_value("no_github") {
+        tokens.push("--no-github".to_string());
+    }
+    Ok(build_slash_command(&tokens))
+}
+
 /// Build `/workflow show <name>` from the `workflow.show` form.
 fn workflow_show_command(form: &crate::form::Form) -> Result<String, &'static str> {
     let name = form.text_value("name").trim().to_string();
@@ -7527,6 +7700,126 @@ mod tests {
         assert!(
             failures.contains("runs /provenance failures") || failures.contains('…'),
             "a hint that does not fit is clipped visibly, never cut by the frame: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn the_last_parity_misses_are_reachable_from_the_palette() {
+        // Parity, measured 2026-09-05: schedules, discourse, publish, report
+        // and the plugin inventory had no palette entry.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        for (id, effect) in [
+            ("schedule.list", "runs /schedule list"),
+            ("discourse.list", "runs /discourse list"),
+            ("plugins.list", "runs /plugins list"),
+        ] {
+            assert!(crate::command::CATALOG.iter().any(|c| c.id == id), "{id}");
+            assert_eq!(crate::command::effect(id), effect, "{id}");
+            assert!(app.dispatch_command(id), "{id}");
+        }
+        for id in [
+            "schedule.create",
+            "schedule.cancel",
+            "discourse.run",
+            "publish.artifact",
+            "report.bug",
+        ] {
+            assert!(crate::command::CATALOG.iter().any(|c| c.id == id), "{id}");
+            assert_eq!(crate::command::effect(id), "opens a form", "{id}");
+            assert!(app.dispatch_command(id), "{id}");
+            assert!(app.form.is_some(), "{id} opens a form");
+            app.form = None;
+        }
+    }
+
+    #[test]
+    fn last_parity_forms_compose_their_commands() {
+        // A schedule needs a goal and exactly one trigger.
+        let sched = |goal: &str, every: &str, cron: &str, at: &str| {
+            Form::new(
+                "t",
+                "go",
+                vec![
+                    FormField::text("goal", "Goal", goal),
+                    FormField::text("every", "Every", every),
+                    FormField::text("cron", "Cron", cron),
+                    FormField::text("at", "At", at),
+                ],
+            )
+        };
+        assert_eq!(
+            schedule_create_command(&sched("", "6h", "", "")),
+            Err("enter the goal to wake")
+        );
+        assert_eq!(
+            schedule_create_command(&sched("g1", "", "", "")),
+            Err("choose exactly one trigger: every, cron or at")
+        );
+        assert_eq!(
+            schedule_create_command(&sched("g1", "6h", "0 9 * * *", "")),
+            Err("choose exactly one trigger: every, cron or at")
+        );
+        assert_eq!(
+            schedule_create_command(&sched("g1", "", "0 9 * * *", "")).unwrap(),
+            "/schedule create --goal g1 --cron '0 9 * * *'"
+        );
+        // Publish: path required, target defaults to the CLI's own.
+        let pubf = |path: &str, to: &str, repo: &str, private: bool| {
+            Form::new(
+                "t",
+                "go",
+                vec![
+                    FormField::text("path", "Path", path),
+                    FormField::text("to", "Target", to),
+                    FormField::text("repo", "Repository", repo),
+                    FormField::toggle("private", "Private", private),
+                ],
+            )
+        };
+        assert_eq!(
+            publish_command(&pubf("", "", "", false)),
+            Err("enter the artifact path")
+        );
+        assert_eq!(
+            publish_command(&pubf("model.ckpt", "huggingface", "me/model", true)).unwrap(),
+            "/publish model.ckpt --to huggingface --repo me/model --private"
+        );
+        assert_eq!(
+            publish_command(&pubf("wf.yaml", "", "", false)).unwrap(),
+            "/publish wf.yaml"
+        );
+        // Report: description required; GitHub issue is opt-out.
+        let rep = |desc: &str, no_gh: bool| {
+            Form::new(
+                "t",
+                "go",
+                vec![
+                    FormField::text("description", "What happened", desc),
+                    FormField::toggle("no_github", "Skip GitHub", no_gh),
+                ],
+            )
+        };
+        assert_eq!(
+            report_command(&rep("", false)),
+            Err("describe what happened")
+        );
+        assert_eq!(
+            report_command(&rep("the footer lied", true)).unwrap(),
+            "/report 'the footer lied' --no-github"
+        );
+        // Discourse: spec id required, params ride along as --param k=v.
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("spec", "Spec id", "abc-123"),
+                FormField::text("params", "Params", "alloy=GRCop-42, rounds=3"),
+            ],
+        );
+        assert_eq!(
+            discourse_run_command(&form).unwrap(),
+            "/discourse run abc-123 --param alloy=GRCop-42 --param rounds=3"
         );
     }
 

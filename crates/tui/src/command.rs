@@ -106,6 +106,70 @@ pub static CATALOG: &[Command] = &[
         suggested: false,
     },
     Command {
+        id: "schedule.list",
+        title: "Schedules",
+        description: "Every schedule, its state and last outcome",
+        category: "Automation",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "schedule.create",
+        title: "Create schedule",
+        description: "Wake a goal on an interval, a cron, or once",
+        category: "Automation",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "schedule.cancel",
+        title: "Cancel schedule",
+        description: "It never fires again",
+        category: "Automation",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "discourse.list",
+        title: "Discourse specs",
+        description: "Multi-agent discourse specs on the platform",
+        category: "Automation",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "discourse.run",
+        title: "Run discourse",
+        description: "Run a spec with parameter bindings — billable",
+        category: "Automation",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "publish.artifact",
+        title: "Publish artifact",
+        description: "Model, dataset or workflow to a registry",
+        category: "Marketplace",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "report.bug",
+        title: "Report a bug",
+        description: "Files it with system context attached",
+        category: "Diagnostics",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "plugins.list",
+        title: "Plugins & planes",
+        description: "Loaded and failed plugins, MCP servers, skills, ontologies",
+        category: "Diagnostics",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
         id: "ontology.list",
         title: "Ontologies",
         description: "Builtins plus every project artifact",
@@ -881,6 +945,11 @@ pub fn effect(id: &str) -> String {
         | "reverify.history"
         | "matkg.load"
         | "predict.run"
+        | "schedule.create"
+        | "schedule.cancel"
+        | "discourse.run"
+        | "publish.artifact"
+        | "report.bug"
         | "node.up"
         | "goal.set"
         | "campaign.start"
@@ -904,6 +973,9 @@ pub fn effect(id: &str) -> String {
         "ontology.proposals" => "runs /ontology proposals list",
         "provenance.stats" => "runs /provenance stats",
         "provenance.failures" => "runs /provenance failures",
+        "schedule.list" => "runs /schedule list",
+        "discourse.list" => "runs /discourse list",
+        "plugins.list" => "runs /plugins list",
         "node.status" => "runs /node status",
         "campaign.list" => "runs /campaign list",
         "workflow.list" => "runs /workflow list",
