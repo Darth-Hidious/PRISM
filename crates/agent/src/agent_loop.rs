@@ -975,9 +975,7 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
             .get("title")
             .and_then(Value::as_str)
             .unwrap_or("(untitled)");
-        let year = record
-            .get("year")
-            .and_then(Value::as_u64)
+        let year = record_year(record)
             .map(|y| format!(" ({y})"))
             .unwrap_or_default();
         let id = paper_key(record).unwrap_or_else(|| "unidentified".to_string());
@@ -1620,13 +1618,17 @@ fn cli_payload(result: &Value) -> Option<Value> {
 /// Every paper record in a search payload, whichever shape it arrived in.
 fn paper_records(payload: &Value) -> Vec<&Value> {
     // `papers search` -> {papers:[…]}; `papers sweep` -> {outcome:{papers:[…]}};
-    // `prior_art_search` -> {papers:[…], patents:[…]}. Sweep is the biggest
-    // producer, so missing its nesting would silently exclude the most
-    // productive tool from the count.
+    // `prior_art_search` -> {papers:[…], patents:[…], eastern:[…]}. Sweep is
+    // the biggest producer, so missing its nesting would silently exclude the
+    // most productive tool from the count — and `eastern` is a SECOND array
+    // beside `papers`, not an alternative to it: an eastern search carries an
+    // empty `papers` and every record in `eastern`. Taking the first array
+    // present dropped every Russian and Chinese record from the digest.
+    let mut records: Vec<&Value> = Vec::new();
     for path in [
         &["papers"][..],
+        &["eastern"][..],
         &["outcome", "papers"][..],
-        &["results"][..],
     ] {
         let mut node = payload;
         let mut ok = true;
@@ -1640,10 +1642,25 @@ fn paper_records(payload: &Value) -> Vec<&Value> {
             }
         }
         if ok && let Some(list) = node.as_array() {
-            return list.iter().collect();
+            records.extend(list.iter());
         }
     }
-    Vec::new()
+    if records.is_empty()
+        && let Some(list) = payload.get("results").and_then(Value::as_array)
+    {
+        records.extend(list.iter());
+    }
+    records
+}
+
+/// A record's year as the digest prints it. Western engines give a number;
+/// OAI-PMH and archive scans give a string — both are years.
+fn record_year(record: &Value) -> Option<u64> {
+    match record.get("year")? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().get(..4).and_then(|y| y.parse::<u64>().ok()),
+        _ => None,
+    }
 }
 
 impl SaturationTracker {
@@ -7929,6 +7946,40 @@ mod tests {
         assert!(
             digest.contains("patents error: no patent backend configured"),
             "{digest}"
+        );
+    }
+
+    /// Proof run 2026-09-05 (budget 6 min): the Russian and Chinese lanes
+    /// FOUND records (OpenAlex zh/ru, CyberLeninka) and the parent could not
+    /// cite one of them — the digest's extractor took the first array present,
+    /// `papers`, which is empty on an eastern search, and never read `eastern`.
+    #[test]
+    fn an_eastern_search_digest_lists_its_records_with_their_ids() {
+        let payload = serde_json::json!({
+            "papers": [],
+            "patents": [],
+            "eastern": [
+                {"source": "openalex", "source_id": "10.1000/zh1", "doi": "10.1000/zh1",
+                 "title": "钛合金表面梯度Al2O3陶瓷涂层的高温抗氧化性能", "year": 2017,
+                 "source_language": "zh"},
+                {"source": "cyberleninka", "source_id": "https://cyberleninka.ru/article/n/zharo",
+                 "title": "Жаростойкое покрытие для лопаток из сплава ВЖЛ21", "year": "2019",
+                 "source_language": "ru"}
+            ],
+            "counts": {"papers": null, "patents": null, "eastern": 2},
+            "searched": ["eastern"],
+            "sources": [{"source": "openalex:zh", "status": "ok", "count": 1},
+                        {"source": "cyberleninka", "status": "ok", "count": 1}]
+        });
+        let digest = search_digest("prior_art_search", &payload, 2).expect("a digest");
+        assert!(digest.contains("2 result(s)"), "{digest}");
+        assert!(
+            digest.contains("钛合金表面梯度Al2O3陶瓷涂层的高温抗氧化性能 (2017) [doi:10.1000/zh1]"),
+            "{digest}"
+        );
+        assert!(
+            digest.contains("Жаростойкое покрытие для лопаток из сплава ВЖЛ21 (2019) [cyberleninka:https://cyberleninka.ru/article/n/zharo]"),
+            "a string year and a source:id key must both survive: {digest}"
         );
     }
 
