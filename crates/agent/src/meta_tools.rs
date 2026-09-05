@@ -913,6 +913,15 @@ fn find_tools(args: &Value, catalog: &ToolCatalog) -> Value {
     json!({
         "query": query,
         "count": matches.len(),
+        // Its source is the local tool catalog; the source table reads this.
+        "sources": [{
+            "source": "tool catalog",
+            "kind": "tool description",
+            "count": matches.len(),
+            "fetched": chrono::Utc::now().to_rfc3339(),
+            "status": "ok",
+            "record": { "query": query },
+        }],
         "matches": matches,
         // Told, not silently applied: a model that asked for 130 and got 25 must
         // know the shortlist is a shortlist, or it concludes the catalog is small.
@@ -1024,9 +1033,9 @@ async fn recall_with_backend(
             .await?;
         return Ok(match chain.into_iter().find(|r| r.id == id) {
             Some(rec) => {
-                // A record without a tool name is still one record.
+                // A record without a tool name still has an action type.
                 let sources = recall_sources(std::iter::once(
-                    rec.tool_name.as_deref().unwrap_or("unknown tool"),
+                    rec.tool_name.as_deref().unwrap_or(rec.action_type.as_str()),
                 ));
                 // A recalled result keeps the class its producer declared;
                 // recall adds none of its own, so an undeclared one stays so.
@@ -1119,6 +1128,7 @@ async fn recall_with_backend(
                                 let mut hit = json!({
                                     "id": rec.id,
                                     "tool_name": rec.tool_name,
+                                    "action_type": rec.action_type.as_str(),
                                     "preview": clip_str(&output_str, RECALL_PREVIEW_CHARS),
                                     "status": rec.status,
                                     "exit_code": rec.exit_code,
@@ -1168,6 +1178,7 @@ async fn recall_with_backend(
             let mut hit = json!({
                 "id": rec.id,
                 "tool_name": rec.tool_name,
+                "action_type": rec.action_type.as_str(),
                 "preview": clip_str(&output_str, RECALL_PREVIEW_CHARS),
                 "status": rec.status,
                 "exit_code": rec.exit_code,
@@ -1183,11 +1194,12 @@ async fn recall_with_backend(
     Ok(json!({
         "query": query,
         "count": matches.len(),
-        "sources": recall_sources(
-            matches
-                .iter()
-                .map(|m| m.get("tool_name").and_then(Value::as_str).unwrap_or("unknown tool")),
-        ),
+        "sources": recall_sources(matches.iter().map(|m| {
+            m.get("tool_name")
+                .and_then(Value::as_str)
+                .or_else(|| m.get("action_type").and_then(Value::as_str))
+                .unwrap_or("record")
+        })),
         "matches": matches,
         "hint": if all_sessions || requested_session_id.is_some() {
             "call recall with a returned id and session_id to get that result's full output"
@@ -1972,6 +1984,64 @@ mod tests {
             .await
             .unwrap();
         assert!(out.get("evidence_class").is_none(), "{out}");
+    }
+
+    #[tokio::test]
+    async fn find_tools_declares_the_tool_catalog_as_its_source() {
+        // Live 2026-09-05: "SOURCE NOT REPORTED BY find_tools". Its source is
+        // the local tool catalog, and it knows how many it matched.
+        let catalog = ToolCatalog::from_tool_server_json(&json!({ "tools": [] }));
+        let out = execute_meta_tool(
+            "find_tools",
+            &json!({ "query": "anything" }),
+            None,
+            "sess",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        let sources = out["sources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("find_tools must declare its sources: {out}"));
+        assert_eq!(sources[0]["source"], json!("tool catalog"));
+        assert_eq!(sources[0]["count"], json!(0));
+        assert_eq!(sources[0]["status"], json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn recall_names_a_tool_less_record_by_its_action_type() {
+        // Live 2026-09-05: two recalled records read "recalled unknown tool
+        // record". A record without a tool name still has an action type.
+        let (store, _) = seeded_store().await;
+        let mut rec = new_record(
+            "sess-recall",
+            ActionType::LlmCall,
+            Actor::Agent,
+            None,
+            None,
+            json!({}),
+        );
+        rec.output_json = Some(json!("titanium aluminide summary"));
+        store.record(&rec).await.unwrap();
+        let out = recall(
+            &json!({ "query": "titanium" }),
+            Some(&store),
+            "sess-recall",
+            None,
+        )
+        .await
+        .unwrap();
+        let kinds: Vec<String> = out["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            kinds.iter().any(|k| k == "recalled llm_call record"),
+            "the action type names the record: {kinds:?}"
+        );
+        assert!(!kinds.iter().any(|k| k.contains("unknown")), "{kinds:?}");
     }
 
     #[tokio::test]

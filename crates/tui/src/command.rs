@@ -423,6 +423,14 @@ pub static CATALOG: &[Command] = &[
         suggested: true,
     },
     Command {
+        id: "search.keys",
+        title: "Search sources & keys",
+        description: "Semantic Scholar key, Lens token, patent table — used by every search",
+        category: "Settings",
+        keybind: "palette",
+        suggested: true,
+    },
+    Command {
         id: "slash.billing",
         title: "Billing & credits",
         description: "Credit balance, usage & prices",
@@ -710,6 +718,54 @@ pub fn fuzzy_sorted(query: &str) -> Vec<&'static Command> {
     }
 
     scored.into_iter().map(|(_, _, c)| c).collect()
+}
+
+/// What Enter does for a palette-only entry — the right-hand column of its
+/// row. A keybind is shown when the entry has one; otherwise this. Driven
+/// live on 2026-09-05: that column read the word "palette" on most rows,
+/// which told the reader nothing about what would happen.
+///
+/// This mirrors [`App::dispatch_command`]; the palette test walks the whole
+/// catalog so an entry without an effect fails the build's tests.
+pub fn effect(id: &str) -> String {
+    let s = match id {
+        "sci.properties" | "sci.simulate" | "sci.predict" => "fills the prompt",
+        "sci.research"
+        | "browse.open"
+        | "node.up"
+        | "goal.set"
+        | "campaign.start"
+        | "campaign.status"
+        | "campaign.resume"
+        | "workflow.show"
+        | "workflow.run"
+        | "marketplace.search"
+        | "marketplace.find"
+        | "marketplace.install"
+        | "marketplace.publish"
+        | "skills.run"
+        | "skills.create" => "opens a form",
+        "knowledge.open" | "sci.search" | "sci.ingest" | "sci.notebook" => "opens a pane",
+        "help.show" | "which_key.show" | "theme.list" | "gh.show" | "account.show"
+        | "sessions.show" | "tools.show" | "status.show" | "home.show" | "config.show"
+        | "apikey.show" | "search.keys" | "links.open" | "cost.show" | "model.show"
+        | "compute.gpus" | "nodes.show" | "mcp.show" => "opens a panel",
+        "node.stop" => "runs /node stop",
+        "node.status" => "runs /node status",
+        "campaign.list" => "runs /campaign list",
+        "workflow.list" => "runs /workflow list",
+        "skills.list" => "runs /skills list",
+        "use.show" => "runs /use show",
+        "session.new" => "starts a session",
+        "chat.clear" => "clears the transcript",
+        "app.exit" => "quits",
+        "thinking.toggle" | "metrics.toggle" | "cost.toggle" | "copy.toggle" => "toggles",
+        "input.focus" => "focuses the prompt",
+        id if id.starts_with("workspace.") => "switches the sidebar",
+        id if id.starts_with("slash.") => return format!("runs /{}", &id["slash.".len()..]),
+        _ => "",
+    };
+    s.to_string()
 }
 
 #[cfg(test)]

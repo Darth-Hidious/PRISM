@@ -110,7 +110,7 @@ pub enum ActionType {
 }
 
 impl ActionType {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::ToolCall => "tool_call",
             Self::LlmCall => "llm_call",

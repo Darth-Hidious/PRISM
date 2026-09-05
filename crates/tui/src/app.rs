@@ -629,7 +629,10 @@ pub struct FormPane {
     pub target: FormTarget,
 }
 
-/// Providers offered in the API-key window, in display order.
+/// Keys offered in the API-key window, in display order: LLM providers, then
+/// the search sources that need one. Every entry is saved to
+/// `~/.prism/api_keys.json` and hydrated into the environment at startup, so
+/// "set SEMANTIC_SCHOLAR_API_KEY" is advice a reader can act on here.
 ///
 /// Anthropic is deliberately absent — PRISM does not ship it (see the policy
 /// block in `crates/core/providers.toml`). Adding it is a `~/.prism/providers
@@ -639,6 +642,9 @@ pub const API_PROVIDERS: &[(&str, &str)] = &[
     ("Google", "GOOGLE_API_KEY"),
     ("Mistral", "MISTRAL_API_KEY"),
     ("Cohere", "COHERE_API_KEY"),
+    ("Semantic Scholar (search)", "SEMANTIC_SCHOLAR_API_KEY"),
+    ("Lens.org (patents)", "LENS_API_TOKEN"),
+    ("Patent table (BigQuery)", "PRISM_PATENT_TABLE"),
 ];
 
 pub struct App {
@@ -4792,7 +4798,7 @@ impl App {
             "status.show" => self.open_status_window(),
             "home.show" => self.open_home(),
             "config.show" => self.open_config_window(),
-            "apikey.show" => self.open_apikey_window(),
+            "apikey.show" | "search.keys" => self.open_apikey_window(),
             "session.new" => self.new_session(),
             "links.open" => self.open_link_picker(),
             "cost.show" => self.modal = Some(Modal::Cost),
@@ -6734,6 +6740,52 @@ mod tests {
     }
 
     #[test]
+    fn the_key_window_offers_the_search_source_keys() {
+        // "Set SEMANTIC_SCHOLAR_API_KEY for a dedicated pool" is only advice
+        // if there is somewhere in the TUI to set it. The key window is that
+        // place, and its file is hydrated into the environment at startup.
+        for env in [
+            "SEMANTIC_SCHOLAR_API_KEY",
+            "LENS_API_TOKEN",
+            "PRISM_PATENT_TABLE",
+        ] {
+            assert!(
+                API_PROVIDERS.iter().any(|(_, e)| *e == env),
+                "{env} must be offered in the key window"
+            );
+        }
+    }
+
+    #[test]
+    fn the_palette_reaches_the_search_keys_and_says_what_every_entry_does() {
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        assert!(
+            crate::command::CATALOG
+                .iter()
+                .any(|c| c.id == "search.keys"),
+            "a Settings entry for the search sources"
+        );
+        assert!(
+            app.dispatch_command("search.keys"),
+            "the entry is dispatched"
+        );
+        assert!(app.apikey_window.open, "and it opens the key window");
+        // The right-hand column of a palette row is a keybind or, when the
+        // entry has none, what Enter does — never the word "palette".
+        for c in crate::command::CATALOG {
+            let hint = crate::command::effect(c.id);
+            if c.keybind == "palette" {
+                assert!(
+                    !hint.is_empty() && hint != "palette",
+                    "{} says what Enter does: {hint:?}",
+                    c.id
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_footer_does_not_say_ready_while_a_tool_is_still_running() {
         // Driven live on 2026-09-05: the model's text segment ended, the
         // text-flush event wrote "Ready", and the footer read Ready for the
@@ -6806,6 +6858,26 @@ mod tests {
         assert!(
             footer.contains("glm-5.3-flash"),
             "the model is never dropped: {footer:?}"
+        );
+        // Live 2026-09-05 with an approval pending: the focus tag is a state
+        // and stays, and the row read "Ctrl-C qui" again. Credits go before
+        // the quit hint does.
+        app.show_metrics = false;
+        app.show_cost = false;
+        app.focus = Focus::Approval;
+        // An approval is asked mid-turn, so the word is "working", two
+        // columns longer than "Ready" — the two that overflowed live.
+        app.turn_in_progress = true;
+        app.is_waiting = false;
+        let footer = footer_row(&app);
+        assert!(footer.contains("working"), "{footer:?}");
+        assert!(
+            footer.contains("[APPROVAL]"),
+            "a pending approval is a state: {footer:?}"
+        );
+        assert!(
+            footer.trim_end().ends_with("Ctrl-C quit"),
+            "the last words survive an approval too: {footer:?}"
         );
     }
 

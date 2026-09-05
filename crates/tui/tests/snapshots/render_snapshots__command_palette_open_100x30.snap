@@ -1,6 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1005
+assertion_line: 1011
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
@@ -10,18 +10,18 @@ expression: rendered
 │> type to search…                                               │ │
 │                                                                │ │
 │  ── SCIENCE ────────────────────────────────────────────────── │ │
-│    Deep research           Multi-step research with c… palette │ │
-│    Knowledge               Search & ingest — one pane  palette │ │
-│    Material properties     Structure, lattice, moduli… palette │ │
-│    Nodes                   See your connected nodes    palette │ │
-│    Notebook                Python notebook — persiste… palette │ │
-│    Predict properties      ML prediction for a compos… palette │ │
-│    Procure GPU compute     Live GPU catalog with pric… palette │ │
-│    Run simulation          Relax/MD via MACE + pyiron  palette │ │
-│    Browse web page         Read a URL as text (HTTP f… palette │ │
-│    Goal status             Check a discovery campaign… palette │ │
-│    List goals              Discovery campaigns on thi… palette │ │
-│  … 57 more — ↓ to scroll or type to filter                     │ │
+│    Deep research           Multi-step research w… opens a form │ │
+│    Knowledge               Search & ingest — one… opens a pane │ │
+│    Material properties     Structure, lattic… fills the prompt │ │
+│    Nodes                   See your connected n… opens a panel │ │
+│    Notebook                Python notebook — per… opens a pane │ │
+│    Predict properties      ML prediction for… fills the prompt │ │
+│    Procure GPU compute     Live GPU catalog wit… opens a panel │ │
+│    Run simulation          Relax/MD via MACE… fills the prompt │ │
+│    Browse web page         Read a URL as text (H… opens a form │ │
+│    Goal status             Check a discovery cam… opens a form │ │
+│    List goals              Discovery camp… runs /campaign list │ │
+│  … 58 more — ↓ to scroll or type to filter                     │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
                                                                    │

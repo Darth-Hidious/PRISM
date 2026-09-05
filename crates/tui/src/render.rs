@@ -1415,6 +1415,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         FooterTrim::Group("tok/s:"),
         FooterTrim::Group("cost:"),
         FooterTrim::ShortReasoning,
+        // Last resort, seen live with an approval pending (the focus tag is a
+        // state then and stays): the balance goes before the quit hint does.
+        FooterTrim::Group("credits:"),
     ];
     for trim in trims {
         if line.width() <= width {
@@ -4549,9 +4552,16 @@ fn draw_command_palette(f: &mut Frame, app: &App) {
                     } else {
                         format!("  {:>11} ▸ ", c.category.to_ascii_lowercase())
                     };
+                    // A keybind when the entry has one; otherwise what Enter
+                    // does. The word "palette" told the reader nothing.
+                    let hint = if c.keybind == "palette" {
+                        command::effect(c.id)
+                    } else {
+                        c.keybind.to_string()
+                    };
                     let fixed = tag.chars().count() + 24;
                     let desc_max = inner_w
-                        .saturating_sub(fixed + c.keybind.chars().count() + 2)
+                        .saturating_sub(fixed + hint.chars().count() + 2)
                         .min(44);
                     let mut spans = vec![
                         Span::styled(tag, Style::default().fg(t.muted)),
@@ -4562,12 +4572,9 @@ fn draw_command_palette(f: &mut Frame, app: &App) {
                         Span::styled(clip(c.description, desc_max), Style::default().fg(t.dim)),
                     ];
                     let used = fixed + c.description.chars().count().min(desc_max);
-                    let pad = inner_w.saturating_sub(used + c.keybind.chars().count() + 1);
+                    let pad = inner_w.saturating_sub(used + hint.chars().count() + 1);
                     spans.push(Span::raw(" ".repeat(pad)));
-                    spans.push(Span::styled(
-                        c.keybind.to_string(),
-                        Style::default().fg(t.muted),
-                    ));
+                    spans.push(Span::styled(hint, Style::default().fg(t.muted)));
                     let mut line = Line::from(spans);
                     if focused {
                         line = line.style(Style::default().add_modifier(Modifier::REVERSED));
