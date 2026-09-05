@@ -1514,7 +1514,7 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
             // is a lie. Spell the keys that ARE live instead.
             if app.focus == Focus::Approval {
                 if app.approval_reason.is_some() {
-                    "approval pending…  (type yes · then y allow once · n/Esc deny)".to_string()
+                    "approval pending…  (type yes · then y allow once · Esc deny)".to_string()
                 } else {
                     "tool approval pending…  (y allow · a allow all · n/Esc deny)".to_string()
                 }
@@ -5761,7 +5761,9 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
                 Span::styled("Allow once · after unlock", Style::default().fg(t.muted)),
             ]),
         }
-        if app.approval_typed.is_empty() {
+        // `n` is a deny key only without an unlock field; with one it is a
+        // letter (tool names begin with it), so the legend lists Esc alone.
+        if app.approval_reason.is_none() {
             hints.extend([
                 Span::raw("   [n/Esc] "),
                 Span::styled("Deny", Style::default().fg(t.err)),
@@ -5770,9 +5772,13 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
             hints.extend([
                 Span::raw("   [Esc] "),
                 Span::styled("Deny", Style::default().fg(t.err)),
-                Span::raw("   [⌫] "),
-                Span::styled("edit", Style::default().fg(t.muted)),
             ]);
+            if !app.approval_typed.is_empty() {
+                hints.extend([
+                    Span::raw("   [⌫] "),
+                    Span::styled("edit", Style::default().fg(t.muted)),
+                ]);
+            }
         }
         if let Some(hint) = scroll_hint {
             hints.push(Span::styled(hint, Style::default().fg(t.muted)));

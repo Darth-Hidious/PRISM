@@ -159,7 +159,7 @@ pub static KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "n",
-        description: "Deny the pending call",
+        description: "Deny the pending call (on a destructive call n is a letter of the unlock word; Esc denies)",
         category: "Approvals",
     },
     KeyBinding {

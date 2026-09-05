@@ -506,7 +506,13 @@ fn snapshot_approval_destructive_popup_100x30() {
     assert_no_terminal_controls(&rendered);
     assert!(rendered.contains("command: rm -rf build"), "{rendered}");
     assert!(rendered.contains("reversible: no"), "{rendered}");
-    assert!(rendered.contains("[n/Esc] Deny"), "{rendered}");
+    // While the unlock field is up `n` is a letter (tool names begin with
+    // it), so the legend lists Esc alone as the deny key.
+    assert!(rendered.contains("[Esc] Deny"), "{rendered}");
+    assert!(
+        !rendered.contains("[n/Esc]"),
+        "n is not a deny key on a destructive call:\n{rendered}"
+    );
     insta::assert_snapshot!("approval_destructive_popup_100x30", rendered);
 }
 

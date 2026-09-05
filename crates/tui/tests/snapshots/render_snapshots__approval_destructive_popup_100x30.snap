@@ -18,7 +18,7 @@ expression: rendered
 ││command: rm -rf build                                         ││ │
 │└──────────────────────────────────────────────────────────────┘│ │
 │  unlock (type yes or execute_bash): ▏                          │ │
-│  [y] Allow once · after unlock   [n/Esc] Deny                  │ │
+│  [y] Allow once · after unlock   [Esc] Deny                    │ │
 └────────────────────────────────────────────────────────────────┘ │
                                                                    │
                                                                    │
@@ -27,7 +27,7 @@ expression: rendered
                                                                    │
                                                                    │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
-│approval pending…  (type yes · then y allow once · n/Esc deny)  │ │
+│approval pending…  (type yes · then y allow once · Esc deny)    │ │
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │

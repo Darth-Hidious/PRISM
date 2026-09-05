@@ -905,7 +905,8 @@ pub struct App {
     pub approval_args: Option<String>,
     /// What the human has typed into the popup's unlock field. Only a
     /// destructive call (`approval_reason` is `Some`) has the field: `y` is
-    /// accepted once this reads `yes` or the tool's name.
+    /// accepted once this reads `yes` or the tool's name. While the field is
+    /// up every printable key is a letter — `n` included — and Esc denies.
     pub approval_typed: String,
     /// Scroll offset into the approval popup's arguments block.
     pub approval_scroll: u16,
@@ -3178,15 +3179,17 @@ impl App {
                 self.clear_approval();
                 self.push_system(&format!("[approved {tool}]"));
             }
-            // `n` denies while the field is empty; once the human has begun
-            // typing an unlock word (a tool name can contain an `n`) it is a
-            // letter, and Esc is the deny key.
+            // Esc denies at any point. `n` denies only a call without a
+            // reason: while the unlock field is up it is a letter, because
+            // tool names begin with it (`notebook_exec`, `node`) and contain
+            // it (`knowledge_write`), and a deny on the first keystroke would
+            // make those names impossible to type.
             KeyCode::Esc => {
                 let _ = self.backend.send_approval("n", &tool);
                 self.clear_approval();
                 self.push_system(&format!("[denied {tool}]"));
             }
-            KeyCode::Char('n') | KeyCode::Char('N') if self.approval_typed.is_empty() => {
+            KeyCode::Char('n') | KeyCode::Char('N') if self.approval_reason.is_none() => {
                 let _ = self.backend.send_approval("n", &tool);
                 self.clear_approval();
                 self.push_system(&format!("[denied {tool}]"));
@@ -10998,18 +11001,69 @@ mod tests {
         assert!(app.approval_args.is_none());
     }
 
-    /// `n` and Esc deny a destructive call at any point; Esc even after the
-    /// human began typing the unlock word.
-    #[test]
-    fn a_destructive_prompt_is_denied_by_n_and_by_esc() {
+    /// Every notification the fake backend has queued, by method, in order.
+    /// The fake pushes synchronously, so a short timeout means "empty".
+    async fn drain_methods(app: &mut App) -> Vec<String> {
+        let mut heard = Vec::new();
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), app.backend.recv()).await
+        {
+            heard.push(
+                msg.get("method")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        }
+        heard
+    }
+
+    /// On a destructive call Esc is the deny key and `n` is a letter: tool
+    /// names begin with it (`notebook_exec`, `node`) and contain it, and the
+    /// unlock field must be able to hold them. A call without a reason is
+    /// still denied by `n`. A denial is not a local clear — the backend hears
+    /// the "n", or it would wait on the prompt forever.
+    #[tokio::test]
+    async fn a_destructive_prompt_is_denied_by_esc_and_n_is_a_letter() {
+        // Baseline: what the fake emits at launch, before any answer.
+        let mut control = fresh();
+        let launch = drain_methods(&mut control).await;
+
         let mut app = fresh();
         app.apply_agent_msg(forced_rm_prompt());
         app.handle_key(key(KeyCode::Char('n')));
-        assert!(app.approval_pending.is_none(), "n denies");
+        assert!(
+            app.approval_pending.is_some(),
+            "n must not deny a destructive call: it is the first letter of a tool name"
+        );
+        assert_eq!(app.approval_typed, "n", "n lands in the unlock field");
+        assert!(
+            !app.messages.iter().any(|m| m.text.contains("[denied")),
+            "nothing was denied"
+        );
+
+        let mut app = fresh();
+        app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+            tool_name: "compute_submit".into(),
+            message: "Allow compute_submit?".into(),
+            call_id: None,
+            tool_args: None,
+            tool_description: None,
+            requires_approval: Some(true),
+            permission_mode: None,
+            choices: vec![],
+            prompt_type: None,
+            reason: None,
+        });
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(
+            app.approval_pending.is_none(),
+            "n still denies a plain call"
+        );
         assert!(
             app.messages
                 .iter()
-                .any(|m| m.text.contains("[denied execute_bash]")),
+                .any(|m| m.text.contains("[denied compute_submit]")),
             "the denial is written into the transcript"
         );
 
@@ -11024,6 +11078,22 @@ mod tests {
         assert!(
             app.approval_typed.is_empty(),
             "the field is cleared with the prompt"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.text.contains("[denied execute_bash]")),
+            "the denial is written into the transcript"
+        );
+        // The fake answers "n" with a status and a turn-complete, "y" with a
+        // card and "a" with a permissions notice — so what it queued after
+        // its launch notifications says which reply went on the wire.
+        let heard = drain_methods(&mut app).await;
+        assert_eq!(
+            heard.get(launch.len()..),
+            Some(&["ui.status".to_string(), "ui.turn.complete".to_string()][..]),
+            "Esc must send the backend an \"n\"; heard {heard:?} after {} launch notifications",
+            launch.len()
         );
     }
 
@@ -11044,6 +11114,44 @@ mod tests {
             app.messages
                 .iter()
                 .any(|m| m.text.contains("[approved execute_bash]")),
+            "y after the unlock approves"
+        );
+    }
+
+    /// A tool whose name begins with `n` is unlocked by its name too: while
+    /// the field is up, `n` is a letter, never a deny. (`notebook_exec` runs
+    /// on the kernel shared with the human, so a cell that removes a file
+    /// carries a reason.)
+    #[test]
+    fn a_tool_named_with_a_leading_n_is_unlocked_by_its_name() {
+        let mut app = fresh();
+        app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+            tool_name: "notebook_exec".into(),
+            message: "Allow notebook_exec?".into(),
+            call_id: Some("forced-nb".into()),
+            tool_args: Some(serde_json::json!({ "code": "os.remove('x')" })),
+            tool_description: None,
+            requires_approval: Some(true),
+            permission_mode: None,
+            choices: vec!["y".into(), "n".into(), "a".into()],
+            prompt_type: Some("approval".into()),
+            reason: Some("'notebook_exec' can write and the cell names 'remove'".into()),
+        });
+        for c in "notebook_exec".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(
+            app.approval_pending.is_some(),
+            "typing the name must not answer the prompt"
+        );
+        assert_eq!(app.approval_typed, "notebook_exec");
+        assert!(app.approval_unlocked(), "the tool's name unlocks the call");
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.approval_pending.is_none());
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.text.contains("[approved notebook_exec]")),
             "y after the unlock approves"
         );
     }
