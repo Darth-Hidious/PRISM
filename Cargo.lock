@@ -6391,6 +6391,7 @@ dependencies = [
  "dirs",
  "jsonschema",
  "libc",
+ "mockito",
  "prism-agent",
  "prism-campaign",
  "prism-client",
