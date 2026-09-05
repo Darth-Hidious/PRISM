@@ -131,6 +131,36 @@ Streaming and cancellation are supported. Tool calling is not yet supported by
 the embedded adapter; tool-bearing turns are refused before generation rather
 than silently dropping tools.
 
+### Fallback models (own inference that does not fail)
+
+`~/.prism/config.toml` may name targets tried, in order, when the primary
+cannot answer — the box is unreachable (connection refused, DNS, timeout) or
+up but failing (HTTP 5xx / 429 once the retry budget is spent):
+
+```toml
+[chat]
+mode = "local"
+url = "http://127.0.0.1:8080/v1"
+model = "qwen3-32b"
+
+[[fallbacks]]
+mode = "provider"
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+
+[[fallbacks]]
+mode = "local"
+url = "http://10.0.0.2:8080/v1"
+model = "qwen3-32b"
+```
+
+A 4xx is the request being wrong and is never routed around. Failover happens
+only when the primary delivered nothing (a stream that broke halfway is already
+on screen; a fallback would say it twice). The TUI's activity strip says which
+fallback answered. A `marc27` entry is not a valid fallback on this path. An
+endpoint that accepts `stream: true` and sends an empty stream is answered by
+one plain request, and streaming is retired for that client.
+
 ## CLI Commands
 
 ### Setup & Auth
