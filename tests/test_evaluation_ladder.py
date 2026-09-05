@@ -363,3 +363,26 @@ def test_a_synthetic_backend_result_is_never_executed_evidence():
     assert ev.evidence_source_for(ev.TIER_MACE, failed) is EvidenceSource.MODEL_ASSERTION
     stamped = stamp_evidence({}, ev.evidence_source_for(ev.TIER_MACE, fake))
     assert stamped is not EvidenceClass.REFERENCE_VALIDATED, stamped
+
+
+def test_tier_three_sees_the_provisioned_quantum_espresso(monkeypatch, tmp_path):
+    """Measured in the SX500 run 2026-09-05: the report said "Tier 3 (Quantum
+    ESPRESSO) not installed — no pw.x binary" while `prism qe status` reported
+    ready — pw.x lives in ~/.prism/qe/bin (or wherever the QE settings say),
+    not on PATH. The tier probe must use the QE runtime's resolver."""
+    from app.tools import evaluation
+
+    pw = tmp_path / "pw.x"
+    pw.write_text("#!/bin/sh\n")
+    pw.chmod(0o755)
+    monkeypatch.setattr(evaluation, "find_pw_x", lambda config=None: str(pw))
+    monkeypatch.setattr(evaluation, "check_qe_available", lambda: True, raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path / "nowhere"))
+    status = evaluation.tier_status()
+    assert status["3"]["execution_available"] is True, status["3"]
+    assert status["3"]["pw_x_path"] == str(pw)
+
+    monkeypatch.setattr(evaluation, "find_pw_x", lambda config=None: None)
+    status = evaluation.tier_status()
+    assert status["3"]["execution_available"] is False
+    assert "prism provision qe" in status["3"].get("install_hint", ""), status["3"]

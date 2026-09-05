@@ -37,18 +37,24 @@ Contract (the product is the traceability):
     from this repo for inventing alloy compositions; that deletion is the
     standard this module is written to.
 
-Tier 3 honesty note: there is no pw.x binary in the development environment
-this module was written in. ``evaluate_candidate`` therefore generates a real
-pw.x input file (validated against ASE's espresso-in reader) but reports
+Tier 3 note: pw.x is resolved through the QE runtime (PRISM_QE_PW, the [qe]
+settings, ~/.prism/qe/bin as built by `prism provision qe`, then PATH). Where
+none is found, ``evaluate_candidate`` generates a real pw.x input file
+(validated against ASE's espresso-in reader), reports
 ``execution.status = "unavailable"`` with the reason, and returns NO energy.
-The execution path is written but UNVERIFIED: exercising it requires a pw.x
-install, or submission through the SLURM path in crates/compute.
+A provisioned pw.x ran a converged Si scf on this machine on 2026-09-05.
 """
 
 from __future__ import annotations
 
 import logging
 import shutil
+from app.tools.simulation.qe.runtime import find_pw_x  # env → QE settings → ~/.prism/qe → PATH
+try:
+    from app.tools.simulation.qe import check_qe_available
+except Exception:  # pragma: no cover - the qe extra is optional
+    def check_qe_available():  # type: ignore[misc]
+        return False
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -140,9 +146,10 @@ TIER_INSTALL_HINTS = {
     TIER_QE: (
         "Tier 3 needs (a) the [qe] extra for input/output handling: "
         "~/.prism/venv/bin/python -m pip install 'ase>=3.23.0' "
-        "'pymatgen>=2024.1.1', AND (b) a pw.x binary on PATH — install "
-        "Quantum ESPRESSO, or submit the generated .in file through the "
-        "SLURM path in crates/compute."
+        "'pymatgen>=2024.1.1', AND (b) a pw.x binary: run `prism provision qe` "
+        "(builds Quantum ESPRESSO into ~/.prism/qe with the PseudoDojo set), or "
+        "point PRISM_QE_PW / the [qe] settings at an existing pw.x, or submit "
+        "the generated .in file through the SLURM path in crates/compute."
     ),
 }
 
@@ -278,11 +285,13 @@ def tier_status() -> dict[str, dict]:
     }
 
     try:
-        from app.tools.simulation.qe import check_qe_available
         qe_io_ok = check_qe_available()
     except Exception:
         qe_io_ok = False
-    pw_path = shutil.which("pw.x")
+    # Not PATH alone: `prism provision qe` builds pw.x into ~/.prism/qe, and
+    # the QE settings may name another binary. The SX500 run (2026-09-05)
+    # was told "no pw.x binary" while a working one sat one directory over.
+    pw_path = find_pw_x({})
     status["3"] = {
         "tier": TIER_QE,
         "name": TIER_NAMES[3],
@@ -294,7 +303,7 @@ def tier_status() -> dict[str, dict]:
         # than it is.
         "io_available": bool(qe_io_ok),
         "execution_available": bool(pw_path),
-        "pw_x_path": pw_path,
+        "pw_x_path": str(pw_path) if pw_path else None,
         **({} if qe_io_ok else {
             "reason": "ase / pymatgen not importable",
         }),
@@ -713,7 +722,7 @@ def _run_tier3(candidate: dict, elems: list[str], fracs: list[float]) -> dict:
         write_input,
     )
 
-    pw_path = shutil.which("pw.x")
+    pw_path = find_pw_x({})
     pseudo_dir = Path(candidate.get("qe_pseudo_dir")
                       or Path.home() / ".prism" / "pseudos")
     workdir = Path(candidate.get("qe_workdir")
