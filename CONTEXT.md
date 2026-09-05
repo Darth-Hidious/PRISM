@@ -140,7 +140,11 @@ DONE: view panel wraps long lines (was cut at the edge).
 DONE `4078e6b0`: panels wrap at spaces. DONE (tools): MACE tier accepts every fcc/bcc/hcp element (tables derived from ASE); LPBF map's evidence class follows property_sources (unsourced → RED, gaps named).
 DONE: disk — /tmp/panel-target debug wiped (46 GB) + brew/npm/uv caches; 52 GB free.
 DONE `45b8086b`: QE is a standard run — `prism provision qe` builds pw.x (7.4.1) into ~/.prism/qe + PseudoDojo set with manifest; runtime + qe_run/qe_status tools; `prism qe status|settings|run`; palette QE status/settings/run; `/tools reload` hot reload; PROMOTE + KEEP WORKING directives. Live: Si scf 4.3 s.
-NEXT: settings hub tiles; credits/tok resets; destructive → forced human approval; own-inference fallbacks; model router; SSO scope (platform side).
+DONE `fe27d7d4`: settings hub — palette "Settings" → ten large tiles (Model, Search keys, Compute & QE, Approvals, Display, Billing, Account, Nodes, Config, Tools) opening the real windows; meters reset with /new; footer says "overdrawn" on a negative balance.
+DONE `6730d420`: destructive words (rm/rmdir/delete/drop/…) no longer abort the model's call — they FORCE a per-call human decision (no auto-approve, no session "always", reason on the popup, 'a' approves this call only). bash.py still refuses `.git`/`.prism` — loosening that is the owner's call (classifier blocked it).
+DONE `1d86412c`: own inference does not fail — empty stream → one plain request + streaming retired; `[[fallbacks]]` in ~/.prism/config.toml tried on transport/5xx/429 (never on 4xx, never after partial text); switch announced in the activity strip. README documents it.
+DONE `68f85341`: balance refreshes itself after 2 idle min and says "stale" when a fetch failed; "Search sources & keys" opens on Semantic Scholar.
+NEXT: `prism use fallback add/list/clear` + palette form (fallbacks without hand-editing TOML); model window lists fallbacks; SSO scope (Mirdyne provider exists in `prism login`; SAML/IdP is platform-side); CONTEXT.md ≤20 lines at session end.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
