@@ -4094,3 +4094,24 @@ fn hovering_records_the_target_under_the_pointer() {
     });
     assert_eq!(app.hovered, None, "moving off a mark must clear the hover");
 }
+
+#[test]
+fn a_single_body_view_is_one_tab() {
+    // Live 2026-09-05: `/papers search` answered with a `ui.view` carrying
+    // `title` and `body`, and the panel read "nothing to show … yet". The
+    // parser read only `tabs`; every single-body view from the backend
+    // (doctor, providers, billing, papers) rendered empty.
+    let msg = parse_notification(&serde_json::json!({
+        "method": "ui.view",
+        "params": {"view_type": "papers", "title": "Papers — search", "body": "2 paper(s)\n  • A", "tone": "info"}
+    }));
+    match msg {
+        AgentMsg::View { title, tabs } => {
+            assert_eq!(title, "Papers — search");
+            assert_eq!(tabs.len(), 1, "the body is the one tab");
+            assert_eq!(tabs[0].0, "Papers — search", "named after the view");
+            assert!(tabs[0].1.contains("2 paper(s)"), "{:?}", tabs[0].1);
+        }
+        other => panic!("expected a View, got {other:?}"),
+    }
+}

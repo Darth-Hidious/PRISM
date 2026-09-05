@@ -4471,7 +4471,9 @@ fn draw_gh_panel(f: &mut Frame, app: &App) {
 /// 2026-09-05: "Fetch a paper's full textJATS or PDF…" pushed the row past
 /// the frame).
 pub(crate) fn palette_title_cell(title: &str) -> String {
-    format!("{:<24}", clip(title, 24))
+    // 23 visible columns plus one of daylight: a 24-column title touched its
+    // description ("Assertions to re-verifyBy verification status").
+    format!("{:<24}", clip(title, 23))
 }
 
 fn draw_command_palette(f: &mut Frame, app: &App) {
@@ -4562,12 +4564,16 @@ fn draw_command_palette(f: &mut Frame, app: &App) {
                     };
                     // A keybind when the entry has one; otherwise what Enter
                     // does. The word "palette" told the reader nothing.
-                    let hint = if c.keybind == "palette" {
+                    let fixed = tag.chars().count() + 24;
+                    // A hint the row cannot hold is clipped with an ellipsis,
+                    // never cut silently by the frame ("runs /provenance
+                    // failure│" read as a different word).
+                    let hint_raw = if c.keybind == "palette" {
                         command::effect(c.id)
                     } else {
                         c.keybind.to_string()
                     };
-                    let fixed = tag.chars().count() + 24;
+                    let hint = clip(&hint_raw, inner_w.saturating_sub(fixed + 1).max(4));
                     let desc_max = inner_w
                         .saturating_sub(fixed + hint.chars().count() + 2)
                         .min(44);

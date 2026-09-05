@@ -1864,9 +1864,8 @@ async fn execute_manual_tool_call(
 
 fn command_timeout_for_root(root: &str) -> Duration {
     match root {
-        "workflow" | "ingest" | "query" | "run" | "research" | "deploy" | "publish" | "papers" => {
-            Duration::from_secs(300)
-        }
+        "workflow" | "ingest" | "query" | "run" | "research" | "deploy" | "publish" | "papers"
+        | "ontology" | "matkg" | "predict" | "reverify" => Duration::from_secs(300),
         "node" | "mesh" => Duration::from_secs(60),
         _ => Duration::from_secs(30),
     }
@@ -8787,6 +8786,28 @@ async fn handle_command(
         // as a subprocess would print "\u{2713} Chat: ..." as if it took
         // effect now, when it actually only applies on the next launch —
         // an honest-looking lie. `show` has no such gap: it only reads.
+        // The knowledge planes, in-app (parity, 2026-09-05): each runs the
+        // CLI subcommand a human could type and shows its output as it is.
+        _ if ["ontology", "provenance", "reverify", "matkg", "predict"]
+            .iter()
+            .any(|r| trimmed == format!("/{r}") || trimmed.starts_with(&format!("/{r} "))) =>
+        {
+            let tokens = parse_command_tail(&trimmed[1..])?;
+            let root = tokens[0].clone();
+            let title = match root.as_str() {
+                "ontology" => "Ontologies",
+                "provenance" => "Provenance",
+                "reverify" => "Re-verification",
+                "matkg" => "MatKG",
+                _ => "Predict",
+            };
+            match run_cli_backed_slash_command(&tokens, slash_ctx).await {
+                Ok(out) => emit_view(&root, title, &out, "info"),
+                Err(e) => emit_view(&root, title, &format!("{e}"), "warning"),
+            }
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
         // `/papers search|sweep|full-text|corpus …` — the literature engine
         // in-app (parity, 2026-09-05). The CLI prints JSON; search and sweep
         // are shown as a reader's page (papers, then the databases asked),

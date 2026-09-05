@@ -345,6 +345,13 @@ const CLI_BACKED_ROOTS: &[&str] = &[
     // The literature engine, in-app: the palette's papers forms dispatch
     // `/papers search|sweep|full-text|corpus …` (parity, 2026-09-05).
     "papers",
+    // The knowledge planes, in-app (parity, 2026-09-05): ontologies, the
+    // provenance ledger, re-verification, MatKG, marketplace prediction.
+    "ontology",
+    "provenance",
+    "reverify",
+    "matkg",
+    "predict",
 ];
 
 pub fn builtin_help_text() -> String {
@@ -372,6 +379,13 @@ pub fn builtin_help_text() -> String {
         "  /papers search --query \"...\" [--sources a,b] [--limit n]  (also sweep | full-text | corpus)"
             .to_string(),
     );
+    lines.push("  /ontology list | bind <names> | relations <class> | validate <path> | promote <path> | proposals list".to_string());
+    lines.push("  /provenance stats | failures".to_string());
+    lines.push(
+        "  /reverify list --status <s> | run --assertion <id> | history --assertion <id>"
+            .to_string(),
+    );
+    lines.push("  /matkg load <path>   /predict <model> [--task t] [--input json]".to_string());
     lines.push("  /marketplace search <query>".to_string());
     lines.push("  /models list [--provider google]".to_string());
     lines.push("  /gpus".to_string());
@@ -403,6 +417,13 @@ mod tests {
     /// with "Unsupported slash command root: use", because the allowlist that
     /// gates dispatch is a SECOND list that nothing kept in sync with the
     /// first. Found by typing it into the running TUI, not by any test.
+    #[test]
+    fn the_knowledge_planes_are_dispatchable_slash_roots() {
+        for root in ["ontology", "provenance", "reverify", "matkg", "predict"] {
+            assert!(is_cli_backed_slash_root(root), "{root}");
+        }
+    }
+
     #[test]
     fn the_papers_engine_is_a_dispatchable_slash_root() {
         // Parity, measured 2026-09-05: the palette's papers forms dispatch

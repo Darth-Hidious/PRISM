@@ -106,6 +106,110 @@ pub static CATALOG: &[Command] = &[
         suggested: false,
     },
     Command {
+        id: "ontology.list",
+        title: "Ontologies",
+        description: "Builtins plus every project artifact",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "ontology.bind",
+        title: "Bind terms",
+        description: "Free-text names onto the loaded ontologies",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "ontology.relations",
+        title: "Ontology relations",
+        description: "What relations touch a class, and what is on the other end",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "ontology.validate",
+        title: "Validate ontology",
+        description: "Parse and validate a TTL artifact",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "ontology.promote",
+        title: "Promote ontology",
+        description: "DRAFT → ACCEPTED, into the project catalog",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "ontology.proposals",
+        title: "Ontology proposals",
+        description: "Extension proposals the paper reader queued",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "provenance.stats",
+        title: "Provenance stats",
+        description: "Record counts: ok / error / other",
+        category: "Diagnostics",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "provenance.failures",
+        title: "Failed tool runs",
+        description: "status='error', newest first",
+        category: "Diagnostics",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "reverify.list",
+        title: "Assertions to re-verify",
+        description: "By verification status",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "reverify.run",
+        title: "Re-verify assertion",
+        description: "Re-read its cited lines with the model — recorded",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "reverify.history",
+        title: "Re-verification history",
+        description: "Every verdict for one assertion",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "matkg.load",
+        title: "Load MatKG",
+        description: "Stream SUBRELOBJ triples into the local graph",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "predict.run",
+        title: "Predict (marketplace)",
+        description: "Run a marketplace model on the cloud — billable",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
         id: "papers.search",
         title: "Search papers (engine)",
         description: "Federated literature search — ten databases, no model",
@@ -768,6 +872,15 @@ pub fn effect(id: &str) -> String {
         | "papers.sweep"
         | "papers.fulltext"
         | "papers.corpus"
+        | "ontology.bind"
+        | "ontology.relations"
+        | "ontology.validate"
+        | "ontology.promote"
+        | "reverify.list"
+        | "reverify.run"
+        | "reverify.history"
+        | "matkg.load"
+        | "predict.run"
         | "node.up"
         | "goal.set"
         | "campaign.start"
@@ -787,6 +900,10 @@ pub fn effect(id: &str) -> String {
         | "apikey.show" | "search.keys" | "links.open" | "cost.show" | "model.show"
         | "compute.gpus" | "nodes.show" | "mcp.show" => "opens a panel",
         "node.stop" => "runs /node stop",
+        "ontology.list" => "runs /ontology list",
+        "ontology.proposals" => "runs /ontology proposals list",
+        "provenance.stats" => "runs /provenance stats",
+        "provenance.failures" => "runs /provenance failures",
         "node.status" => "runs /node status",
         "campaign.list" => "runs /campaign list",
         "workflow.list" => "runs /workflow list",

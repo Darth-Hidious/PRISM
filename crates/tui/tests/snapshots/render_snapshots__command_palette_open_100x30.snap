@@ -18,10 +18,10 @@ expression: rendered
 │    Predict properties      ML prediction for… fills the prompt │ │
 │    Procure GPU compute     Live GPU catalog wit… opens a panel │ │
 │    Run simulation          Relax/MD via MACE… fills the prompt │ │
+│    Assertions to re-verify By verification status opens a form │ │
+│    Bind terms              Free-text names onto … opens a form │ │
 │    Browse web page         Read a URL as text (H… opens a form │ │
-│    Build a corpus          Every full text for a… opens a form │ │
-│    Fetch full text         JATS or PDF by URL or… opens a form │ │
-│  … 62 more — ↓ to scroll or type to filter                     │ │
+│  … 75 more — ↓ to scroll or type to filter                     │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
                                                                    │

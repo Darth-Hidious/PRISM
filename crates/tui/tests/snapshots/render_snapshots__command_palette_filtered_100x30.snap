@@ -11,17 +11,17 @@ expression: rendered
 │                                                                │ │
 │    reference ▸ Tool catalog            Browse t… opens a panel │ │
 │  diagnostics ▸ Show tool permissions   Tool acce… /permissions │ │
+│  diagnostics ▸ Failed tool runs        runs /provenance failu… │ │
 │  marketplace ▸ Marketplace install     Install a… opens a form │ │
 │  marketplace ▸ Marketplace find        Semantic … opens a form │ │
 │   navigation ▸ Workspace: Tools        Switch sidebar to … ←/→ │ │
 │  marketplace ▸ Marketplace publish     PRISM's o… opens a form │ │
 │  marketplace ▸ Marketplace search      Search do… opens a form │ │
 │      display ▸ Mission Control         The laun… opens a panel │ │
-│      science ▸ Node stop               Stop t… runs /node stop │ │
-│      account ▸ Account                 Platform… opens a panel │ │
-│      session ▸ Set goal                Standing … /goal <text> │ │
-│   automation ▸ Show workflow           Inspect o… opens a form │ │
-│  … 30 more — ↓ to scroll or type to filter                     │ │
+│      science ▸ Promote ontology        DRAFT → A… opens a form │ │
+│      science ▸ Validate ontology       Parse and… opens a form │ │
+│      science ▸ Bind terms              Free-text… opens a form │ │
+│  … 41 more — ↓ to scroll or type to filter                     │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
                                                                    │

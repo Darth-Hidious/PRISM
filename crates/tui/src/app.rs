@@ -623,6 +623,18 @@ pub enum FormTarget {
     PapersSweep,
     PapersFulltext,
     PapersCorpus,
+    /// The knowledge planes (palette `ontology.*`, `reverify.*`, `matkg.load`,
+    /// `predict.run`): one positional or flagged argument each, dispatched
+    /// as the CLI command a human could type.
+    OntologyBind,
+    OntologyRelations,
+    OntologyValidate,
+    OntologyPromote,
+    ReverifyList,
+    ReverifyRun,
+    ReverifyHistory,
+    MatkgLoad,
+    PredictRun,
     /// Read one web page as text via agent-browser (palette `browse.open`).
     /// Submit dispatches `/browse <url>`, which the backend runs through the
     /// SAME `agent-browser` path the agent's `web_browse` tool uses.
@@ -3034,6 +3046,77 @@ impl App {
                     }
                 }
             }
+            FormTarget::OntologyBind
+            | FormTarget::OntologyRelations
+            | FormTarget::OntologyValidate
+            | FormTarget::OntologyPromote
+            | FormTarget::ReverifyList
+            | FormTarget::ReverifyRun
+            | FormTarget::ReverifyHistory
+            | FormTarget::MatkgLoad
+            | FormTarget::PredictRun => {
+                let f = &pane.form;
+                let composed = match pane.target {
+                    FormTarget::OntologyBind => positional_command(
+                        f,
+                        "names",
+                        &["ontology", "bind"],
+                        "enter one or more names",
+                    ),
+                    FormTarget::OntologyRelations => {
+                        positional_command(f, "class", &["ontology", "relations"], "enter a class")
+                    }
+                    FormTarget::OntologyValidate => positional_command(
+                        f,
+                        "path",
+                        &["ontology", "validate"],
+                        "enter the artifact path",
+                    ),
+                    FormTarget::OntologyPromote => positional_command(
+                        f,
+                        "path",
+                        &["ontology", "promote"],
+                        "enter the artifact path",
+                    ),
+                    FormTarget::ReverifyList => flag_command(
+                        f,
+                        "status",
+                        &["reverify", "list"],
+                        "--status",
+                        "enter a status",
+                    ),
+                    FormTarget::ReverifyRun => flag_command(
+                        f,
+                        "assertion",
+                        &["reverify", "run"],
+                        "--assertion",
+                        "enter an assertion id",
+                    ),
+                    FormTarget::ReverifyHistory => flag_command(
+                        f,
+                        "assertion",
+                        &["reverify", "history"],
+                        "--assertion",
+                        "enter an assertion id",
+                    ),
+                    FormTarget::MatkgLoad => positional_command(
+                        f,
+                        "path",
+                        &["matkg", "load"],
+                        "enter the SUBRELOBJ path",
+                    ),
+                    _ => predict_command(f),
+                };
+                match composed {
+                    Ok(cmd) => {
+                        let _ = self.backend.send_command(&cmd);
+                    }
+                    Err(msg) => {
+                        self.toast(msg, ToastKind::Warn);
+                        self.form = Some(pane);
+                    }
+                }
+            }
         }
     }
 
@@ -3148,7 +3231,7 @@ impl App {
             vec![
                 FormField::text("query", "Query", "").with_note("e.g. GRCop-42 creep copper alloy"),
                 FormField::text("sources", "Sources", "")
-                    .with_note("comma-separated; empty = every source (arxiv, openalex, crossref, pubmed, osti, ntrs, …)"),
+                    .with_note("comma-separated source ids; empty = every source"),
                 FormField::text("limit", "Per-source limit", "").with_note("empty = 20"),
             ],
         );
@@ -3198,6 +3281,40 @@ impl App {
             ],
         );
         self.open_form(form, FormTarget::PapersCorpus);
+    }
+
+    /// One-field forms for the knowledge planes; the field name is what the
+    /// composer reads.
+    fn open_one_field_form(
+        &mut self,
+        title: &str,
+        submit: &str,
+        field: &str,
+        label: &str,
+        note: &str,
+        target: FormTarget,
+    ) {
+        let form = Form::new(
+            title,
+            submit,
+            vec![FormField::text(field, label, "").with_note(note)],
+        );
+        self.open_form(form, target);
+    }
+
+    /// Palette `predict.run` — a marketplace model, its task and JSON inputs.
+    pub fn open_predict_form(&mut self) {
+        let form = Form::new(
+            "Predict with a marketplace model — billable",
+            "run",
+            vec![
+                FormField::text("model", "Model slug", "").with_note("e.g. mace-mh-1, chgnet"),
+                FormField::text("task", "Task", "").with_note("single_point (default), relax, md"),
+                FormField::text("input", "Inputs (JSON)", "")
+                    .with_note("e.g. {\"structure\": {...}}"),
+            ],
+        );
+        self.open_form(form, FormTarget::PredictRun);
     }
 
     /// Palette `workflow.run` — name, optional `--set key=value` pairs, and
@@ -4887,6 +5004,83 @@ impl App {
             "papers.sweep" => self.open_papers_sweep_form(),
             "papers.fulltext" => self.open_papers_fulltext_form(),
             "papers.corpus" => self.open_papers_corpus_form(),
+            "ontology.list" => {
+                let _ = self.backend.send_command("/ontology list");
+            }
+            "ontology.proposals" => {
+                let _ = self.backend.send_command("/ontology proposals list");
+            }
+            "provenance.stats" => {
+                let _ = self.backend.send_command("/provenance stats");
+            }
+            "provenance.failures" => {
+                let _ = self.backend.send_command("/provenance failures");
+            }
+            "ontology.bind" => self.open_one_field_form(
+                "Bind terms to the loaded ontologies",
+                "bind",
+                "names",
+                "Names",
+                "free-text property or material names, comma-separated",
+                FormTarget::OntologyBind,
+            ),
+            "ontology.relations" => self.open_one_field_form(
+                "Relations of an ontology class",
+                "show",
+                "class",
+                "Class",
+                "e.g. YieldStrength",
+                FormTarget::OntologyRelations,
+            ),
+            "ontology.validate" => self.open_one_field_form(
+                "Validate an ontology artifact",
+                "validate",
+                "path",
+                "TTL path",
+                "lists the specific violations if it fails",
+                FormTarget::OntologyValidate,
+            ),
+            "ontology.promote" => self.open_one_field_form(
+                "Promote a DRAFT ontology to ACCEPTED",
+                "promote",
+                "path",
+                "TTL path",
+                "validation runs first; installs into the project catalog",
+                FormTarget::OntologyPromote,
+            ),
+            "reverify.list" => self.open_one_field_form(
+                "Assertions to re-verify",
+                "list",
+                "status",
+                "Verification status",
+                "e.g. cited_by_reader (the span-unchecked set)",
+                FormTarget::ReverifyList,
+            ),
+            "reverify.run" => self.open_one_field_form(
+                "Re-verify one assertion — a model call",
+                "run",
+                "assertion",
+                "Assertion id",
+                "re-reads its exact cited lines; the verdict is recorded",
+                FormTarget::ReverifyRun,
+            ),
+            "reverify.history" => self.open_one_field_form(
+                "Re-verification history",
+                "show",
+                "assertion",
+                "Assertion id",
+                "every recorded verdict, oldest first — no model call",
+                FormTarget::ReverifyHistory,
+            ),
+            "matkg.load" => self.open_one_field_form(
+                "Load MatKG into the local knowledge graph",
+                "load",
+                "path",
+                "SUBRELOBJ path",
+                ".nt, .nt.gz or .nt.tar.gz — bounded; re-running does not inflate",
+                FormTarget::MatkgLoad,
+            ),
+            "predict.run" => self.open_predict_form(),
             "account.show" => self.open_account(),
             "sessions.show" => self.open_sessions(),
             "tools.show" => self.open_tools_window(),
@@ -6595,6 +6789,52 @@ fn push_opt(tokens: &mut Vec<String>, flag: &str, value: &str) {
     }
 }
 
+/// `/<tokens…> <value>` from one required field, or the message to show.
+fn positional_command(
+    form: &crate::form::Form,
+    field: &str,
+    prefix: &[&str],
+    empty: &'static str,
+) -> Result<String, &'static str> {
+    let value = form.text_value(field).trim().to_string();
+    if value.is_empty() {
+        return Err(empty);
+    }
+    let mut tokens: Vec<String> = prefix.iter().map(|t| t.to_string()).collect();
+    tokens.push(value);
+    Ok(build_slash_command(&tokens))
+}
+
+/// `/<tokens…> <flag> <value>` from one required field, or the message to show.
+fn flag_command(
+    form: &crate::form::Form,
+    field: &str,
+    prefix: &[&str],
+    flag: &str,
+    empty: &'static str,
+) -> Result<String, &'static str> {
+    let value = form.text_value(field).trim().to_string();
+    if value.is_empty() {
+        return Err(empty);
+    }
+    let mut tokens: Vec<String> = prefix.iter().map(|t| t.to_string()).collect();
+    tokens.push(flag.to_string());
+    tokens.push(value);
+    Ok(build_slash_command(&tokens))
+}
+
+/// `/predict <model> [--task t] [--input json]` from the `predict.run` form.
+fn predict_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let model = form.text_value("model").trim().to_string();
+    if model.is_empty() {
+        return Err("enter a marketplace model slug");
+    }
+    let mut tokens = vec!["predict".to_string(), model];
+    push_opt(&mut tokens, "--task", &form.text_value("task"));
+    push_opt(&mut tokens, "--input", &form.text_value("input"));
+    Ok(build_slash_command(&tokens))
+}
+
 /// Build `/workflow show <name>` from the `workflow.show` form.
 fn workflow_show_command(form: &crate::form::Form) -> Result<String, &'static str> {
     let name = form.text_value("name").trim().to_string();
@@ -7111,7 +7351,13 @@ mod tests {
             24,
             "{cell:?}"
         );
-        assert!(cell.ends_with('…'), "{cell:?}");
+        assert!(
+            cell.ends_with("… "),
+            "clipped, and one column of daylight: {cell:?}"
+        );
+        // Exactly 24 columns is also too long: it would touch the description.
+        let cell = crate::render::palette_title_cell("Assertions to re-verify!");
+        assert!(cell.ends_with("… "), "{cell:?}");
         let cell = crate::render::palette_title_cell("Short");
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(cell.as_str()),
@@ -7131,6 +7377,157 @@ mod tests {
                 "the row ends at the frame: {r:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_knowledge_planes_are_reachable_from_the_palette() {
+        // Parity, measured 2026-09-05: ontology, provenance, reverify,
+        // MatKG and predict had no palette entry. Entries that need no
+        // argument run their command; the rest open a form.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        let runs = [
+            ("ontology.list", "runs /ontology list"),
+            ("ontology.proposals", "runs /ontology proposals list"),
+            ("provenance.stats", "runs /provenance stats"),
+            ("provenance.failures", "runs /provenance failures"),
+        ];
+        for (id, effect) in runs {
+            assert!(crate::command::CATALOG.iter().any(|c| c.id == id), "{id}");
+            assert_eq!(crate::command::effect(id), effect, "{id}");
+            assert!(app.dispatch_command(id), "{id} dispatches");
+        }
+        let forms = [
+            "ontology.bind",
+            "ontology.relations",
+            "ontology.validate",
+            "ontology.promote",
+            "reverify.list",
+            "reverify.run",
+            "reverify.history",
+            "matkg.load",
+            "predict.run",
+        ];
+        for id in forms {
+            assert!(crate::command::CATALOG.iter().any(|c| c.id == id), "{id}");
+            assert_eq!(crate::command::effect(id), "opens a form", "{id}");
+            assert!(app.dispatch_command(id), "{id} dispatches");
+            assert!(app.form.is_some(), "{id} opens a form");
+            app.form = None;
+        }
+    }
+
+    #[test]
+    fn knowledge_plane_forms_compose_their_commands() {
+        let one = |name: &str, value: &str| {
+            Form::new("t", "go", vec![FormField::text(name, name, value)])
+        };
+        assert_eq!(
+            positional_command(
+                &one("names", ""),
+                "names",
+                &["ontology", "bind"],
+                "enter a name"
+            ),
+            Err("enter a name")
+        );
+        assert_eq!(
+            positional_command(
+                &one("names", "yield strength, UTS"),
+                "names",
+                &["ontology", "bind"],
+                "e"
+            )
+            .unwrap(),
+            "/ontology bind 'yield strength, UTS'"
+        );
+        assert_eq!(
+            positional_command(
+                &one("path", "./.prism/ontologies/x.ttl"),
+                "path",
+                &["ontology", "promote"],
+                "e"
+            )
+            .unwrap(),
+            "/ontology promote ./.prism/ontologies/x.ttl"
+        );
+        assert_eq!(
+            flag_command(
+                &one("status", "cited_by_reader"),
+                "status",
+                &["reverify", "list"],
+                "--status",
+                "e"
+            )
+            .unwrap(),
+            "/reverify list --status cited_by_reader"
+        );
+        assert_eq!(
+            flag_command(
+                &one("assertion", ""),
+                "assertion",
+                &["reverify", "run"],
+                "--assertion",
+                "enter an id"
+            ),
+            Err("enter an id")
+        );
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("model", "Model", "mace-mh-1"),
+                FormField::text("task", "Task", "relax"),
+                FormField::text("input", "Input", "{\"structure\": {}}"),
+            ],
+        );
+        assert_eq!(
+            predict_command(&form).unwrap(),
+            "/predict mace-mh-1 --task relax --input '{\"structure\": {}}'"
+        );
+        let form = Form::new("t", "go", vec![FormField::text("model", "Model", "")]);
+        assert_eq!(
+            predict_command(&form),
+            Err("enter a marketplace model slug")
+        );
+    }
+
+    #[test]
+    fn a_long_palette_hint_never_pushes_the_row_past_the_frame() {
+        // Snapshot 2026-09-05: "runs /provenance failures" (25 columns) left
+        // the row as "…runs /provenance failure│ │" — the hint column is
+        // bounded like the title column.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.open_palette();
+        for c in "provenance".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let palette_rows: Vec<&String> = rows.iter().filter(|r| r.contains("▸")).collect();
+        assert!(!palette_rows.is_empty());
+        for r in &palette_rows {
+            let trimmed = r.trim_end();
+            assert!(trimmed.ends_with("│ │"), "the row ends at the frame: {r:?}");
+        }
+        let failures = palette_rows
+            .iter()
+            .find(|r| r.contains("Failed tool runs"))
+            .expect("the provenance failures row");
+        assert!(
+            failures.contains("runs /provenance failures") || failures.contains('…'),
+            "a hint that does not fit is clipped visibly, never cut by the frame: {failures:?}"
+        );
     }
 
     #[test]

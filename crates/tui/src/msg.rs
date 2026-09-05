@@ -802,7 +802,7 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .and_then(|t| t.as_str())
                 .unwrap_or("View")
                 .to_string();
-            let tabs = params
+            let tabs: Vec<(String, String)> = params
                 .get("tabs")
                 .and_then(|t| t.as_array())
                 .map(|arr| {
@@ -819,6 +819,19 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                         .collect()
                 })
                 .unwrap_or_default();
+            // A single-body view (`emit_view`: title + body, no tabs) is one
+            // tab named after the view. Without this every such panel — doctor,
+            // providers, billing, papers — read "nothing to show … yet".
+            let tabs = if tabs.is_empty() {
+                match params.get("body").and_then(|b| b.as_str()) {
+                    Some(body) if !body.trim().is_empty() => {
+                        vec![(title.clone(), body.to_string())]
+                    }
+                    _ => tabs,
+                }
+            } else {
+                tabs
+            };
             AgentMsg::View { title, tabs }
         }
 
