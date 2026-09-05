@@ -7834,6 +7834,44 @@ mod tests {
         }
     }
 
+    /// A narrow modal leaves no room beside the value: the note moves to
+    /// indented lines of its own instead of three words per row.
+    #[test]
+    fn a_note_with_no_room_beside_the_value_takes_indented_lines() {
+        let mut app = fresh();
+        app.open_fallback_add_form();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(64, 30)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let screen = rows.join("\n");
+        assert!(screen.contains("↵ add"), "{screen}");
+        let note_rows: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains("OpenAI-compatible") || r.contains("leave empty"))
+            .collect();
+        assert!(!note_rows.is_empty(), "the note is still shown:\n{screen}");
+        for row in note_rows {
+            let after_border = row
+                .find('│')
+                .map(|i| &row[i + '│'.len_utf8()..])
+                .unwrap_or(row);
+            let indent = after_border.len() - after_border.trim_start().len();
+            assert!(indent >= 6, "indented, not at the edge: {row:?}");
+            assert!(
+                !after_border.contains("Local URL"),
+                "with no room beside the value the note is not on the label row: {row:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_key_window_offers_the_search_source_keys() {
         // "Set SEMANTIC_SCHOLAR_API_KEY for a dedicated pool" is only advice

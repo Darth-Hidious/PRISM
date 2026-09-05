@@ -5044,13 +5044,16 @@ fn form_field_lines_in(
             // "  ▸ " + the 18-column label + the value, then two spaces.
             let note_col = 4 + 18 + value_width + 2;
             let room = width.saturating_sub(note_col);
-            let pieces = if room >= 12 {
-                wrap_plain(note, room)
+            // Enough room beside the value: the note starts there and continues
+            // under its own column. Too little (a narrow modal): the note takes
+            // indented lines of its own rather than three words per row.
+            let (beside, indent, pieces) = if room >= 24 {
+                (true, note_col, wrap_plain(note, room))
             } else {
-                vec![note.clone()]
+                (false, 6, wrap_plain(note, width.saturating_sub(6).max(12)))
             };
             let mut pieces = pieces.into_iter();
-            if let Some(first) = pieces.next() {
+            if beside && let Some(first) = pieces.next() {
                 spans.push(Span::styled(
                     format!("  {first}"),
                     Style::default().fg(t.muted),
@@ -5058,7 +5061,7 @@ fn form_field_lines_in(
             }
             for piece in pieces {
                 continuation.push(Line::from(vec![
-                    Span::raw(" ".repeat(note_col)),
+                    Span::raw(" ".repeat(indent)),
                     Span::styled(piece, Style::default().fg(t.muted)),
                 ]));
             }
