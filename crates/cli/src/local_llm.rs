@@ -489,7 +489,7 @@ mod tests {
             .into_iter()
             .map(|(id, _, _)| id)
             .collect();
-        for expected in ["ollama", "llamacpp", "lmstudio", "vllm"] {
+        for expected in ["ollama", "llamacpp", "lmstudio", "vllm", "magnitude"] {
             assert!(
                 ids.contains(&expected.to_string()),
                 "{expected} must be probed, got {ids:?}"

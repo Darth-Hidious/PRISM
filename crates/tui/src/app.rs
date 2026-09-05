@@ -642,9 +642,9 @@ pub const API_PROVIDERS: &[(&str, &str)] = &[
     ("Google", "GOOGLE_API_KEY"),
     ("Mistral", "MISTRAL_API_KEY"),
     ("Cohere", "COHERE_API_KEY"),
-    ("Semantic Scholar (search)", "SEMANTIC_SCHOLAR_API_KEY"),
-    ("Lens.org (patents)", "LENS_API_TOKEN"),
-    ("Patent table (BigQuery)", "PRISM_PATENT_TABLE"),
+    ("Semantic Scholar", "SEMANTIC_SCHOLAR_API_KEY"),
+    ("Lens.org", "LENS_API_TOKEN"),
+    ("Patent table", "PRISM_PATENT_TABLE"),
 ];
 
 pub struct App {

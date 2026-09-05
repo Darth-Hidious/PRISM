@@ -532,6 +532,10 @@ mod tests {
             ("ollama", "http://localhost:11434/v1/chat/completions"),
             ("llamacpp", "http://localhost:8080/v1/chat/completions"),
             ("mlx", "http://localhost:8082/v1/chat/completions"),
+            (
+                "magnitude",
+                "http://127.0.0.1:10100/inference/v1/chat/completions",
+            ),
             ("lmstudio", "http://localhost:1234/v1/chat/completions"),
             ("vllm", "http://localhost:8000/v1/chat/completions"),
         ];
@@ -624,7 +628,7 @@ mod tests {
     #[test]
     fn local_providers_are_keyless() {
         let reg = Registry::builtin().unwrap();
-        for id in ["ollama", "llamacpp", "mlx", "lmstudio", "vllm"] {
+        for id in ["ollama", "llamacpp", "mlx", "lmstudio", "vllm", "magnitude"] {
             let p = reg.get(id).unwrap_or_else(|| panic!("{id} missing"));
             assert!(
                 p.api_key_env.is_none(),
