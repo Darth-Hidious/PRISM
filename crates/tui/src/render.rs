@@ -5454,12 +5454,13 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
     f.render_widget(popup, area);
 }
 
-/// Hard-wrap plain text to `width` DISPLAY COLUMNS per line (no word-splitting
-/// smarts — code must never be reflowed in a way that hides content). Wraps on
+/// Wrap plain text to `width` DISPLAY COLUMNS per line. Breaks at the last
+/// space that fits when there is one (prose reads as prose), and hard-breaks a
+/// token longer than the width (a URL, a DOI, code) so nothing is ever hidden
+/// past the panel edge, where the popup has no horizontal scroll. Wraps on
 /// unicode display width, not char count, so a CJK/emoji-heavy line (each such
-/// glyph is 2 columns wide) is not right-clipped past the panel edge where the
-/// popup has no horizontal scroll. Every input line yields at least one output
-/// line, so nothing is dropped.
+/// glyph is 2 columns wide) is measured correctly. Every input line yields at
+/// least one output line and every glyph survives, so nothing is dropped.
 fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
@@ -5471,14 +5472,34 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
         }
         let mut current = String::new();
         let mut col = 0usize;
+        // Where the last space in `current` sits, so a break can move the
+        // word in progress to the next line whole.
+        let mut last_space: Option<(usize, usize)> = None; // (byte index, column)
         for ch in line.chars() {
             let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-            // Break before this glyph would spill past the edge (but never on
-            // an empty line, so a lone wide char wider than `width` still
-            // emits rather than looping).
             if col + w > width && !current.is_empty() {
-                out.push(std::mem::take(&mut current));
-                col = 0;
+                match last_space {
+                    Some((byte, _)) => {
+                        let rest = current.split_off(byte + 1);
+                        while current.ends_with(' ') {
+                            current.pop();
+                        }
+                        out.push(std::mem::take(&mut current));
+                        current = rest;
+                        col = current
+                            .chars()
+                            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                            .sum();
+                    }
+                    None => {
+                        out.push(std::mem::take(&mut current));
+                        col = 0;
+                    }
+                }
+                last_space = None;
+            }
+            if ch == ' ' {
+                last_space = Some((current.len(), col));
             }
             current.push(ch);
             col += w;
@@ -6041,6 +6062,28 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn wrapping_prefers_a_space_and_never_hides_content() {
+        // Live 2026-09-05: the provenance view wrapped "use `prism provenance
+        // failures`" as "…provenance fai" / "lures` to list them". Prose breaks
+        // at the last space that fits; a token longer than the width still
+        // breaks hard, and every glyph of the input survives.
+        let out = wrap_plain("alpha beta gamma delta", 11);
+        assert_eq!(out, vec!["alpha beta", "gamma delta"]);
+        let out = wrap_plain("abcdefghijklmnop qr", 6);
+        assert_eq!(out, vec!["abcdef", "ghijkl", "mnop", "qr"]);
+        // Content is never lost, whatever the width: every non-space glyph
+        // of the input survives, in order.
+        for width in 1..=12 {
+            let glyphs: String = wrap_plain("the quick brown fox", width)
+                .concat()
+                .chars()
+                .filter(|c| *c != ' ')
+                .collect();
+            assert_eq!(glyphs, "thequickbrownfox", "width {width}");
+        }
+    }
     use super::*;
     use crate::backend::{BackendHandle, FakeScenario};
     use unicode_width::UnicodeWidthStr;
