@@ -216,6 +216,8 @@ pub enum AgentMsg {
         permission_mode: Option<String>,
         choices: Vec<String>,
         prompt_type: Option<String>,
+        /// Present when a human must decide this call (destructive tripwire).
+        reason: Option<String>,
     },
 
     // ── Cost / metrics ───────────────────────────────────────────────
@@ -777,6 +779,10 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
             prompt_type: params
                 .get("prompt_type")
                 .and_then(|p| p.as_str())
+                .map(str::to_string),
+            reason: params
+                .get("reason")
+                .and_then(|r| r.as_str())
                 .map(str::to_string),
         },
 

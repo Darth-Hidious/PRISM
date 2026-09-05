@@ -5502,10 +5502,11 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
         return;
     }
 
-    let area = overlay_area(f, 60, 20);
-    f.render_widget(Clear, area);
-
-    let popup = Paragraph::new(vec![
+    // The popup is as tall as its lines: a fixed 20% of a 30-row terminal
+    // clipped everything below the tool name — the message, the reason, and
+    // the keys the reader is meant to press.
+    let width_hint = overlay_area(f, 60, 20).width.saturating_sub(4) as usize;
+    let mut lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
             "  ⚠ APPROVAL REQUIRED  ",
@@ -5528,22 +5529,43 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
             Span::styled(message, Style::default().fg(t.text)),
         ]),
         Line::from(""),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("  [y] "),
-            Span::styled("Allow", Style::default().fg(t.ok)),
-            Span::raw("   [a] "),
-            Span::styled("Allow all", Style::default().fg(t.warn)),
-            Span::raw("   [n] "),
-            Span::styled("Deny", Style::default().fg(t.err)),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(t.approval)),
-    )
-    .alignment(Alignment::Left);
+    ];
+    if let Some(reason) = &app.approval_reason {
+        for (i, l) in wrap_plain(reason, width_hint.saturating_sub(2).max(8))
+            .into_iter()
+            .enumerate()
+        {
+            let lead = if i == 0 { "  ⚠ " } else { "    " };
+            lines.push(Line::from(vec![
+                Span::styled(lead, Style::default().fg(t.warn)),
+                Span::styled(l, Style::default().fg(t.warn)),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.extend([Line::from(vec![
+        Span::raw("  [y] "),
+        Span::styled("Allow", Style::default().fg(t.ok)),
+        Span::raw("   [a] "),
+        Span::styled("Allow all", Style::default().fg(t.warn)),
+        Span::raw("   [n] "),
+        Span::styled("Deny", Style::default().fg(t.err)),
+    ])]);
+    let mut area = overlay_area(f, 60, 20);
+    let height = (lines.len() as u16 + 2).min(f.area().height);
+    area.y = area
+        .y
+        .saturating_sub(height.saturating_sub(area.height) / 2);
+    area.height = height;
+    f.render_widget(Clear, area);
+    let popup = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.approval)),
+        )
+        .alignment(Alignment::Left);
 
     f.render_widget(popup, area);
 }

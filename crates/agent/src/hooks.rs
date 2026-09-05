@@ -18,6 +18,12 @@ pub struct HookResult {
     pub abort: bool,
     pub reason: String,
     pub modified_inputs: Option<Value>,
+    /// The call may run, but only a HUMAN may approve it: session-wide
+    /// "always allow" does not apply and the prompt states `reason`. Set by
+    /// the destructive-keyword tripwire — `rm -rf`, `drop`, `reset --hard` —
+    /// which used to abort the model's call outright with no human in the
+    /// loop. The owner's rule: allow it, but only the user can allow it.
+    pub require_human_approval: bool,
 }
 
 /// Result of a post-hook execution.
@@ -84,6 +90,9 @@ impl HookRegistry {
     /// Fire all matching pre-hooks. First abort wins.
     /// Panics in individual hooks are caught and logged.
     pub fn fire_before(&self, tool_name: &str, inputs: &Value) -> HookResult {
+        // An abort ends the scan. A forced human decision does not — a later
+        // hook may still abort — but it is what comes back when nothing does.
+        let mut forced: Option<HookResult> = None;
         for hook in &self.hooks {
             if let Some(ref before) = hook.before
                 && hook.matches(tool_name)
@@ -97,6 +106,13 @@ impl HookRegistry {
                             info!("Hook '{}' aborted {}: {}", hook.name, tool_name, hr.reason);
                             return hr;
                         }
+                        if hr.require_human_approval && forced.is_none() {
+                            info!(
+                                "Hook '{}' requires a human decision on {}: {}",
+                                hook.name, tool_name, hr.reason
+                            );
+                            forced = Some(hr);
+                        }
                     }
                     Err(_) => {
                         warn!("Pre-hook '{}' panicked", hook.name);
@@ -104,7 +120,7 @@ impl HookRegistry {
                 }
             }
         }
-        HookResult::default()
+        forced.unwrap_or_default()
     }
 
     /// Fire all matching post-hooks. Never aborts. Panics are caught.
@@ -188,9 +204,11 @@ fn tool_is_write_capable(tool_name: &str) -> bool {
 /// security boundary. The real gates (permission map, OPA policy, approval)
 /// still run after it.
 pub fn safety_hook() -> Hook {
-    let destructive: HashSet<&str> = ["delete", "drop", "remove", "destroy", "truncate", "reset"]
-        .into_iter()
-        .collect();
+    let destructive: HashSet<&str> = [
+        "delete", "drop", "remove", "destroy", "truncate", "reset", "rm", "rmdir", "shred", "wipe",
+    ]
+    .into_iter()
+    .collect();
 
     Hook {
         name: "safety_guard".into(),
@@ -216,17 +234,14 @@ pub fn safety_hook() -> Hook {
                             // skill and provenance gates but treats THIS
                             // scan as advisory, because a human asked.
                             return HookResult {
-                                abort: true,
+                                abort: false,
+                                require_human_approval: true,
                                 reason: format!(
-                                    "Blocked: the word '{}' appears in {}.{} \
-                                     and '{}' can write. If the user asked \
-                                     for exactly this, ask them to run it \
-                                     themselves with /bash or /python (the \
-                                     human-typed path treats this check as \
-                                     advisory). Otherwise rephrase without \
-                                     the destructive wording or use a \
-                                     read-only tool.",
-                                    word, tool_name, key, tool_name
+                                    "'{}' can write and the call names '{}' ({}). A human decides \
+                                     this one: the approval prompt is shown even if the tool was \
+                                     allowed for the session, and 'always' does not cover it. \
+                                     Wait for their answer.",
+                                    tool_name, word, key
                                 ),
                                 modified_inputs: None,
                             };
@@ -944,7 +959,9 @@ mod tests {
         let registry = build_default_hooks();
         let inputs = json!({"query": "DROP TABLE users"});
         let result = registry.fire_before("sql_exec", &inputs);
-        assert!(result.abort);
+        // Not an abort: a human decision. The reason names the word.
+        assert!(!result.abort);
+        assert!(result.require_human_approval);
         assert!(result.reason.contains("drop"));
     }
 
@@ -1001,16 +1018,25 @@ mod tests {
     #[test]
     fn m1_write_capable_tool_is_still_gated() {
         // `execute_bash` is FullAccess; `knowledge_ingest` is WorkspaceWrite.
-        // A whole destructive word in their arguments still aborts.
+        // A whole destructive word in their arguments still gates the call —
+        // the gate is now a human's decision, not an abort.
         let registry = build_default_hooks();
         let bash = registry.fire_before("execute_bash", &json!({ "command": "git reset --hard" }));
-        assert!(bash.abort, "write-capable tool must stay gated");
+        assert!(!bash.abort);
+        assert!(
+            bash.require_human_approval,
+            "write-capable tool must stay gated"
+        );
         assert!(bash.reason.contains("reset"));
         let ingest = registry.fire_before(
             "knowledge_ingest",
             &json!({ "content": "DROP TABLE users" }),
         );
-        assert!(ingest.abort, "workspace-write tool must stay gated");
+        assert!(!ingest.abort);
+        assert!(
+            ingest.require_human_approval,
+            "workspace-write tool must stay gated"
+        );
     }
 
     #[test]
@@ -1030,17 +1056,19 @@ mod tests {
     }
 
     #[test]
-    fn m1_abort_reason_names_recourse_the_model_can_take() {
-        // The abort is delivered to the MODEL, which cannot invoke slash
-        // commands. The recourse must be one the caller can act on: asking
-        // the human — not "run it yourself".
+    fn m1_forced_reason_names_recourse_the_model_can_take() {
+        // The reason is delivered to the MODEL, which cannot invoke slash
+        // commands. Its recourse is the one thing it can do: a human is being
+        // asked, so wait for their answer — not "run it yourself".
         let registry = build_default_hooks();
         let result =
             registry.fire_before("execute_bash", &json!({ "command": "rm -rf x; drop it" }));
-        assert!(result.abort);
+        assert!(!result.abort);
+        assert!(result.require_human_approval);
         assert!(
-            result.reason.contains("ask them to run it"),
-            "reason must direct the model to ask the human: {}",
+            result.reason.contains("A human decides")
+                && result.reason.contains("Wait for their answer"),
+            "reason must tell the model a human is being asked: {}",
             result.reason
         );
         assert!(
@@ -1465,6 +1493,7 @@ mod tests {
                 abort: true,
                 reason: "first".into(),
                 modified_inputs: None,
+                require_human_approval: false,
             })),
             after: None,
             tool_filter: None,
@@ -1475,6 +1504,7 @@ mod tests {
                 abort: true,
                 reason: "second".into(),
                 modified_inputs: None,
+                require_human_approval: false,
             })),
             after: None,
             tool_filter: None,
@@ -1531,7 +1561,16 @@ mod tests {
         for keyword in &["delete", "remove", "destroy", "truncate", "reset"] {
             let inputs = json!({"cmd": format!("please {} it", keyword)});
             let result = registry.fire_before("tool", &inputs);
-            assert!(result.abort, "should block '{}'", keyword);
+            assert!(
+                !result.abort,
+                "'{}' is a human decision, not a block",
+                keyword
+            );
+            assert!(
+                result.require_human_approval,
+                "should force a human on '{}'",
+                keyword
+            );
         }
     }
 

@@ -6083,6 +6083,7 @@ fn emit_agent_event(event: AgentEvent) {
             tool_description,
             requires_approval,
             permission_mode,
+            reason,
         } => {
             // Frontend expects "ui.prompt" with UiPrompt schema
             emit_notification(
@@ -6096,6 +6097,7 @@ fn emit_agent_event(event: AgentEvent) {
                     "tool_description": tool_description,
                     "requires_approval": requires_approval,
                     "permission_mode": permission_mode,
+                    "reason": reason,
                 }),
             );
         }

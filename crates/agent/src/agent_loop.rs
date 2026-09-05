@@ -59,12 +59,16 @@ async fn approval_gate_outcome(
     args: &Value,
     call_id: &str,
     preview: &Option<String>,
+    forced_reason: Option<&str>,
     approval_rx: Option<&SharedApprovalReceiver>,
     live_permission_overrides: Option<&SharedPermissionOverrides>,
     history: &mut Vec<ChatMessage>,
     emit: &mut (dyn FnMut(AgentEvent) + Send),
 ) -> ApprovalGateOutcome {
-    if config.auto_approve || permission_decision.auto_approved {
+    // A forced prompt (destructive tripwire) ignores every shortcut: not the
+    // global auto-approve, not the session's "always allow", not the tool's
+    // own "needs no approval". The human sees the reason and decides.
+    if forced_reason.is_none() && (config.auto_approve || permission_decision.auto_approved) {
         return ApprovalGateOutcome::Proceed;
     }
 
@@ -80,9 +84,10 @@ async fn approval_gate_outcome(
     // `declared_free` is not `!requires_approval`: silence means the author
     // never decided, and silence is gated. Only an explicit `false` from the
     // tool buys it past the prompt.
-    if tool_catalog
-        .find(tool_name)
-        .is_some_and(|tool| tool.declared_free)
+    if forced_reason.is_none()
+        && tool_catalog
+            .find(tool_name)
+            .is_some_and(|tool| tool.declared_free)
     {
         return ApprovalGateOutcome::Proceed;
     }
@@ -101,6 +106,7 @@ async fn approval_gate_outcome(
         permission_mode: tool_meta
             .map(|tool| tool.permission_mode.as_str().to_string())
             .unwrap_or_else(|| "workspace-write".to_string()),
+        reason: forced_reason.map(str::to_string),
     });
 
     // If no approval channel is wired, auto-approve for backward
@@ -4330,6 +4336,11 @@ pub(crate) async fn run_turn_inner(
 
             // ── h2. Fire pre-hooks ────────────────────────────────
             let pre_result = hooks.fire_before(tool_name, &args);
+            // A destructive word does not abort the call: it makes the
+            // approval a human decision that no session-wide allow covers.
+            let forced_reason: Option<String> = pre_result
+                .require_human_approval
+                .then(|| pre_result.reason.clone());
             if pre_result.abort {
                 let error_msg = format!("Blocked by hook: {}", pre_result.reason);
                 emit(AgentEvent::ToolCallResult {
@@ -4512,6 +4523,7 @@ pub(crate) async fn run_turn_inner(
                 &args,
                 call_id,
                 &preview,
+                forced_reason.as_deref(),
                 approval_rx.as_ref(),
                 live_permission_overrides.as_ref(),
                 history,
@@ -5892,6 +5904,50 @@ mod tests {
         assert!(!tool_evidence_requires_success("recall"));
     }
 
+    /// The owner's rule for `rm -rf` and its kin: allow it, but only the
+    /// user can allow it. A forced call skips no gate — not auto-approve,
+    /// not the session's "always allow" — and the prompt carries the reason.
+    #[tokio::test]
+    async fn a_forced_call_is_asked_even_when_the_session_allowed_the_tool() {
+        let config = AgentConfig {
+            auto_approve: false,
+            ..Default::default()
+        };
+        let permission_decision = crate::permissions::ToolPermissionDecision {
+            blocked: false,
+            auto_approved: true,
+        };
+        let catalog = ToolCatalog::from_tool_server_json(&serde_json::json!({ "tools": [] }));
+        let args = serde_json::json!({ "command": "rm -rf build" });
+        let mut history = Vec::new();
+        let mut events = Vec::new();
+        let outcome = {
+            let mut emit = |event| events.push(event);
+            approval_gate_outcome(
+                &config,
+                &permission_decision,
+                &catalog,
+                "execute_bash",
+                &args,
+                "forced-rm",
+                &None,
+                Some("'execute_bash' can write and the call names 'rm'"),
+                None,
+                None,
+                &mut history,
+                &mut emit,
+            )
+            .await
+        };
+        // No approval channel is wired here, so the gate proceeds — but it
+        // ASKED first, with the reason, which the auto-approved path never does.
+        assert_eq!(outcome, ApprovalGateOutcome::Proceed);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolApprovalRequest { reason: Some(r), .. } if r.contains("'rm'")
+        )));
+    }
+
     #[tokio::test]
     async fn denied_apply_patch_stops_before_dispatch_and_preserves_target_bytes() {
         use crate::command_tools::{CommandToolPlatformAccess, with_platform_access};
@@ -5939,6 +5995,7 @@ mod tests {
                 &args,
                 "denied-apply-patch",
                 &Some("apply project patch".to_string()),
+                None,
                 Some(&approval_rx),
                 None,
                 &mut history,

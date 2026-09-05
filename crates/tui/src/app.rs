@@ -779,6 +779,9 @@ pub struct App {
     /// Unlike `is_waiting`, streaming deltas do not clear this lifecycle bit.
     pub(crate) turn_in_progress: bool,
     pub approval_pending: Option<(String, String)>,
+    /// Why THIS call must be decided by a human (destructive tripwire). While
+    /// set, 'a' approves this one call and whitelists nothing.
+    pub approval_reason: Option<String>,
     /// Full code of a pending `notebook_exec` approval (from the prompt's
     /// `tool_args`). The kernel is SHARED with the human, so the popup must
     /// show EXACTLY what they are approving — a 60-char first-line preview
@@ -1040,6 +1043,7 @@ impl App {
             is_waiting: false,
             turn_in_progress: false,
             approval_pending: None,
+            approval_reason: None,
             approval_code: None,
             approval_scroll: 0,
             approval_max_scroll: std::cell::Cell::new(0),
@@ -2839,9 +2843,19 @@ impl App {
                 self.push_system(&format!("[denied {tool}]"));
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                let _ = self.backend.send_approval("a", &tool);
-                self.clear_approval();
-                self.push_system(&format!("[allow-all {tool}]"));
+                if self.approval_reason.is_some() {
+                    // A destructive call is approved once, by a human, and
+                    // never turned into a standing permission.
+                    let _ = self.backend.send_approval("y", &tool);
+                    self.clear_approval();
+                    self.push_system(&format!(
+                        "[approved {tool} — this call only; a destructive call is never allowed for the session]"
+                    ));
+                } else {
+                    let _ = self.backend.send_approval("a", &tool);
+                    self.clear_approval();
+                    self.push_system(&format!("[allow-all {tool}]"));
+                }
             }
             // Scroll the code block (long notebook_exec cells must be fully
             // reviewable before answering).
@@ -2867,6 +2881,7 @@ impl App {
     /// the scroll state together so they can never desync.
     fn clear_approval(&mut self) {
         self.approval_pending = None;
+        self.approval_reason = None;
         self.approval_code = None;
         self.approval_scroll = 0;
         self.approval_max_scroll.set(0);
@@ -6259,10 +6274,12 @@ impl App {
                 tool_name,
                 message,
                 tool_args,
+                reason,
                 ..
             } => {
                 // `..` ignores call_id, tool_description, requires_approval,
                 // permission_mode, choices, prompt_type.
+                self.approval_reason = reason.map(|r| sanitize_for_render(&r));
                 // Sanitize everything before storing in approval_pending and
                 // the ChatLine.
                 let clean_name = sanitize_for_render(&tool_name);
@@ -9140,6 +9157,92 @@ mod tests {
     /// Pasting while an approval prompt is up must not answer it. The prompt
     /// intercepts keys for exactly this reason; a paste containing a `y` would
     /// otherwise approve a tool the human never looked at.
+    fn forced_rm_prompt() -> AgentMsg {
+        AgentMsg::ApprovalPrompt {
+            tool_name: "execute_bash".into(),
+            message: "Allow execute_bash?".into(),
+            call_id: Some("forced-rm".into()),
+            tool_args: Some(serde_json::json!({ "command": "rm -rf build" })),
+            tool_description: None,
+            requires_approval: Some(true),
+            permission_mode: None,
+            choices: vec!["y".into(), "n".into(), "a".into()],
+            prompt_type: Some("approval".into()),
+            reason: Some("'execute_bash' can write and the call names 'rm'".into()),
+        }
+    }
+
+    /// `rm -rf` is allowed — by a human, once. The prompt carries the reason
+    /// and the 'a' key, which normally whitelists the tool for the session,
+    /// approves this single call instead.
+    #[tokio::test]
+    async fn a_forced_prompt_is_approved_once_and_never_whitelisted() {
+        let mut app = fresh();
+        app.apply_agent_msg(forced_rm_prompt());
+        assert_eq!(app.focus, Focus::Approval);
+        assert!(
+            app.approval_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("'rm'")
+        );
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        // The fake backend answers "y" with a result card and "a" with a
+        // permissions notice — so the first notification says which reply
+        // actually went on the wire.
+        // The fake's launch notifications (welcome, status…) precede the reply.
+        let mut reply = None;
+        for _ in 0..16 {
+            let Some(msg) = app.backend.recv().await else {
+                break;
+            };
+            match msg.get("method").and_then(|m| m.as_str()) {
+                Some("ui.card") | Some("ui.permissions") => {
+                    reply = Some(msg);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let reply = reply.expect("the backend heard a reply");
+        assert_eq!(
+            reply.get("method").and_then(|m| m.as_str()),
+            Some("ui.card"),
+            "'a' on a forced prompt must approve this call only (a 'y'), got {reply}"
+        );
+        assert!(
+            app.approval_reason.is_none(),
+            "the reason is cleared with the prompt"
+        );
+        let last = app
+            .messages
+            .last()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        assert!(last.contains("this call only"), "{last}");
+    }
+
+    /// The popup says WHY a human is being asked, in the warning colour.
+    #[test]
+    fn a_forced_prompt_states_its_reason_in_the_popup() {
+        let mut app = fresh();
+        app.apply_agent_msg(forced_rm_prompt());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(screen.contains("⚠ 'execute_bash' can write"), "{screen}");
+    }
+
     #[test]
     fn a_paste_cannot_answer_an_approval_prompt() {
         let mut app = fresh();
@@ -9528,6 +9631,7 @@ mod tests {
             permission_mode: None,
             choices: vec![],
             prompt_type: None,
+            reason: None,
         });
         assert_eq!(
             app.approval_code.as_deref(),
@@ -9556,6 +9660,7 @@ mod tests {
             permission_mode: None,
             choices: vec![],
             prompt_type: None,
+            reason: None,
         });
         let preview = app.approval_code.as_deref().expect("code preview present");
         assert!(
@@ -9578,6 +9683,7 @@ mod tests {
             permission_mode: None,
             choices: vec![],
             prompt_type: None,
+            reason: None,
         });
         assert!(
             app.approval_code.is_none(),

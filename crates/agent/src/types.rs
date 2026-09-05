@@ -162,6 +162,9 @@ pub enum AgentEvent {
         tool_description: Option<String>,
         requires_approval: bool,
         permission_mode: String,
+        /// Why this call must be decided by a human even if the tool was
+        /// allowed for the session (the destructive tripwire's finding).
+        reason: Option<String>,
     },
     TurnComplete {
         text: Option<String>,

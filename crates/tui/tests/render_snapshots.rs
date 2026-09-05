@@ -433,6 +433,7 @@ fn snapshot_approval_required_popup_100x30() {
         permission_mode: Some("full_access".into()),
         choices: vec!["y".into(), "n".into(), "a".into()],
         prompt_type: Some("approval".into()),
+        reason: None,
     });
     // The approval popup should be visible
     app.tokens_per_sec = 0.0;
@@ -474,6 +475,7 @@ fn snapshot_notebook_exec_approval_code_popup_100x30() {
         permission_mode: Some("full_access".into()),
         choices: vec!["y".into(), "n".into(), "a".into()],
         prompt_type: Some("approval".into()),
+        reason: None,
     });
     app.tokens_per_sec = 0.0;
     app.first_token_time = None;
@@ -790,6 +792,7 @@ fn snapshot_approval_after_y_100x30() {
         permission_mode: None,
         choices: vec!["y".into(), "n".into(), "a".into()],
         prompt_type: None,
+        reason: None,
     });
     // Simulate pressing 'y' — the key handler approves and clears
     // the pending state.  We replicate the visible behavior directly.
@@ -834,6 +837,7 @@ fn snapshot_approval_after_n_100x30() {
         permission_mode: None,
         choices: vec!["y".into(), "n".into(), "a".into()],
         prompt_type: None,
+        reason: None,
     });
     // Simulate pressing 'n' — deny
     if let Some((tool, _)) = app.approval_pending.take() {
@@ -864,6 +868,7 @@ fn snapshot_approval_after_a_100x30() {
         permission_mode: None,
         choices: vec!["y".into(), "n".into(), "a".into()],
         prompt_type: None,
+        reason: None,
     });
     // Simulate pressing 'a' — allow all
     if let Some((tool, _)) = app.approval_pending.take() {

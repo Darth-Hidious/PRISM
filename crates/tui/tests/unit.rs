@@ -640,6 +640,7 @@ fn approval_prompt_sets_pending_and_focus() {
         permission_mode: None,
         choices: vec![],
         prompt_type: None,
+        reason: None,
     });
     assert!(app.approval_pending.is_some());
     assert_eq!(app.approval_pending.as_ref().unwrap().0, "bash");
@@ -1182,6 +1183,7 @@ fn parse_approval_prompt_captures_rich_fields() {
             permission_mode,
             choices,
             prompt_type,
+            reason: _,
         } => {
             assert_eq!(tool_name, "compute_submit");
             assert_eq!(message, "Allow compute_submit?");
@@ -2114,6 +2116,7 @@ fn approval_prompt_still_sets_pending_and_focus() {
         permission_mode: Some("full_access".into()),
         choices: vec!["y".into(), "n".into(), "a".into()],
         prompt_type: Some("approval".into()),
+        reason: None,
     });
     assert!(app.approval_pending.is_some());
     assert_eq!(app.approval_pending.as_ref().unwrap().0, "bash");
@@ -2367,6 +2370,7 @@ fn approval_prompt_with_ansi_stores_sanitized_text() {
         permission_mode: None,
         choices: vec![],
         prompt_type: None,
+        reason: None,
     });
     // Check approval_pending is sanitized
     let (tool, msg) = app.approval_pending.as_ref().unwrap();
