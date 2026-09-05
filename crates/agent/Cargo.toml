@@ -56,6 +56,7 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+mockito = { workspace = true }
 async-trait = { workspace = true }
 # For the HTTP chat parity/approval integration tests (tests/http_chat_parity.rs):
 # stub OpenAI-compatible LLM server + direct use of the loop's own types.

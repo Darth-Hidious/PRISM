@@ -1,10 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1031
+assertion_line: 1042
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-┌ Keybindings — j/k scroll · ? or Esc close ─────────────────────┐ │ [Act] Too Fil Obj Str Art
+┌ Keybindings — j/k scroll · ? or Esc close ─────────────────────┐ │ [Act] Sto Too Fil Obj Str Art
 │ Commands & palette                                             │ │
 │   Ctrl-P                Command palette — run any command      │ │  (no activity yet)
 │   ?                     This keybindings panel                 │ │

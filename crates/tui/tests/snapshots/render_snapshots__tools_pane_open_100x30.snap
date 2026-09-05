@@ -1,9 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 1986
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-┌ Tools ─────────────────────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+┌ Tools ─────────────────────────────────────────────────────────┐ │ [Act] Sto Too Fil Obj Str Art
 │ 4 tools   · 2 need approval   · 2 auto                         │ │
 │> filter by name / description…    (4 shown)                    │ │  (no activity yet)
 │                                                                │ │

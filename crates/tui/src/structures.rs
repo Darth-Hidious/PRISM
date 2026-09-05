@@ -182,9 +182,15 @@ impl WorkspaceStructure {
         })
     }
 
-    /// Formula for display — `unknown` when the backend never sent one.
+    /// Formula for display — the writer's formula, else the composition PRISM
+    /// derived from the cell (seen live 2026-09-05: a relaxed 100-atom cell
+    /// headlined "unknown" while "Fe100" sat one line below), `unknown` only
+    /// when neither exists.
     pub fn formula_display(&self) -> &str {
-        self.formula.as_deref().unwrap_or(UNKNOWN)
+        self.formula
+            .as_deref()
+            .or(self.composition.as_deref())
+            .unwrap_or(UNKNOWN)
     }
 
     /// The `cache://` reference for display — `unknown` when absent.
@@ -192,9 +198,14 @@ impl WorkspaceStructure {
         self.cache_ref.as_deref().unwrap_or(UNKNOWN)
     }
 
-    /// Source for display — verbatim when reported, `unknown` otherwise.
+    /// Source for display — verbatim when reported; else the tool that made
+    /// it (MACE's meta writer records `tool`, not `source`); `unknown` only
+    /// when neither was written.
     pub fn source_display(&self) -> &str {
-        self.source.as_deref().unwrap_or(UNKNOWN)
+        self.source
+            .as_deref()
+            .or(self.tool.as_deref())
+            .unwrap_or(UNKNOWN)
     }
 }
 
@@ -257,6 +268,42 @@ fn format_cif_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_nameless_structure_is_called_by_its_formula_and_its_maker() {
+        let s = WorkspaceStructure::from_value(&serde_json::json!({
+            "cache_key": "39ad0e6bbe428e0ccef5fa0d323f",
+            "formula": "Fe100",
+            "n_atoms": 100,
+            "tool": "mace_relax"
+        }))
+        .unwrap();
+        assert_eq!(s.formula_display(), "Fe100");
+        assert_eq!(s.source_display(), "mace_relax");
+        let mut derived = s.clone();
+        derived.formula = None;
+        derived.composition = Some("Fe100".to_string());
+        assert_eq!(
+            derived.formula_display(),
+            "Fe100",
+            "the derived composition names it"
+        );
+        let bare = WorkspaceStructure::from_value(&serde_json::json!({
+            "cache_key": "937e76d8047edef32b3456aeb597",
+            "n_atoms": 100
+        }))
+        .unwrap();
+        assert_eq!(
+            bare.formula_display(),
+            UNKNOWN,
+            "no formula or composition: nothing invented"
+        );
+        assert_eq!(
+            bare.source_display(),
+            UNKNOWN,
+            "nothing written, nothing invented"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

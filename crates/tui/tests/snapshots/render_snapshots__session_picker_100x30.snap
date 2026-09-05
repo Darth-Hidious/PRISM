@@ -1,9 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 1125
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-┌ Sessions ──────────────────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+┌ Sessions ──────────────────────────────────────────────────────┐ │ [Act] Sto Too Fil Obj Str Art
 │> type to filter…    (2 shown)                                  │ │
 │                                                                │ │  (no activity yet)
 │ ● 2025-07-01 20:00   12t  gemma-4-12B-it-qat-UD…  sess-3  ◀    │ │

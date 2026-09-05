@@ -1,10 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1176
+assertion_line: 1209
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-┌ Nodes — 2 of 4 online ─────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+┌ Nodes — 2 of 4 online ─────────────────────────────────────────┐ │ [Act] Sto Too Fil Obj Str Art
 │   Node                Hardware                  Access   Last s│ │
 │                                                                │ │  (no activity yet)
 │ ● lab-hpc-01          2× A100-80GB · 64 cores … org      online│ │

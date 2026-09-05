@@ -1,9 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 1697
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-┌────────────────────────────────────────────────────────────────┐ │ Act Too Fil Obj [Str] Art
+┌────────────────────────────────────────────────────────────────┐ │ Act Sto Too Fil Obj [Str] Art
 │ Structure — TiAl                                               │ │
 │                                                                │ │▸ ◇ TiAl
 │formula:     TiAl                                               │ │    2 atoms · Al1 Ti1 · user_im…

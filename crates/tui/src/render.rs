@@ -1012,6 +1012,13 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
             .map(|(_, rows)| (*rows).min(u16::MAX as u32) as u16)
             .unwrap_or(0)
     };
+    // Where each message starts, in wrapped rows — what a story box or a
+    // reference jumps to. Measured here, once per frame, from the same
+    // wrap the transcript is drawn with.
+    *app.message_rows.borrow_mut() = message_lines
+        .iter()
+        .map(|(first, idx)| (rows_for(*first), *idx))
+        .collect();
     let figure_rows: Vec<(u16, String)> = inline_figures
         .iter()
         .map(|(idx, path)| (rows_for(*idx), path.clone()))
@@ -1606,6 +1613,7 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
     match app.workspace_tab {
         WorkspaceTab::Tools => build_tools_lines(app, t, &mut lines, &mut rows, w),
         WorkspaceTab::Activity => build_activity_lines(app, t, &mut lines, &mut rows, w),
+        WorkspaceTab::Story => build_story_lines(app, t, &mut lines, &mut rows, w),
         WorkspaceTab::Files => build_files_lines(app, t, &mut lines, &mut rows, w),
         WorkspaceTab::Objects => build_objects_lines(app, t, &mut lines, &mut rows, w),
         WorkspaceTab::Structures => {
@@ -1753,16 +1761,18 @@ fn workspace_tabs_line(app: &App, t: Theme, w: usize) -> (Line<'static>, TabSpan
     // set can never fit the 42-column sidebar ceiling, so the degradation
     // ladder is three-letter labels, then two-letter initials, then whole
     // tabs elided behind a `‹`/`›` marker.
-    const SHORT: [(WorkspaceTab, &str); 6] = [
+    const SHORT: [(WorkspaceTab, &str); 7] = [
         (WorkspaceTab::Activity, "Act"),
+        (WorkspaceTab::Story, "Sto"),
         (WorkspaceTab::Tools, "Too"),
         (WorkspaceTab::Files, "Fil"),
         (WorkspaceTab::Objects, "Obj"),
         (WorkspaceTab::Structures, "Str"),
         (WorkspaceTab::Artifacts, "Art"),
     ];
-    const MIN: [(WorkspaceTab, &str); 6] = [
+    const MIN: [(WorkspaceTab, &str); 7] = [
         (WorkspaceTab::Activity, "Ac"),
+        (WorkspaceTab::Story, "St"),
         (WorkspaceTab::Tools, "To"),
         (WorkspaceTab::Files, "Fi"),
         (WorkspaceTab::Objects, "Ob"),
@@ -2226,6 +2236,57 @@ fn build_activity_lines(
                 Style::default().fg(t.dim),
             )));
         }
+    }
+}
+
+/// The run's story: one box per narrated step. A pending box says the model
+/// is still writing; a failed one says so in the warning colour; a done one
+/// carries the model's sentences, wrapped. Enter jumps to the entry.
+fn build_story_lines(
+    app: &App,
+    t: Theme,
+    lines: &mut Vec<Line<'static>>,
+    rows: &mut Vec<(usize, usize)>,
+    w: usize,
+) {
+    if app.story.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no story yet — each step gets a box here as the narrator writes it)",
+            Style::default().fg(t.muted),
+        )));
+        return;
+    }
+    let sel = app
+        .workspace_selected
+        .min(app.story.len().saturating_sub(1));
+    for (i, b) in app.story.iter().enumerate() {
+        rows.push((lines.len(), i));
+        let focused = i == sel;
+        let marker = if focused { "▸" } else { " " };
+        let head_style = if focused {
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.text)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker} {}. ", i + 1),
+                Style::default().fg(t.accent),
+            ),
+            Span::styled(b.tool.clone(), head_style),
+        ]));
+        let (body, style) = match b.status.as_str() {
+            "pending" => ("narrating…".to_string(), Style::default().fg(t.muted)),
+            "failed" => (b.text.clone(), Style::default().fg(t.warn)),
+            _ => (b.text.clone(), Style::default().fg(t.text)),
+        };
+        for piece in wrap_plain(&body, w.saturating_sub(5).max(10)) {
+            lines.push(Line::from(vec![
+                Span::raw("     "),
+                Span::styled(piece, style),
+            ]));
+        }
+        lines.push(Line::raw(""));
     }
 }
 

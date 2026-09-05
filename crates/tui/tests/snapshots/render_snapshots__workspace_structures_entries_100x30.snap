@@ -1,10 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1566
+assertion_line: 1600
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-· PRISM ready                                                      │ Act Too Fil Obj [Str] Art
+· PRISM ready                                                      │ Act Sto Too Fil Obj [Str] Art
                                                                    │
                                                                    │▸ ◇ TiAl
                                                                    │    2 atoms · Al1 Ti1 · user_im…

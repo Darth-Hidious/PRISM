@@ -1,10 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1387
+assertion_line: 1392
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-┌────────────────────────────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+┌────────────────────────────────────────────────────────────────┐ │ [Act] Sto Too Fil Obj Str Art
 │ Activity — 2. tool                                             │ │ 1 tools · 1 ✓
 │                                                                │ │
 │{                                                               │ │  1. prompt "sample alloy" •

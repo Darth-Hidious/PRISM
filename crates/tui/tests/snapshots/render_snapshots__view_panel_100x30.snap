@@ -1,10 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1073
+assertion_line: 1084
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-┌────────────────────────────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+┌────────────────────────────────────────────────────────────────┐ │ [Act] Sto Too Fil Obj Str Art
 │ Tools   [Native]  MCP                                          │ │
 │                                                                │ │  (no activity yet)
 │sample_material                                                 │ │

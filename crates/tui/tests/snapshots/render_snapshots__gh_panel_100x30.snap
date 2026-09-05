@@ -1,10 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1200
+assertion_line: 1233
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-┌ GitHub — Issues ───────────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+┌ GitHub — Issues ───────────────────────────────────────────────┐ │ [Act] Sto Too Fil Obj Str Art
 │ [Issues]  PRs  Status    ◆ Darth-Hidious/PRISM                 │ │
 │> type to filter…    (2 shown)                                  │ │  (no activity yet)
 │                                                                │ │

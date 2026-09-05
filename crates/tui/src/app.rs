@@ -112,6 +112,9 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTab {
     Activity,
+    /// The run narrated by a model, one box per step, each jumping to the
+    /// transcript entry it describes.
+    Story,
     Tools,
     Files,
     Objects,
@@ -741,6 +744,20 @@ pub struct FormPane {
     pub target: FormTarget,
 }
 
+/// One narrated step of the run: what the model said was done and what it
+/// means, pointing at the transcript entry (by tool call id) it describes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoryBox {
+    pub call_id: Option<String>,
+    pub seq: u64,
+    pub tool: String,
+    /// `pending` | `done` | `failed`
+    pub status: String,
+    pub text: String,
+    /// Index into [`App::messages`] of the tool result it narrates, once known.
+    pub msg_index: Option<usize>,
+}
+
 /// A wall only a human can pass, as the agent reported it: what to obtain,
 /// where (a link the human opens), and why the agent could not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -850,6 +867,14 @@ pub struct App {
     // Artifacts.
     pub workspace_tab: WorkspaceTab,
     pub workspace_selected: usize,
+    /// The run's story, one box per narrated step, in arrival order.
+    pub story: Vec<StoryBox>,
+    /// Tool call id → index of its result in `messages`, so a story box can
+    /// find the entry it narrates.
+    pub call_index: std::collections::HashMap<String, usize>,
+    /// Wrapped transcript row at which each message starts, as measured by
+    /// the last frame (`(row, message index)`); what a jump scrolls to.
+    pub message_rows: std::cell::RefCell<Vec<(u16, usize)>>,
     pub workspace_expanded: bool,
     /// Domain objects (structures, alloys, simulations, …) shown in the
     /// Objects tab. Upserted by `id` from `ui.object.update` notifications.
@@ -1111,6 +1136,9 @@ impl App {
             needs_credits_refresh: true,
             credits_stale: false,
             workspace_tab: WorkspaceTab::Activity,
+            story: Vec::new(),
+            call_index: std::collections::HashMap::new(),
+            message_rows: std::cell::RefCell::new(Vec::new()),
             workspace_selected: 0,
             workspace_expanded: false,
             objects: Vec::new(),
@@ -2273,6 +2301,10 @@ impl App {
                             .min(artifacts.len().saturating_sub(1)),
                         ArtifactStoreState::Loading | ArtifactStoreState::Unavailable(_) => 0,
                     },
+                    WorkspaceTab::Story => self
+                        .workspace_selected
+                        .saturating_add(1)
+                        .min(self.story.len().saturating_sub(1)),
                     WorkspaceTab::Structures => match &self.structure_store {
                         StructuresStoreState::Ready(structures) => self
                             .workspace_selected
@@ -2457,6 +2489,31 @@ impl App {
                 let path = files[sel].path.clone();
                 self.open_detail_view(format!("File — {path}"), read_file_capped(&path));
             }
+            WorkspaceTab::Story => {
+                if self.story.is_empty() {
+                    self.toast(
+                        "no story yet — steps appear here as the narrator writes them",
+                        ToastKind::Info,
+                    );
+                    return;
+                }
+                let sel = self.workspace_selected.min(self.story.len() - 1);
+                let target = {
+                    let b = &self.story[sel];
+                    b.msg_index.or_else(|| {
+                        b.call_id
+                            .as_deref()
+                            .and_then(|id| self.call_index.get(id).copied())
+                    })
+                };
+                match target {
+                    Some(idx) => self.jump_to_message(idx),
+                    None => self.toast(
+                        "that step's transcript entry is not on screen yet",
+                        ToastKind::Info,
+                    ),
+                }
+            }
             WorkspaceTab::Activity => {
                 let items = self.derive_activity();
                 if items.is_empty() {
@@ -2569,6 +2626,28 @@ impl App {
         }
     }
 
+    /// Scroll the transcript so message `idx` is at the top, taking the view
+    /// over from auto-follow: the reader asked for THIS entry.
+    pub fn jump_to_message(&mut self, idx: usize) {
+        let row = self
+            .message_rows
+            .borrow()
+            .iter()
+            .find(|(_, m)| *m == idx)
+            .map(|(row, _)| *row);
+        match row {
+            Some(row) => {
+                self.scroll_offset = row;
+                self.auto_scroll = false;
+                self.anchor_user_turn.set(false);
+            }
+            None => self.toast(
+                "that entry has not been drawn yet — scroll once and try again",
+                ToastKind::Info,
+            ),
+        }
+    }
+
     /// Palette `human.needs`: every wall the agent hit that only a human can
     /// pass, with what to obtain and the link. PRISM never opens a browser
     /// itself; the link is shown for the human to open (Ctrl-P → Links also
@@ -2607,7 +2686,8 @@ impl App {
 
     fn workspace_next_tab(&mut self) {
         self.workspace_tab = match self.workspace_tab {
-            WorkspaceTab::Activity => WorkspaceTab::Tools,
+            WorkspaceTab::Activity => WorkspaceTab::Story,
+            WorkspaceTab::Story => WorkspaceTab::Tools,
             WorkspaceTab::Tools => WorkspaceTab::Files,
             WorkspaceTab::Files => WorkspaceTab::Objects,
             WorkspaceTab::Objects => WorkspaceTab::Structures,
@@ -2624,7 +2704,8 @@ impl App {
     fn workspace_prev_tab(&mut self) {
         self.workspace_tab = match self.workspace_tab {
             WorkspaceTab::Activity => WorkspaceTab::Artifacts,
-            WorkspaceTab::Tools => WorkspaceTab::Activity,
+            WorkspaceTab::Story => WorkspaceTab::Activity,
+            WorkspaceTab::Tools => WorkspaceTab::Story,
             WorkspaceTab::Files => WorkspaceTab::Tools,
             WorkspaceTab::Objects => WorkspaceTab::Files,
             WorkspaceTab::Structures => WorkspaceTab::Objects,
@@ -6219,6 +6300,43 @@ impl App {
                 self.session_mode = mode;
                 self.message_count = message_count;
             }
+            AgentMsg::Story {
+                call_id,
+                seq,
+                tool,
+                status,
+                text,
+            } => {
+                let call_id = call_id.map(|c| sanitize_for_render(&c));
+                let msg_index = call_id
+                    .as_deref()
+                    .and_then(|id| self.call_index.get(id).copied());
+                let text = sanitize_for_render(&text);
+                let status = sanitize_for_render(&status);
+                let tool = sanitize_for_render(&tool);
+                match self
+                    .story
+                    .iter_mut()
+                    .find(|b| b.call_id.is_some() && b.call_id == call_id)
+                {
+                    Some(existing) => {
+                        existing.status = status;
+                        existing.text = text;
+                        existing.tool = tool;
+                        if existing.msg_index.is_none() {
+                            existing.msg_index = msg_index;
+                        }
+                    }
+                    None => self.story.push(StoryBox {
+                        call_id,
+                        seq,
+                        tool,
+                        status,
+                        text,
+                        msg_index,
+                    }),
+                }
+            }
             AgentMsg::NeedsHuman {
                 source,
                 what,
@@ -6339,6 +6457,7 @@ impl App {
                 elapsed_ms,
                 data,
                 agent,
+                call_id,
                 ..
             } => {
                 // Every result card receives an explicit class token. The
@@ -6400,6 +6519,9 @@ impl App {
                         kind: LineKind::Error(text, clean_agent),
                     });
                 } else {
+                    if let Some(id) = call_id.as_deref().filter(|id| !id.is_empty()) {
+                        self.call_index.insert(id.to_string(), self.messages.len());
+                    }
                     self.push_message(ChatLine {
                         role: Role::Tool,
                         text,
@@ -8026,6 +8148,117 @@ mod tests {
             .map(|(_, b)| b.clone())
             .unwrap_or_default();
         assert!(body.contains("Nothing is waiting on a human"), "{body}");
+    }
+
+    fn tool_card(call_id: &str, tool: &str) -> AgentMsg {
+        AgentMsg::ToolCard {
+            tool_name: tool.into(),
+            call_id: Some(call_id.into()),
+            content: format!("{tool} result"),
+            card_type: "results".into(),
+            elapsed_ms: Some(12),
+            provenance_id: None,
+            data: None,
+            agent: None,
+        }
+    }
+
+    /// "Boxes that say what it has done, and click to go to the exact part."
+    /// The box appears at once as pending, fills in when the model answers,
+    /// and knows which transcript entry it narrates.
+    #[test]
+    fn a_story_box_arrives_pending_then_fills_in_and_points_at_its_entry() {
+        let mut app = fresh();
+        app.apply_agent_msg(tool_card("c1", "prior_art_search"));
+        let entry = app.messages.len() - 1;
+        app.apply_agent_msg(AgentMsg::Story {
+            call_id: Some("c1".into()),
+            seq: 0,
+            tool: "prior_art_search".into(),
+            status: "pending".into(),
+            text: String::new(),
+        });
+        assert_eq!(app.story.len(), 1);
+        assert_eq!(app.story[0].status, "pending");
+        assert_eq!(app.story[0].msg_index, Some(entry));
+        app.apply_agent_msg(AgentMsg::Story {
+            call_id: Some("c1".into()),
+            seq: 0,
+            tool: "prior_art_search".into(),
+            status: "done".into(),
+            text: "Searched prior art for preburner coatings: 24 papers, 20 from OpenAlex.".into(),
+        });
+        assert_eq!(
+            app.story.len(),
+            1,
+            "the pending box fills in; it is not a second box"
+        );
+        assert_eq!(app.story[0].status, "done");
+        assert!(app.story[0].text.starts_with("Searched prior art"));
+    }
+
+    #[test]
+    fn enter_on_a_story_box_jumps_the_transcript_to_its_entry() {
+        let mut app = fresh();
+        app.apply_agent_msg(tool_card("c1", "web"));
+        let entry = app.messages.len() - 1;
+        app.apply_agent_msg(AgentMsg::Story {
+            call_id: Some("c1".into()),
+            seq: 0,
+            tool: "web".into(),
+            status: "done".into(),
+            text: "Searched the web.".into(),
+        });
+        // What the last frame measured: that entry starts at wrapped row 7
+        // (another message, not this one, starts at row 0).
+        *app.message_rows.borrow_mut() = vec![(0, usize::MAX), (7, entry)];
+        app.workspace_tab = WorkspaceTab::Story;
+        app.workspace_selected = 0;
+        app.auto_scroll = true;
+        app.focus = Focus::Workspace;
+        // A frame has drawn the sidebar (without it, workspace focus is
+        // handed back to the input — measured live at 90 columns).
+        app.sidebar_visible.set(true);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.scroll_offset,
+            7,
+            "the view moves to the entry's first row (toast {:?})",
+            app.toasts.last().map(|t| t.message.clone())
+        );
+        assert!(!app.auto_scroll, "the reader took the view over");
+    }
+
+    #[test]
+    fn the_story_tab_is_in_the_cycle_and_the_panel_reads_the_boxes() {
+        let mut app = fresh();
+        app.workspace_tab = WorkspaceTab::Activity;
+        app.workspace_next_tab();
+        assert_eq!(app.workspace_tab, WorkspaceTab::Story);
+        app.apply_agent_msg(AgentMsg::Story {
+            call_id: Some("c9".into()),
+            seq: 0,
+            tool: "web".into(),
+            status: "done".into(),
+            text: "Read the RD-0120 preburner paper in full; hydrogen-rich gas at 850 K.".into(),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            screen.contains("[Sto]"),
+            "the tab is labelled and active: {screen}"
+        );
+        assert!(screen.contains("RD-0120 preburner paper"), "{screen}");
     }
 
     #[test]

@@ -152,6 +152,16 @@ pub enum AgentMsg {
         text: String,
         done: bool,
     },
+    /// One step of the run narrated by a model: `pending` when the box is
+    /// opened, then `done` (text) or `failed`. `call_id` names the tool call
+    /// it narrates, so the box can jump to that transcript entry.
+    Story {
+        call_id: Option<String>,
+        seq: u64,
+        tool: String,
+        status: String,
+        text: String,
+    },
     /// A wall only a human can pass: what to obtain, where, and why the
     /// agent could not.
     NeedsHuman {
@@ -640,6 +650,29 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
         },
 
         // ── Status ───────────────────────────────────────────────────
+        "ui.story" => AgentMsg::Story {
+            call_id: params
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            seq: params.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+            tool: params
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            status: params
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("done")
+                .to_string(),
+            text: params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        },
         "ui.needs_human" => AgentMsg::NeedsHuman {
             source: params
                 .get("source")

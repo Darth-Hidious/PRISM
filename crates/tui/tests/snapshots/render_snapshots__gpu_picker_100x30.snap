@@ -1,10 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1153
+assertion_line: 1186
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-┌ Procure GPU compute ───────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+┌ Procure GPU compute ───────────────────────────────────────────┐ │ [Act] Sto Too Fil Obj Str Art
 │   GPU                   VRAM  Region    Provider         $/hr  │ │
 │                                                                │ │  (no activity yet)
 │ ● RTX-4090             24 GB  US        runpod       $0.44/hr  │ │

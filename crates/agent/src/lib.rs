@@ -14,6 +14,7 @@ pub mod marked;
 pub mod mcp;
 pub mod meta_tools;
 pub mod models;
+pub mod narrator;
 pub mod node_supervisor;
 pub mod notebook;
 pub mod orchestrator;

@@ -1,10 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1130
+assertion_line: 1163
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-┌ Switch model ──────────────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+┌ Switch model ──────────────────────────────────────────────────┐ │ [Act] Sto Too Fil Obj Str Art
 │  current: gemma-4-12B-it-qat-UD-Q4_K_XL.gguf                   │ │
 │> recommended — type to search all 2 models…    (1 shown)       │ │  (no activity yet)
 │                                                                │ │

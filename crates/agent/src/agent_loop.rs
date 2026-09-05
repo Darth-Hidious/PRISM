@@ -3560,6 +3560,7 @@ pub(crate) async fn run_turn_inner(
     let mut code_failure_streak: HashMap<String, usize> = HashMap::new();
     let mut announced_needs_human: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut story_seq = 0usize;
     // VS2-P1 FIX-6: reset the provenance repair-chain memory at turn start so a
     // new turn's first code run is not tagged repair_attempt pointing at last
     // turn's failure, and so an in-process subagent does not splice into the
@@ -5220,6 +5221,20 @@ pub(crate) async fn run_turn_inner(
             // A licence or account wall reported by the tool becomes a task
             // for the human — once per source per session, with the link.
             announce_needs_human(&result_value, &mut announced_needs_human, emit);
+
+            // ── h7c. The story ─────────────────────────────────────
+            // A model narrates this step in plain language for the reader,
+            // off the agent's path (spawned, one at a time), pointing at this
+            // call so the box can jump to it. See `narrator`.
+            crate::narrator::narrate_step(
+                llm.config().clone(),
+                call_id.clone(),
+                story_seq,
+                tool_name.to_string(),
+                args.clone(),
+                content_after_hooks.clone(),
+            );
+            story_seq += 1;
 
             // ── h8. Large-result handling ─────────────────────────
             // A counted search collapses to its digest FIRST. h6 has already
