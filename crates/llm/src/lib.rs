@@ -38,6 +38,19 @@ pub use model_artifact::{BUNDLED_GEMMA, ModelArtifactManifest, sha256_hex, verif
 pub use overflow::{error_is_context_window_exceeded, is_context_window_exceeded};
 pub use transient::{error_is_transient_transport, is_transient_transport};
 
+/// Whether an error from the primary target is the kind a fallback can answer:
+/// the box is unreachable (transport), or it is up but failing (5xx) or
+/// throttled (429) after the retry budget. A 4xx is the request being wrong —
+/// the same request would be wrong at a fallback, and a different model
+/// answering a different question would only hide the fault.
+pub fn failover_worthy(error: &anyhow::Error) -> bool {
+    if error_is_transient_transport(error) {
+        return true;
+    }
+    let text = format!("{error:#}");
+    text.contains("LLM returned HTTP 5") || text.contains("LLM returned HTTP 429")
+}
+
 /// Canonical text and identity produced by the embedded GGUF's own template.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RenderedLocalPrompt {
@@ -222,6 +235,13 @@ pub struct LlmConfig {
     /// `stream: true`, returns 200, and never sends a chunk.
     #[serde(default = "default_streaming")]
     pub streaming: bool,
+    /// Targets tried, in order, when this one cannot answer: connection
+    /// refused, DNS, timeout, or HTTP 5xx/429 once the retry budget is spent.
+    /// Each is a complete config; a fallback's own `fallbacks` are ignored.
+    /// A 4xx is the primary saying the request is wrong and is never routed
+    /// around. Written as `[[fallbacks]]` in ~/.prism/config.toml.
+    #[serde(default)]
+    pub fallbacks: Vec<LlmConfig>,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -385,6 +405,7 @@ impl Default for LlmConfig {
             // Deliberation stays ON by default: the reader wants it, and a
             // caller that does not must say so.
             no_think: false,
+            fallbacks: Vec::new(),
             max_sample_rows: 10,
             // MUST agree with the serde default. They disagreed — serde said 0
             // ("PRISM does not impose one on them"), this said 300 — and every
@@ -682,6 +703,14 @@ pub struct LlmClient {
     /// 400/422): the field is stripped for the rest of this client's life
     /// instead of failing every later turn or retrying every time.
     reasoning_replay_refused: std::sync::atomic::AtomicBool,
+    /// Set once a streaming request came back 200 with nothing in it: the
+    /// endpoint cannot really stream, so later turns go straight to the plain
+    /// request instead of waiting on a stream that never arrives.
+    streaming_dead: std::sync::atomic::AtomicBool,
+    /// The fallback that answered the last request when the primary could
+    /// not — "model at url" — for the caller to announce. See
+    /// [`LlmClient::take_route_switch`].
+    route_switch: std::sync::Mutex<Option<String>>,
 }
 
 /// The chat-completions endpoint for an OpenAI-compatible base URL.
@@ -808,6 +837,8 @@ impl LlmClient {
             config,
             local_call_counter: std::sync::atomic::AtomicU64::new(0),
             reasoning_replay_refused: std::sync::atomic::AtomicBool::new(false),
+            streaming_dead: std::sync::atomic::AtomicBool::new(false),
+            route_switch: std::sync::Mutex::new(None),
         }
     }
 
@@ -1309,6 +1340,38 @@ impl LlmClient {
     /// the agent loop uses [`Self::chat_with_tools_streaming`], which sends
     /// tools on both.
     pub async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<ChatResponse> {
+        let error = match self.chat_with_tools_primary(messages, tools).await {
+            Ok(response) => return Ok(response),
+            Err(error) if self.config.fallbacks.is_empty() || !failover_worthy(&error) => {
+                return Err(error);
+            }
+            Err(error) => error,
+        };
+        let mut tried = Vec::new();
+        for fallback in &self.config.fallbacks {
+            let client = Self::fallback_client(fallback);
+            match client.chat_with_tools_primary(messages, tools).await {
+                Ok(response) => {
+                    self.note_route_switch(fallback);
+                    return Ok(response);
+                }
+                Err(e) => tried.push(format!(
+                    "{} at {}: {e:#}",
+                    fallback.model, fallback.base_url
+                )),
+            }
+        }
+        Err(error.context(format!(
+            "primary unreachable and every fallback failed — {}",
+            tried.join("; ")
+        )))
+    }
+
+    async fn chat_with_tools_primary(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
@@ -1975,15 +2038,94 @@ impl LlmClient {
         tools: &[ToolDefinition],
         mut on_delta: impl FnMut(&str, bool),
     ) -> Result<ChatResponse> {
+        // Failover only when the primary delivered NOTHING. A stream that
+        // broke halfway has already put text on the reader's screen; a
+        // fallback would answer from the top and the reader would see the
+        // reply twice. That case stays an error the caller already handles.
+        let mut delivered = false;
+        let mut counting = |delta: &str, reasoning: bool| {
+            delivered = true;
+            on_delta(delta, reasoning);
+        };
+        let error = match self
+            .chat_with_tools_streaming_primary(messages, tools, &mut counting)
+            .await
+        {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if delivered || self.config.fallbacks.is_empty() || !failover_worthy(&error) =>
+            {
+                return Err(error);
+            }
+            Err(error) => error,
+        };
+        let mut tried = Vec::new();
+        for fallback in &self.config.fallbacks {
+            let client = Self::fallback_client(fallback);
+            match client
+                .chat_with_tools_streaming_primary(messages, tools, &mut on_delta)
+                .await
+            {
+                Ok(response) => {
+                    self.note_route_switch(fallback);
+                    return Ok(response);
+                }
+                Err(e) => tried.push(format!(
+                    "{} at {}: {e:#}",
+                    fallback.model, fallback.base_url
+                )),
+            }
+        }
+        Err(error.context(format!(
+            "primary unreachable and every fallback failed — {}",
+            tried.join("; ")
+        )))
+    }
+
+    fn fallback_client(fallback: &LlmConfig) -> LlmClient {
+        LlmClient::new(LlmConfig {
+            fallbacks: Vec::new(),
+            ..fallback.clone()
+        })
+    }
+
+    fn note_route_switch(&self, fallback: &LlmConfig) {
+        let mut slot = self
+            .route_switch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(format!("{} at {}", fallback.model, fallback.base_url));
+    }
+
+    /// Which fallback answered the last request, if the primary could not.
+    /// Reported once: the caller announces it and the slot clears.
+    pub fn take_route_switch(&self) -> Option<String> {
+        self.route_switch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    async fn chat_with_tools_streaming_primary(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        on_delta: &mut impl FnMut(&str, bool),
+    ) -> Result<ChatResponse> {
         // An endpoint that cannot stream is served by ONE ordinary request,
         // with the finished text handed to the caller as a single delta so the
         // streaming contract still holds for the UI. Declared per provider
         // (`providers.toml`, `streaming = false`) rather than discovered by
         // timeout: mlx-lm accepts `stream: true`, answers 200 and sends
         // nothing at all, so a streaming-only caller waits for a chunk that is
-        // never coming.
-        if !self.config.streaming {
-            let response = self.chat_with_tools(messages, tools).await?;
+        // never coming. `streaming_dead` is the same fact learned live: a
+        // 200 with an empty stream retires streaming for this client.
+        if !self.config.streaming
+            || self
+                .streaming_dead
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let response = self.chat_with_tools_primary(messages, tools).await?;
             if let Some(text) = response.message.content.as_deref()
                 && !text.is_empty()
             {
@@ -2433,6 +2575,23 @@ impl LlmClient {
         }
 
         let tool_calls = native_calls.finish();
+
+        if full_content.is_empty() && tool_calls.is_none() && full_reasoning.is_empty() {
+            // 200, a well-formed stream, and nothing in it. Some servers
+            // accept `stream: true` and answer with an empty stream (mlx-lm
+            // does; so does a proxy that drops SSE). Once is a wasted round
+            // trip; every turn is a dead session. One plain request answers
+            // this turn, and this client streams no more.
+            self.streaming_dead
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let response = self.chat_with_tools_primary(messages, tools).await?;
+            if let Some(text) = response.message.content.as_deref()
+                && !text.is_empty()
+            {
+                on_delta(text, false);
+            }
+            return Ok(response);
+        }
 
         Ok(ChatResponse {
             message: ChatMessage {
@@ -5432,5 +5591,225 @@ mod hydration_tests {
             std::env::remove_var("PRISM_HYDRATE_TEST_UNSET_A");
             std::env::remove_var("PRISM_HYDRATE_TEST_PRESET_B");
         }
+    }
+
+    use crate::{ChatMessage, LlmClient, LlmConfig};
+
+    // ── Own inference: never fail because a server is odd or a box is down ──
+
+    fn sse(content: &str) -> String {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"delta":{"content":content}}]})
+        )
+    }
+
+    fn body_streams(req: &mockito::Request) -> bool {
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body().unwrap().to_vec()).unwrap();
+        body["stream"].as_bool() == Some(true)
+    }
+
+    /// mlx-lm and some proxies accept `stream: true`, answer 200 and send an
+    /// empty stream. That used to be a turn with no answer, every turn. Now one
+    /// plain request answers the turn and the client streams no more.
+    #[tokio::test]
+    async fn an_empty_stream_is_answered_by_one_plain_request_and_streaming_is_retired() {
+        let mut server = mockito::Server::new_async().await;
+        let streamed = server
+            .mock("POST", "/v1/chat/completions")
+            .match_request(body_streams)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: [DONE]\n\n")
+            .expect(1)
+            .create_async()
+            .await;
+        let plain = server
+            .mock("POST", "/v1/chat/completions")
+            .match_request(|req| !body_streams(req))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"choices":[{"message":{"role":"assistant","content":"hello from the plain request"}}]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let client = LlmClient::new(LlmConfig {
+            base_url: format!("{}/v1", server.url()),
+            model: "own".into(),
+            streaming: true,
+            ..Default::default()
+        });
+        let messages = [ChatMessage {
+            role: "user".into(),
+            content: Some("hi".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let mut deltas = Vec::new();
+        let first = client
+            .chat_with_tools_streaming(&messages, &[], |d, _| deltas.push(d.to_string()))
+            .await
+            .expect("the empty stream must not end the turn");
+        assert_eq!(
+            first.message.content.as_deref(),
+            Some("hello from the plain request")
+        );
+        assert_eq!(deltas, vec!["hello from the plain request".to_string()]);
+
+        // The second turn does not even try to stream.
+        let second = client
+            .chat_with_tools_streaming(&messages, &[], |_, _| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            second.message.content.as_deref(),
+            Some("hello from the plain request")
+        );
+        streamed.assert_async().await;
+        plain.assert_async().await;
+    }
+
+    /// The primary is a box that is down. The first reachable fallback
+    /// answers, and the client remembers which one so the caller can say so.
+    #[tokio::test]
+    async fn a_dead_primary_hands_the_turn_to_the_first_reachable_fallback() {
+        let mut server = mockito::Server::new_async().await;
+        let fallback = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse("from the fallback"))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = LlmClient::new(LlmConfig {
+            base_url: "http://primary.invalid/v1".into(),
+            model: "primary-model".into(),
+            streaming: true,
+            timeout_secs: 5,
+            fallbacks: vec![LlmConfig {
+                base_url: format!("{}/v1", server.url()),
+                model: "fallback-model".into(),
+                streaming: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let messages = [ChatMessage {
+            role: "user".into(),
+            content: Some("hi".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let response = client
+            .chat_with_tools_streaming(&messages, &[], |_, _| {})
+            .await
+            .expect("a reachable fallback answers the turn");
+        assert_eq!(
+            response.message.content.as_deref(),
+            Some("from the fallback")
+        );
+        let route = client
+            .take_route_switch()
+            .expect("the switch is reported once");
+        assert!(route.contains("fallback-model"), "{route}");
+        assert!(
+            client.take_route_switch().is_none(),
+            "reported once, not every turn"
+        );
+        fallback.assert_async().await;
+    }
+
+    /// A 400 is the primary saying the REQUEST is wrong. A fallback would
+    /// answer a different question with a different model and hide the fault.
+    #[tokio::test]
+    async fn a_hard_error_from_the_primary_is_not_papered_over_by_a_fallback() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut other = mockito::Server::new_async().await;
+        let bad = primary
+            .mock("POST", "/v1/chat/completions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"message":"unknown parameter: foo"}}"#)
+            .create_async()
+            .await;
+        let untouched = other
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(sse("should never be asked"))
+            .expect(0)
+            .create_async()
+            .await;
+        let client = LlmClient::new(LlmConfig {
+            base_url: format!("{}/v1", primary.url()),
+            model: "primary-model".into(),
+            streaming: true,
+            fallbacks: vec![LlmConfig {
+                base_url: format!("{}/v1", other.url()),
+                model: "fallback-model".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let messages = [ChatMessage {
+            role: "user".into(),
+            content: Some("hi".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let error = client
+            .chat_with_tools_streaming(&messages, &[], |_, _| {})
+            .await
+            .expect_err("a 400 stays a 400");
+        assert!(format!("{error:#}").contains("400"), "{error:#}");
+        assert!(client.take_route_switch().is_none());
+        bad.assert_async().await;
+        untouched.assert_async().await;
+    }
+
+    /// The plain (non-streaming) path fails over the same way.
+    #[tokio::test]
+    async fn the_plain_request_fails_over_too() {
+        let mut server = mockito::Server::new_async().await;
+        let fallback = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"choices":[{"message":{"role":"assistant","content":"plain fallback"}}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let client = LlmClient::new(LlmConfig {
+            base_url: "http://primary.invalid/v1".into(),
+            model: "primary-model".into(),
+            streaming: false,
+            timeout_secs: 5,
+            fallbacks: vec![LlmConfig {
+                base_url: format!("{}/v1", server.url()),
+                model: "fallback-model".into(),
+                streaming: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let messages = [ChatMessage {
+            role: "user".into(),
+            content: Some("hi".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let response = client.chat_with_tools(&messages, &[]).await.unwrap();
+        assert_eq!(response.message.content.as_deref(), Some("plain fallback"));
+        assert!(client.take_route_switch().is_some());
+        fallback.assert_async().await;
     }
 }

@@ -6725,7 +6725,8 @@ pub(crate) fn build_llm_config(
     // Also load ~/.prism/config.toml [chat] — the user-visible chat target
     // set by `prism use local/provider/marc27`. When set to Local or Provider,
     // it takes precedence over prism.toml [llm] for the LLM endpoint.
-    let chat_target = crate::chat_config::load().unwrap_or_default().chat;
+    let prism_cfg = crate::chat_config::load().unwrap_or_default();
+    let chat_target = prism_cfg.chat.clone();
 
     // Resolve base_url, model, and api_key with the same precedence as
     // Commands::Backend: CLI flags > chat target > prism.toml [llm].
@@ -6791,7 +6792,7 @@ pub(crate) fn build_llm_config(
     // Read before the move into the struct below.
     let model_for_limits = model.clone();
     let endpoint_for_limits = base_url.clone();
-    Ok(prism_ingest::LlmConfig {
+    let mut primary = prism_ingest::LlmConfig {
         base_url,
         model,
         api_key,
@@ -6842,7 +6843,79 @@ pub(crate) fn build_llm_config(
             &endpoint_for_limits,
         ),
         ..Default::default()
-    })
+    };
+    primary.fallbacks = fallback_llm_configs(
+        &prism_cfg.fallbacks,
+        &crate::providers::Registry::load(),
+        &primary,
+    );
+    Ok(primary)
+}
+
+/// `[[fallbacks]]` from ~/.prism/config.toml resolved into complete client
+/// configs, in order. A local target is taken as written; a provider target
+/// resolves like the primary does (registry endpoint, key from the provider's
+/// env var). A platform (marc27) fallback is skipped with a warning: its
+/// credentials are session state this path does not hold. Each fallback's
+/// context window is asked for its own model; everything else — timeouts,
+/// reasoning replay, output cap — follows the primary.
+fn fallback_llm_configs(
+    targets: &[crate::chat_config::ChatTarget],
+    registry: &crate::providers::Registry,
+    primary: &prism_ingest::LlmConfig,
+) -> Vec<prism_ingest::LlmConfig> {
+    use crate::chat_config::ChatTarget;
+    let core_registry = prism_core::providers::Registry::load();
+    targets
+        .iter()
+        .filter_map(|target| {
+            let (base_url, model, api_key) = match target {
+                ChatTarget::Local {
+                    url,
+                    model,
+                    api_key,
+                } => (
+                    url.clone(),
+                    model.clone(),
+                    api_key.clone().filter(|key| !key.trim().is_empty()),
+                ),
+                ChatTarget::Provider {
+                    provider,
+                    model,
+                    api_key_env,
+                } => {
+                    let env_name = api_key_env.clone().unwrap_or_else(|| {
+                        crate::providers::default_api_key_env(registry, provider)
+                    });
+                    (
+                        provider_endpoint(registry, provider),
+                        model.clone(),
+                        std::env::var(&env_name)
+                            .ok()
+                            .filter(|key| !key.trim().is_empty()),
+                    )
+                }
+                ChatTarget::Marc27 { .. } => {
+                    tracing::warn!(
+                        "[[fallbacks]]: a marc27 target cannot be a fallback on this path (its \
+                         credentials are session state); skipped"
+                    );
+                    return None;
+                }
+            };
+            Some(prism_ingest::LlmConfig {
+                context_window: Some(
+                    prism_agent::models::resolve_context_window(&base_url, &model) as u64,
+                ),
+                streaming: prism_core::providers::streams_for_url(&core_registry, &base_url),
+                base_url,
+                model,
+                api_key,
+                fallbacks: Vec::new(),
+                ..primary.clone()
+            })
+        })
+        .collect()
 }
 
 /// Decide the `(llm_base_url, llm_model)` a workflow run should inject into its
@@ -16578,6 +16651,57 @@ fn resolve_unauth_llm_url(fallback_url: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// `[[fallbacks]]` become complete client configs in the written order; a
+    /// marc27 entry is skipped (its credentials are session state), and no
+    /// fallback carries fallbacks of its own.
+    #[test]
+    fn fallbacks_resolve_local_and_provider_targets_and_skip_marc27() {
+        use prism_core::chat_config::ChatTarget;
+        let primary = prism_ingest::LlmConfig {
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            model: "primary".into(),
+            timeout_secs: 77,
+            ..Default::default()
+        };
+        let registry = crate::providers::Registry::load();
+        let resolved = super::fallback_llm_configs(
+            &[
+                ChatTarget::Marc27 { model: None },
+                ChatTarget::Local {
+                    url: "http://10.0.0.2:8080/v1".into(),
+                    model: "qwen".into(),
+                    api_key: Some("  ".into()),
+                },
+                ChatTarget::Provider {
+                    provider: "groq".into(),
+                    model: "llama".into(),
+                    api_key_env: Some("PRISM_TEST_NO_SUCH_KEY_VAR".into()),
+                },
+            ],
+            &registry,
+            &primary,
+        );
+        assert_eq!(
+            resolved.len(),
+            2,
+            "marc27 is skipped, the other two resolve"
+        );
+        assert_eq!(resolved[0].base_url, "http://10.0.0.2:8080/v1");
+        assert_eq!(resolved[0].model, "qwen");
+        assert_eq!(resolved[0].api_key, None, "a blank key is no key");
+        assert_eq!(
+            resolved[0].timeout_secs, 77,
+            "the primary's timeouts carry over"
+        );
+        assert!(resolved[0].fallbacks.is_empty());
+        assert_eq!(resolved[1].model, "llama");
+        assert!(
+            resolved[1].base_url.starts_with("http"),
+            "the provider's endpoint comes from the registry: {}",
+            resolved[1].base_url
+        );
+    }
+
     /// One home for every CLI test that touches the process-wide
     /// document-understanding registry (the vision seam installs and parks
     /// its reader there). `cargo test` runs this binary's tests on

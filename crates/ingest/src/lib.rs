@@ -237,6 +237,7 @@ mod tests {
             streaming: true,
             // Deliberation on: the reader wants it. Only a judge turns it off.
             no_think: false,
+            fallbacks: Vec::new(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: LlmConfig = serde_json::from_str(&json).unwrap();

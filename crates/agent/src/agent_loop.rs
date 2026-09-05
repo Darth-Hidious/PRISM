@@ -3755,7 +3755,20 @@ pub(crate) async fn run_turn_inner(
         // of those results was already in hand; the run was lost to a
         // recoverable condition the harness knew how to answer.
         let response = match first_attempt {
-            Ok(response) => response,
+            Ok(response) => {
+                // The primary could not answer and a fallback did: say so, in
+                // the activity strip, rather than let a different model pass
+                // for the one the reader configured. Unguarded glue — the
+                // routing itself is tested in prism_llm.
+                if let Some(route) = llm.take_route_switch() {
+                    emit(AgentEvent::Activity {
+                        id: "llm.route".to_string(),
+                        text: format!("primary model unreachable — answered by {route}"),
+                        done: false,
+                    });
+                }
+                response
+            }
             Err(error) if prism_llm::error_is_context_window_exceeded(&error) => {
                 // Exactly one recovery per turn — the retry below is inline,
                 // so a second overflow propagates instead of looping on a

@@ -141,6 +141,10 @@ impl ChatTarget {
 pub struct PrismConfig {
     #[serde(default)]
     pub chat: ChatTarget,
+    /// Targets tried, in order, when `chat` cannot answer (unreachable, 5xx,
+    /// throttled). Written as `[[fallbacks]]` tables. Empty means none.
+    #[serde(default)]
+    pub fallbacks: Vec<ChatTarget>,
 }
 
 /// Resolve `~/.prism/config.toml` from `$HOME`. Returns the path even
@@ -278,6 +282,37 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// `[[fallbacks]]` are optional, ordered, and round-trip. A config written
+    /// before they existed reads back with none — nothing to migrate.
+    #[test]
+    fn fallbacks_are_optional_ordered_and_roundtrip() {
+        let old: PrismConfig = toml::from_str("[chat]\nmode = \"marc27\"\n").unwrap();
+        assert!(old.fallbacks.is_empty());
+
+        let cfg = PrismConfig {
+            chat: ChatTarget::Local {
+                url: "http://127.0.0.1:8080/v1".into(),
+                model: "qwen".into(),
+                api_key: None,
+            },
+            fallbacks: vec![
+                ChatTarget::Provider {
+                    provider: "groq".into(),
+                    model: "llama".into(),
+                    api_key_env: None,
+                },
+                ChatTarget::Local {
+                    url: "http://10.0.0.2:8080/v1".into(),
+                    model: "qwen".into(),
+                    api_key: None,
+                },
+            ],
+        };
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let back: PrismConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(back.fallbacks, cfg.fallbacks);
+    }
+
     #[test]
     fn marc27_is_default() {
         assert_eq!(ChatTarget::default(), ChatTarget::Marc27 { model: None });
@@ -293,6 +328,7 @@ mod tests {
             chat: ChatTarget::Marc27 {
                 model: Some("gpt-5.5".to_string()),
             },
+            fallbacks: Vec::new(),
         };
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: PrismConfig = toml::from_str(&raw).unwrap();
@@ -307,6 +343,7 @@ mod tests {
                 model: "llama-3.1-70b".into(),
                 api_key: None,
             },
+            fallbacks: Vec::new(),
         };
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: PrismConfig = toml::from_str(&raw).unwrap();
@@ -321,6 +358,7 @@ mod tests {
                 model: "claude-sonnet-4".into(),
                 api_key_env: None,
             },
+            fallbacks: Vec::new(),
         };
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: PrismConfig = toml::from_str(&raw).unwrap();
@@ -377,6 +415,7 @@ mod tests {
                 model: "llama-3.1-70b".into(),
                 api_key: Some("sk-super-secret".into()),
             },
+            fallbacks: Vec::new(),
         };
         write_atomic(&path, toml::to_string_pretty(&cfg).unwrap().as_bytes()).unwrap();
 
@@ -426,6 +465,7 @@ mod tests {
             let path = tmp.path().join("config.toml");
             let cfg = PrismConfig {
                 chat: target.clone(),
+                fallbacks: Vec::new(),
             };
             write_atomic(&path, toml::to_string_pretty(&cfg).unwrap().as_bytes()).unwrap();
             assert!(
