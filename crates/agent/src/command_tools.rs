@@ -188,6 +188,7 @@ enum CommandToolKind {
     IngestWatch,
     IngestAndWait,
     PapersIngest,
+    PapersFulltext,
     ResearchQuery,
     ModelsList,
     ModelsSearch,
@@ -651,6 +652,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         description: "Extract EMMO-typed claims from one paper's full text and persist them into the local knowledge graph (the `--store` path of `prism papers claims`). Identify the paper by `pmc` or `url` from a prior `papers` search/full-text call; bound the LLM work with `max_blocks`. Approval-gated: writes to the bundled Turso store. For claim extraction without persistence use `papers` subcommand=claims, which is free.",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "papers_fulltext",
+        root: "papers",
+        aliases: &[],
+        kind: CommandToolKind::PapersFulltext,
+        description: "Read one paper's FULL TEXT into the conversation: JATS from PMC (`pmc`) or a direct full-text URL (`url`, JATS XML or PDF — every prior-art record's `full text:` link is one). Nothing is stored and no approval is asked; this is how a paper is READ rather than skimmed from its abstract. A long text is also placed in the notebook kernel as a variable so it can be searched and quoted in code.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
     },
     CommandToolSpec {
         name: "mesh",
@@ -1998,6 +2008,27 @@ fn ingest_and_wait_schema() -> Value {
             }
         },
         "additionalProperties": false
+    })
+}
+
+fn papers_fulltext_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pmc": {
+                "type": "string",
+                "description": "PMC id such as PMC1234567. Provide this OR `url`."
+            },
+            "url": {
+                "type": "string",
+                "description": "Direct full-text URL (JATS XML or PDF) — a prior-art record's `full text:` link. Provide this OR `pmc`."
+            },
+            "format": {
+                "type": "string",
+                "enum": ["jats", "pdf"],
+                "description": "Force the full-text format when the URL gives no hint."
+            }
+        }
     })
 }
 
@@ -3629,6 +3660,7 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         }
         CommandToolKind::IngestAndWait => ingest_and_wait_schema(),
         CommandToolKind::PapersIngest => papers_ingest_schema(),
+        CommandToolKind::PapersFulltext => papers_fulltext_schema(),
         CommandToolKind::ResearchQuery => research_query_schema(),
         CommandToolKind::ModelsList => models_list_schema(),
         CommandToolKind::ModelsSearch => models_search_schema(),
@@ -4894,6 +4926,29 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args.push("--poll-timeout-secs".to_string());
                 args.push(poll_timeout_secs.to_string());
             }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::PapersFulltext => {
+            let pmc = optional_string(input, "pmc");
+            let url = optional_string(input, "url");
+            if pmc.is_none() && url.is_none() {
+                bail!("papers_fulltext requires `pmc` or `url` to identify the paper");
+            }
+            let mut args = vec!["full-text".to_string()];
+            for (flag, value) in [
+                ("--pmc", pmc),
+                ("--url", url),
+                ("--format", optional_string(input, "format")),
+            ] {
+                if let Some(value) = value {
+                    args.push(flag.to_string());
+                    args.push(value);
+                }
+            }
+            // Read-only by construction: no `--store`, nothing persisted.
             Ok(CommandExecution::Cli {
                 root: spec.root,
                 args,
@@ -11447,6 +11502,43 @@ ValueError: boom\n";
     /// (`ingest_file` pattern): offered in the catalog the model sees,
     /// WorkspaceWrite + approval because it writes to the local graph, and
     /// its execution always carries `--store`.
+    /// "Papers need to be READ, not just their abstracts." The full text of a
+    /// paper is reachable without an approval and without storing anything —
+    /// the only paper-reading tool used to be approval-gated ingestion, which
+    /// an autonomous run avoided, so it cited abstracts.
+    #[test]
+    fn papers_fulltext_reads_a_paper_without_approval_or_storage() {
+        for online in [false, true] {
+            assert!(
+                command_tools_filtered(online)
+                    .iter()
+                    .any(|tool| tool.name == "papers_fulltext"),
+                "papers_fulltext must be offered (node online={online})"
+            );
+        }
+        assert_eq!(
+            command_tool_requires_approval("papers_fulltext"),
+            Some(false)
+        );
+        let spec = spec_by_name("papers_fulltext").expect("spec resolves");
+        assert_eq!(
+            command_tool_preview(
+                "papers_fulltext",
+                &json!({"url": "https://example.org/p.pdf", "format": "pdf"})
+            ),
+            Some("prism papers full-text --url https://example.org/p.pdf --format pdf".to_string())
+        );
+        let preview = command_tool_preview("papers_fulltext", &json!({"pmc": "PMC1"})).unwrap();
+        assert!(
+            !preview.contains("--store"),
+            "reading stores nothing: {preview}"
+        );
+        assert!(
+            build_execution(spec, &json!({})).is_err(),
+            "a paper must be identified"
+        );
+    }
+
     #[test]
     fn papers_ingest_is_the_offered_approval_gated_store_path() {
         for online in [false, true] {

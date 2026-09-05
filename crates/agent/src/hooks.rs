@@ -496,6 +496,111 @@ fn provenance_model() -> Option<String> {
 /// here; open-coding the default is how the test suite ended up writing
 /// into the user's live database.
 #[track_caller]
+/// Where a record goes when the store cannot take it: an append-only JSONL
+/// beside the database, replayed at the next successful open. A provenance
+/// record is never dropped. Measured 2026-09-05: a foreign reader held the
+/// store's file lock for eight minutes and 21 tool records of a research run
+/// were lost behind a warning nobody was reading.
+pub fn provenance_spool_path() -> std::path::PathBuf {
+    let db = provenance_db_path();
+    let name = db
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("provenance.db");
+    db.with_file_name(format!("{name}.spool.jsonl"))
+}
+
+/// Append one record to the spool. Says so at WARN under `provenance_spool`;
+/// only a spool that cannot itself be written is a drop (`provenance_drop`).
+pub fn spool_record(record: &prism_provenance::ProvenanceRecord, cause: &str) {
+    use std::io::Write;
+    let path = provenance_spool_path();
+    let line = match serde_json::to_string(record) {
+        Ok(line) => line,
+        Err(e) => {
+            warn!(
+                target: "provenance_drop",
+                tool = %record.tool_name.as_deref().unwrap_or("?"),
+                session = %record.session_id,
+                "record could not be serialised for the spool (dropped): {e}"
+            );
+            return;
+        }
+    };
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    match written {
+        Ok(()) => warn!(
+            target: "provenance_spool",
+            tool = %record.tool_name.as_deref().unwrap_or("?"),
+            session = %record.session_id,
+            "provenance store unavailable ({cause}) — record spooled to {}; replayed at the next \
+             successful open",
+            path.display()
+        ),
+        Err(e) => warn!(
+            target: "provenance_drop",
+            tool = %record.tool_name.as_deref().unwrap_or("?"),
+            session = %record.session_id,
+            "provenance store unavailable ({cause}) and the spool could not be written ({e}) — \
+             record dropped"
+        ),
+    }
+}
+
+/// Replay every spooled record into an open store; returns how many were
+/// written. The spool file is taken (renamed) first so a concurrent writer
+/// starts a fresh one; lines the store still refuses, and malformed lines,
+/// go back to the live spool rather than being deleted.
+pub async fn replay_spool(store: &prism_provenance::ProvenanceStore) -> usize {
+    use std::io::Write;
+    let path = provenance_spool_path();
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+        return 0;
+    }
+    let taken = path.with_extension("replaying");
+    if std::fs::rename(&path, &taken).is_err() {
+        return 0;
+    }
+    let Ok(text) = std::fs::read_to_string(&taken) else {
+        return 0;
+    };
+    let mut written = 0usize;
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        match serde_json::from_str::<prism_provenance::ProvenanceRecord>(line) {
+            Ok(record) => match store.record(&record).await {
+                Ok(()) => written += 1,
+                Err(_) => kept.push(line),
+            },
+            Err(_) => kept.push(line),
+        }
+    }
+    if !kept.is_empty()
+        && let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+    {
+        for line in &kept {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+    let _ = std::fs::remove_file(&taken);
+    if written > 0 {
+        tracing::info!(
+            target: "provenance_spool",
+            written,
+            kept = kept.len(),
+            "spooled provenance records replayed into the store"
+        );
+    }
+    written
+}
+
 pub fn provenance_db_path() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("PRISM_PROVENANCE_DB")
         && !p.is_empty()
@@ -845,37 +950,21 @@ fn provenance_hook() -> Hook {
                         match prism_provenance::ProvenanceStore::open(&db_path).await {
                             Ok(store) => {
                                 if let Err(e) = store.record(&record).await {
-                                    warn!(
-                                        target: "provenance_drop",
-                                        tool = %record.tool_name.as_deref().unwrap_or("?"),
-                                        session = %record.session_id,
-                                        "provenance write failed (record dropped): {e}"
-                                    );
+                                    spool_record(&record, &format!("write failed: {e}"));
                                 } else {
                                     // Semantic memory: embed the record so `recall`
                                     // can find it by meaning, not just keyword.
                                     crate::embeddings::embed_record(&store, &record).await;
+                                    // The store is open and writable: anything
+                                    // spooled while it was not goes in now.
+                                    replay_spool(&store).await;
                                 }
                             }
-                            Err(e) => {
-                                warn!(
-                                    target: "provenance_drop",
-                                    tool = %record.tool_name.as_deref().unwrap_or("?"),
-                                    session = %record.session_id,
-                                    "provenance store open failed (record dropped): {e}"
-                                );
-                            }
+                            Err(e) => spool_record(&record, &format!("open failed: {e}")),
                         }
                     });
                 }
-                Err(e) => {
-                    warn!(
-                        target: "provenance_drop",
-                        tool = %record.tool_name.as_deref().unwrap_or("?"),
-                        session = %record.session_id,
-                        "provenance write skipped — no tokio runtime (record dropped): {e}"
-                    );
-                }
+                Err(e) => spool_record(&record, &format!("no tokio runtime: {e}")),
             }
 
             PostHookResult {
@@ -952,6 +1041,84 @@ mod tests {
                 guard_kills_a_test_that_resolves_the_default_store_path"]
     fn guard_probe_resolves_default_store_path() {
         let _ = super::provenance_db_path();
+    }
+
+    /// Set an env var for one test and restore it on drop.
+    struct EnvGuard(&'static str, Option<String>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => unsafe { std::env::set_var(self.0, v) },
+                None => unsafe { std::env::remove_var(self.0) },
+            }
+        }
+    }
+    fn env_guard(key: &'static str, value: &str) -> EnvGuard {
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, value) };
+        EnvGuard(key, prev)
+    }
+
+    fn spooled_record(tool: &str) -> prism_provenance::ProvenanceRecord {
+        prism_provenance::new_record(
+            "spool-test-session",
+            prism_provenance::ActionType::ToolCall,
+            prism_provenance::Actor::Agent,
+            Some(tool),
+            None,
+            json!({ "query": "x" }),
+        )
+    }
+
+    /// Measured 2026-09-05: with the store's lock held by another process,
+    /// 21 tool records of a research run were dropped. Now they are spooled.
+    #[test]
+    fn a_record_the_store_cannot_take_is_spooled_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("provenance.db");
+        let _guard = env_guard("PRISM_PROVENANCE_DB", db.to_str().unwrap());
+        spool_record(&spooled_record("prior_art_search"), "open failed: locked");
+        spool_record(&spooled_record("web"), "open failed: locked");
+        let spool = provenance_spool_path();
+        assert!(spool.starts_with(dir.path()), "{spool:?}");
+        let lines: Vec<String> = std::fs::read_to_string(&spool)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2);
+        let back: prism_provenance::ProvenanceRecord = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(back.tool_name.as_deref(), Some("prior_art_search"));
+    }
+
+    /// Once the store opens again, the spool drains into it and is gone.
+    #[tokio::test]
+    async fn the_spool_is_replayed_into_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("provenance.db");
+        let _guard = env_guard("PRISM_PROVENANCE_DB", db.to_str().unwrap());
+        spool_record(&spooled_record("prior_art_search"), "open failed: locked");
+        spool_record(&spooled_record("web"), "open failed: locked");
+        std::fs::write(
+            provenance_spool_path(),
+            format!(
+                "{}\nnot json at all\n",
+                std::fs::read_to_string(provenance_spool_path()).unwrap()
+            ),
+        )
+        .unwrap();
+        let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
+        let before = store.stats().await.unwrap().total_records;
+        assert_eq!(replay_spool(&store).await, 2);
+        assert_eq!(store.stats().await.unwrap().total_records, before + 2);
+        // The malformed line is kept for a human, not deleted.
+        let left = std::fs::read_to_string(provenance_spool_path()).unwrap_or_default();
+        assert_eq!(left.trim(), "not json at all");
+        assert_eq!(
+            replay_spool(&store).await,
+            0,
+            "nothing valid left to replay"
+        );
     }
 
     #[test]
