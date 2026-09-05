@@ -259,6 +259,87 @@ pub struct CommandPalette {
     pub selected: usize,
 }
 
+/// The settings hub: one panel of large tiles, each opening the window or
+/// form that already exists. Arrows move, Enter opens, Esc closes.
+#[derive(Debug, Clone, Default)]
+pub struct SettingsHub {
+    pub open: bool,
+    pub selected: usize,
+}
+
+/// One tile of the settings hub: what it is called, what it does, and the
+/// palette command it opens.
+pub struct SettingsTile {
+    pub glyph: &'static str,
+    pub title: &'static str,
+    pub blurb: &'static str,
+    pub command: &'static str,
+}
+
+/// The tiles, in reading order (two columns). The important things first.
+pub const SETTINGS_TILES: &[SettingsTile] = &[
+    SettingsTile {
+        glyph: "◆",
+        title: "Model & routing",
+        blurb: "which model answers, hosted or local",
+        command: "model.show",
+    },
+    SettingsTile {
+        glyph: "⌕",
+        title: "Search sources & keys",
+        blurb: "Semantic Scholar, Lens, patent table",
+        command: "search.keys",
+    },
+    SettingsTile {
+        glyph: "⚛",
+        title: "Compute & QE",
+        blurb: "cutoff, k-spacing, smearing, processes",
+        command: "qe.settings",
+    },
+    SettingsTile {
+        glyph: "✓",
+        title: "Approvals & policy",
+        blurb: "what runs without asking",
+        command: "slash.permissions",
+    },
+    SettingsTile {
+        glyph: "◐",
+        title: "Display & theme",
+        blurb: "colours, reasoning, meters",
+        command: "theme.list",
+    },
+    SettingsTile {
+        glyph: "¤",
+        title: "Billing & credits",
+        blurb: "balance, usage, prices",
+        command: "slash.billing",
+    },
+    SettingsTile {
+        glyph: "☺",
+        title: "Account & sign-in",
+        blurb: "platform login, identity provider",
+        command: "account.show",
+    },
+    SettingsTile {
+        glyph: "⌂",
+        title: "Nodes & GPUs",
+        blurb: "your machines and rented compute",
+        command: "nodes.show",
+    },
+    SettingsTile {
+        glyph: "▤",
+        title: "Config file",
+        blurb: "prism.toml, .mcp.json, ~/.prism",
+        command: "config.show",
+    },
+    SettingsTile {
+        glyph: "⟳",
+        title: "Tools & plugins",
+        blurb: "the catalog; reload what you provisioned",
+        command: "tools.show",
+    },
+];
+
 /// Which-key panel state (`?`) — the opencode-style keymap reference.
 ///
 /// A persistent, grouped, scrollable overlay of every TUI keybinding
@@ -910,6 +991,7 @@ pub struct App {
     pub tools_window: ToolsWindow,
     /// Bespoke Status window.
     pub status_window: StatusWindow,
+    pub settings_hub: SettingsHub,
     /// Mission Control home (launch screen).
     pub home: Home,
     /// Bespoke Config window (file viewer).
@@ -1033,6 +1115,7 @@ impl App {
             tool_catalog: Vec::new(),
             tools_window: ToolsWindow::default(),
             status_window: StatusWindow::default(),
+            settings_hub: SettingsHub::default(),
             home: Home { open: true },
             config_window: ConfigWindow::default(),
             apikey_window: ApiKeyWindow::default(),
@@ -1203,6 +1286,10 @@ impl App {
         }
 
         // Status window intercepts keys while open.
+        if self.settings_hub.open {
+            self.handle_settings_hub_key(key);
+            return;
+        }
         if self.status_window.open {
             self.handle_status_window_key(key);
             return;
@@ -3411,9 +3498,9 @@ impl App {
             "Quantum ESPRESSO settings — empty fields keep their value",
             "save",
             vec![
-                FormField::text("ecutwfc_ry", "Wavefunction cutoff (Ry)", "")
+                FormField::text("ecutwfc_ry", "Cutoff (Ry)", "")
                     .with_note("default 60; PseudoDojo standard set"),
-                FormField::text("kspacing_inv_angstrom", "k-point spacing (1/Å)", "")
+                FormField::text("kspacing_inv_angstrom", "k-spacing (1/Å)", "")
                     .with_note("default 0.15"),
                 FormField::text("smearing", "Smearing", "")
                     .with_note("mv (default), mp, gaussian, fd"),
@@ -3421,7 +3508,7 @@ impl App {
                 FormField::text("nproc", "MPI processes", "").with_note("default: all cores"),
                 FormField::text("pw_path", "pw.x path", "")
                     .with_note("default ~/.prism/qe/bin/pw.x"),
-                FormField::text("pseudo_dir", "Pseudopotential directory", "")
+                FormField::text("pseudo_dir", "Pseudo dir", "")
                     .with_note("default: the provisioned PseudoDojo set"),
             ],
         );
@@ -3438,9 +3525,9 @@ impl App {
                     .with_note("CIF/POSCAR path, cache reference, or formula"),
                 FormField::text("calc", "Calculation", "")
                     .with_note("scf (default), relax, vc-relax"),
-                FormField::text("ecutwfc_ry", "Cutoff override (Ry)", ""),
-                FormField::text("kspacing_inv_angstrom", "k-spacing override (1/Å)", ""),
-                FormField::text("nproc", "Processes override", ""),
+                FormField::text("ecutwfc_ry", "Cutoff (Ry)", ""),
+                FormField::text("kspacing_inv_angstrom", "k-spacing (1/Å)", ""),
+                FormField::text("nproc", "Processes", ""),
             ],
         );
         self.open_form(form, FormTarget::QeRun);
@@ -3870,6 +3957,10 @@ impl App {
         self.messages.clear();
         self.session_title = "New session".to_string();
         self.goal = None;
+        // The meters belong to the session that produced them.
+        self.session_cost = 0.0;
+        self.turn_cost = 0.0;
+        self.reset_stream_metrics();
         self.objects.clear();
         // Marks belong to the session that made them: the objects they point
         // at are gone with it, and a mark surviving into a new session would
@@ -4540,6 +4631,54 @@ impl App {
     fn close_status_window(&mut self) {
         self.status_window.open = false;
     }
+    pub fn open_settings_hub(&mut self) {
+        self.settings_hub.open = true;
+        self.settings_hub.selected = 0;
+    }
+
+    fn close_settings_hub(&mut self) {
+        self.settings_hub.open = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_apikey_window_for_test(&mut self) {
+        self.close_apikey_window();
+    }
+
+    /// Arrows move over the two-column grid, Enter opens the tile's command,
+    /// Esc (or Ctrl-C) closes.
+    fn handle_settings_hub_key(&mut self, key: KeyEvent) {
+        let n = SETTINGS_TILES.len();
+        let cancel = (key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c'))
+            || key.code == KeyCode::Esc;
+        if cancel {
+            self.close_settings_hub();
+            return;
+        }
+        let sel = self.settings_hub.selected;
+        match key.code {
+            KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
+                self.settings_hub.selected = (sel + 1).min(n - 1);
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.settings_hub.selected = sel.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.settings_hub.selected = (sel + 2).min(n - 1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_hub.selected = sel.saturating_sub(2);
+            }
+            KeyCode::Enter => {
+                let command = SETTINGS_TILES[sel.min(n - 1)].command;
+                self.close_settings_hub();
+                self.dispatch_command(command);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_status_window_key(&mut self, key: KeyEvent) {
         let cancel = (key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('c'))
@@ -5237,6 +5376,7 @@ impl App {
             "tools.reload" => {
                 let _ = self.backend.send_command("/tools reload");
             }
+            "settings.hub" => self.open_settings_hub(),
             "qe.settings" => self.open_qe_settings_form(),
             "qe.run" => self.open_qe_run_form(),
             "account.show" => self.open_account(),
@@ -8043,6 +8183,105 @@ mod tests {
             qe_run_command(&form),
             Err("name a structure: a CIF path, a cache reference or a formula")
         );
+    }
+
+    #[test]
+    fn the_settings_hub_is_a_grid_of_tiles_that_open_the_real_windows() {
+        // "Make the most important settings big, like Microsoft's settings":
+        // one panel, large tiles, each opening the window or form that
+        // already exists. Arrows move, Enter opens, Esc closes.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        assert!(
+            crate::command::CATALOG
+                .iter()
+                .any(|c| c.id == "settings.hub")
+        );
+        assert_eq!(crate::command::effect("settings.hub"), "opens a panel");
+        assert!(app.dispatch_command("settings.hub"));
+        assert!(app.settings_hub.open);
+        let titles: Vec<&str> = SETTINGS_TILES.iter().map(|t| t.title).collect();
+        for want in [
+            "Model & routing",
+            "Search sources & keys",
+            "Compute & QE",
+            "Approvals & policy",
+            "Display & theme",
+            "Billing & credits",
+            "Account & sign-in",
+        ] {
+            assert!(titles.contains(&want), "{want} missing from {titles:?}");
+        }
+        // Move to "Search sources & keys" and open it: the key window appears.
+        let idx = SETTINGS_TILES
+            .iter()
+            .position(|t| t.title == "Search sources & keys")
+            .unwrap();
+        for _ in 0..idx {
+            app.handle_key(key(KeyCode::Right));
+        }
+        assert_eq!(app.settings_hub.selected, idx);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.settings_hub.open, "the hub hands over to the window");
+        assert!(
+            app.apikey_window.open,
+            "the tile opened the real key window"
+        );
+        // Esc closes without side effects.
+        app.close_apikey_window_for_test();
+        app.dispatch_command("settings.hub");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.settings_hub.open);
+        // Every tile is drawn with its title at 100x30.
+        app.dispatch_command("settings.hub");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        for t in SETTINGS_TILES {
+            assert!(screen.contains(t.title), "{} drawn: {screen}", t.title);
+        }
+    }
+
+    #[test]
+    fn a_new_session_starts_its_meters_at_zero() {
+        // Session cost, turn cost and the throughput meter belong to the
+        // session that produced them. `/new` cleared the transcript and
+        // carried the numbers over, so a fresh session opened at $0.0062.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.session_cost = 0.0062;
+        app.turn_cost = 0.001;
+        app.tokens_per_sec = 16.6;
+        app.tokens_received = 400;
+        app.new_session();
+        assert_eq!(app.session_cost, 0.0);
+        assert_eq!(app.turn_cost, 0.0);
+        assert_eq!(app.tokens_per_sec, 0.0);
+        assert_eq!(app.tokens_received, 0);
+    }
+
+    #[test]
+    fn a_negative_balance_reads_as_overdrawn() {
+        // -73.4 cr in the footer looked like a display bug. It is the
+        // platform's own ledger; the footer says what a negative number means.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.credits = Some(-73_396);
+        let footer = footer_row(&app);
+        assert!(footer.contains("overdrawn"), "{footer:?}");
+        assert!(footer.contains("-73.4"), "{footer:?}");
+        app.credits = Some(12_500);
+        let footer = footer_row(&app);
+        assert!(!footer.contains("overdrawn"), "{footer:?}");
     }
 
     #[test]

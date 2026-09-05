@@ -106,6 +106,14 @@ pub static CATALOG: &[Command] = &[
         suggested: false,
     },
     Command {
+        id: "settings.hub",
+        title: "Settings",
+        description: "The important settings as tiles — model, sources, compute, approvals, display, billing, account",
+        category: "Settings",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
         id: "tools.reload",
         title: "Reload tools (hot)",
         description: "Pick up provisioned or authored tools without a restart",
@@ -1001,7 +1009,7 @@ pub fn effect(id: &str) -> String {
         "help.show" | "which_key.show" | "theme.list" | "gh.show" | "account.show"
         | "sessions.show" | "tools.show" | "status.show" | "home.show" | "config.show"
         | "apikey.show" | "search.keys" | "links.open" | "cost.show" | "model.show"
-        | "compute.gpus" | "nodes.show" | "mcp.show" => "opens a panel",
+        | "compute.gpus" | "nodes.show" | "mcp.show" | "settings.hub" => "opens a panel",
         "node.stop" => "runs /node stop",
         "ontology.list" => "runs /ontology list",
         "ontology.proposals" => "runs /ontology proposals list",

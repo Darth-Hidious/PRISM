@@ -177,6 +177,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     // theme picker > which-key panel > modal.
     if app.approval_pending.is_some() {
         draw_approval_popup(f, app);
+    } else if app.settings_hub.open {
+        draw_settings_hub(f, app);
     } else if app.palette.open {
         draw_command_palette(f, app);
     } else if app.form.is_some() {
@@ -1328,10 +1330,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if let Some(millicredits) = app.credits {
         spans.push(Span::styled("credits:", Style::default().fg(t.system)));
         spans.push(Span::raw(" "));
+        // A negative balance is the platform's ledger, not a display bug;
+        // say what it means and colour it as the warning it is.
+        let overdrawn = millicredits < 0;
         spans.push(Span::styled(
             prism_client::billing::format_credits(millicredits),
-            Style::default().fg(t.ok),
+            Style::default().fg(if overdrawn { t.warn } else { t.ok }),
         ));
+        if overdrawn {
+            spans.push(Span::styled(" overdrawn", Style::default().fg(t.warn)));
+        }
         spans.push(Span::raw("  "));
     }
 
@@ -4478,6 +4486,92 @@ pub(crate) fn palette_title_cell(title: &str) -> String {
     // 23 visible columns plus one of daylight: a 24-column title touched its
     // description ("Assertions to re-verifyBy verification status").
     format!("{:<24}", clip(title, 23))
+}
+
+/// The settings hub — a grid of large tiles over the content column. Each
+/// tile: glyph, title, one line of what it is for. The selected tile is
+/// framed with the accent; the footer says the keys.
+fn draw_settings_hub(f: &mut Frame, app: &App) {
+    use crate::app::SETTINGS_TILES;
+    let t = app.theme();
+    let bounds = overlay_bounds(f.area(), false);
+    let width = bounds.width.clamp(40, 96);
+    // Two columns from 60 columns up (a tile title needs ~26): the content
+    // column beside the sidebar is 64 wide at 100 columns.
+    let cols: u16 = if width >= 60 { 2 } else { 1 };
+    let rows = (SETTINGS_TILES.len() as u16).div_ceil(cols);
+    // A tall tile (5 rows: frame, title, blurb, gap) when the screen holds
+    // every tile at that height; otherwise a compact one (3 rows: frame and
+    // title) — tiles are never dropped to make room.
+    let tile_h: u16 = if rows * 5 + 5 <= bounds.height { 5 } else { 3 };
+    let gap: u16 = if tile_h == 5 { 1 } else { 0 };
+    let height = (rows * tile_h + 5).min(bounds.height);
+    let area = Rect::new(
+        bounds.x + (bounds.width.saturating_sub(width)) / 2,
+        bounds.y + (bounds.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.accent))
+        .title(Span::styled(
+            " Settings ",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(t.panel));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let tile_w = inner.width / cols;
+    for (i, tile) in SETTINGS_TILES.iter().enumerate() {
+        let col = (i as u16) % cols;
+        let row = (i as u16) / cols;
+        let y = inner.y + 1 + row * tile_h;
+        if y + tile_h > inner.y + inner.height.saturating_sub(1) {
+            break;
+        }
+        let rect = Rect::new(
+            inner.x + col * tile_w + 1,
+            y,
+            tile_w.saturating_sub(2),
+            tile_h - gap,
+        );
+        let selected = i == app.settings_hub.selected;
+        let frame = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if selected { t.accent } else { t.divider }));
+        let body = frame.inner(rect);
+        f.render_widget(frame, rect);
+        let title_style = Style::default().fg(t.text).add_modifier(Modifier::BOLD);
+        let mut lines = vec![Line::from(vec![
+            Span::styled(format!(" {} ", tile.glyph), Style::default().fg(t.accent)),
+            Span::styled(tile.title, title_style),
+        ])];
+        if tile_h >= 5 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "   {}",
+                    clip(tile.blurb, usize::from(body.width.saturating_sub(3)))
+                ),
+                Style::default().fg(t.dim),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), body);
+    }
+    let footer = Rect::new(
+        inner.x,
+        inner.y + inner.height.saturating_sub(1),
+        inner.width,
+        1,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  ←/→ ↑/↓ move · ↵ open · Esc close",
+            Style::default().fg(t.muted),
+        ))),
+        footer,
+    );
 }
 
 fn draw_command_palette(f: &mut Frame, app: &App) {
