@@ -7824,6 +7824,41 @@ mod tests {
     }
 
     #[test]
+    fn a_view_panel_wraps_long_lines_instead_of_cutting_them() {
+        // Live 2026-09-05, the papers view: every title and the
+        // "databases asked:" summary were cut at the panel's right edge —
+        // "…semantic_scholar no answer (│". The hover panel wraps; so does
+        // this one.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        let long = format!("START {} END", "x".repeat(150));
+        app.apply_agent_msg(crate::msg::AgentMsg::View {
+            title: "Papers — search".to_string(),
+            tabs: vec![(
+                "Papers — search".to_string(),
+                format!("1 paper(s)\n{long}\n"),
+            )],
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(screen.contains("START"), "{screen}");
+        assert!(
+            screen.contains("END"),
+            "the tail of a long line is on screen, wrapped: {screen}"
+        );
+    }
+
+    #[test]
     fn the_footer_does_not_say_ready_while_a_tool_is_still_running() {
         // Driven live on 2026-09-05: the model's text segment ended, the
         // text-flush event wrote "Ready", and the footer read Ready for the

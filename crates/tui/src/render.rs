@@ -3031,29 +3031,33 @@ fn draw_view_panel(f: &mut Frame, app: &App) {
             Style::default().fg(t.muted),
         ))]
     } else {
+        // Wrap to the panel, never cut at its edge (live 2026-09-05: every
+        // paper title and the "databases asked" summary ended in "…(│").
+        // The style is decided per source line and shared by its pieces.
+        let inner_w = usize::from(area.width.saturating_sub(2)).max(8);
         body.lines()
-            .map(|l| {
+            .flat_map(|l| {
                 // Diff-aware coloring: additions green, deletions red, hunk
                 // headers accent, file headers bold. Makes /diff a real patch viewer.
-                if l.starts_with("+++") || l.starts_with("---") {
-                    Line::styled(
-                        l.to_string(),
-                        Style::default().fg(t.text).add_modifier(Modifier::BOLD),
-                    )
+                let style = if l.starts_with("+++") || l.starts_with("---") {
+                    Style::default().fg(t.text).add_modifier(Modifier::BOLD)
                 } else if l.starts_with("diff ") || l.starts_with("Index:") {
-                    Line::styled(
-                        l.to_string(),
-                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-                    )
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
                 } else if l.starts_with("@@") {
-                    Line::styled(l.to_string(), Style::default().fg(t.accent))
+                    Style::default().fg(t.accent)
                 } else if l.starts_with('+') {
-                    Line::styled(l.to_string(), Style::default().fg(t.ok))
+                    Style::default().fg(t.ok)
                 } else if l.starts_with('-') {
-                    Line::styled(l.to_string(), Style::default().fg(t.err))
+                    Style::default().fg(t.err)
                 } else {
-                    Line::raw(l.to_string())
-                }
+                    Style::default()
+                };
+                let pieces = if l.is_empty() {
+                    vec![String::new()]
+                } else {
+                    wrap_plain(l, inner_w)
+                };
+                pieces.into_iter().map(move |p| Line::styled(p, style))
             })
             .collect()
     };
