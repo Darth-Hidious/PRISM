@@ -827,6 +827,9 @@ pub struct App {
     /// Set at startup and on each turn boundary to trigger a cheap balance
     /// refresh in the event loop (never on every keystroke).
     pub needs_credits_refresh: bool,
+    /// The last refresh failed: the number shown is the last one known, not
+    /// the current one. The footer says so.
+    pub credits_stale: bool,
     // Workspace sidebar — Activity / Tools / Files / Objects / Structures /
     // Artifacts.
     pub workspace_tab: WorkspaceTab,
@@ -1022,6 +1025,21 @@ pub fn throughput(tokens: u64, window: std::time::Duration) -> Option<f64> {
     (window >= THROUGHPUT_WINDOW_FLOOR).then(|| tokens as f64 / window.as_secs_f64())
 }
 
+/// How long the balance may go unrefreshed while the session is idle. Turn
+/// boundaries refresh it anyway; this covers a reader who leaves the TUI open
+/// and comes back to a number that is an hour old.
+pub const CREDITS_IDLE_REFRESH: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether the balance is due a refresh: idle long enough, and not mid-turn
+/// (the turn's own end refreshes it, and a poll mid-stream is noise).
+pub fn credits_refresh_due(
+    last_fetch: std::time::Instant,
+    now: std::time::Instant,
+    turn_in_progress: bool,
+) -> bool {
+    !turn_in_progress && now.duration_since(last_fetch) >= CREDITS_IDLE_REFRESH
+}
+
 impl App {
     pub fn new(backend: BackendHandle) -> Self {
         let mut input = TextArea::default();
@@ -1065,6 +1083,7 @@ impl App {
             copy_mode: false,
             credits: None,
             needs_credits_refresh: true,
+            credits_stale: false,
             workspace_tab: WorkspaceTab::Activity,
             workspace_selected: 0,
             workspace_expanded: false,
@@ -5400,7 +5419,17 @@ impl App {
             "status.show" => self.open_status_window(),
             "home.show" => self.open_home(),
             "config.show" => self.open_config_window(),
-            "apikey.show" | "search.keys" => self.open_apikey_window(),
+            "apikey.show" => self.open_apikey_window(),
+            "search.keys" => {
+                // The window opens on the first SEARCH source, not the first
+                // LLM provider — the reader came here for Semantic Scholar,
+                // Lens or the patent table.
+                self.open_apikey_window();
+                self.apikey_window.provider_idx = API_PROVIDERS
+                    .iter()
+                    .position(|(name, _)| *name == "Semantic Scholar")
+                    .unwrap_or(0);
+            }
             "session.new" => self.new_session(),
             "links.open" => self.open_link_picker(),
             "cost.show" => self.modal = Some(Modal::Cost),
@@ -7612,6 +7641,21 @@ mod tests {
     }
 
     #[test]
+    fn search_keys_opens_the_key_window_on_the_first_search_source() {
+        let mut app = fresh();
+        app.dispatch_command("search.keys");
+        assert!(app.apikey_window.open);
+        let (name, _) = API_PROVIDERS[app.apikey_window.provider_idx];
+        assert_eq!(name, "Semantic Scholar");
+        app.close_apikey_window_for_test();
+        app.dispatch_command("apikey.show");
+        assert_eq!(
+            app.apikey_window.provider_idx, 0,
+            "the LLM-key entry keeps its first tab"
+        );
+    }
+
+    #[test]
     fn the_key_window_offers_the_search_source_keys() {
         // "Set SEMANTIC_SCHOLAR_API_KEY for a dedicated pool" is only advice
         // if there is somewhere in the TUI to set it. The key window is that
@@ -8284,6 +8328,37 @@ mod tests {
         assert_eq!(app.turn_cost, 0.0);
         assert_eq!(app.tokens_per_sec, 0.0);
         assert_eq!(app.tokens_received, 0);
+    }
+
+    #[test]
+    fn the_balance_refreshes_itself_while_idle() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        assert!(
+            !credits_refresh_due(t0, t0 + Duration::from_secs(30), false),
+            "too soon"
+        );
+        assert!(
+            credits_refresh_due(t0, t0 + CREDITS_IDLE_REFRESH, false),
+            "idle long enough"
+        );
+        assert!(
+            !credits_refresh_due(t0, t0 + Duration::from_secs(600), true),
+            "never mid-turn — the turn's end refreshes it"
+        );
+    }
+
+    #[test]
+    fn a_balance_that_could_not_be_refreshed_says_so() {
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.credits = Some(12_500);
+        app.credits_stale = true;
+        let footer = footer_row(&app);
+        assert!(footer.contains("stale"), "{footer:?}");
+        app.credits_stale = false;
+        let footer = footer_row(&app);
+        assert!(!footer.contains("stale"), "{footer:?}");
     }
 
     #[test]

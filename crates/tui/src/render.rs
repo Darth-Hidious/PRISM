@@ -1340,6 +1340,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         if overdrawn {
             spans.push(Span::styled(" overdrawn", Style::default().fg(t.warn)));
         }
+        if app.credits_stale {
+            // The last refresh failed; this is the last number known.
+            spans.push(Span::styled(" stale", Style::default().fg(t.muted)));
+        }
         spans.push(Span::raw("  "));
     }
 

@@ -328,6 +328,9 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // via an atomic the loop reads (no extra select! branch needed). Fired at
     // startup and after each completed turn. Stays None when unauthed.
     let credits_cell = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
+    // A failed refresh keeps the last number on screen and marks it stale.
+    let credits_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut last_credits_fetch = std::time::Instant::now();
     let platform_auth = config.platform.clone();
 
     // Main event loop — tokio::select! between crossterm events,
@@ -387,21 +390,36 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
 
         // Credits: (re)fetch at startup and after each completed turn, then
         // publish the latest known balance into the app for the status bar.
+        // …and while idle, on a cadence, so a reader who leaves the TUI open
+        // does not come back to an hour-old number.
+        if app::credits_refresh_due(
+            last_credits_fetch,
+            std::time::Instant::now(),
+            app.turn_in_progress,
+        ) {
+            app.needs_credits_refresh = true;
+        }
         if app.needs_credits_refresh {
             app.needs_credits_refresh = false;
+            last_credits_fetch = std::time::Instant::now();
             if let Some(auth) = &platform_auth {
-                let (base, token, cell) = (
+                let (base, token, cell, failed) = (
                     auth.base_url.clone(),
                     auth.token.clone(),
                     credits_cell.clone(),
+                    credits_failed.clone(),
                 );
                 tokio::spawn(async move {
                     let client = prism_client::PlatformClient::new(base).with_token(token);
                     match prism_client::billing::get_balance(&client).await {
                         Ok(b) => {
                             cell.store(b.balance_millicredits, std::sync::atomic::Ordering::SeqCst);
+                            failed.store(false, std::sync::atomic::Ordering::SeqCst);
                         }
-                        Err(e) => tracing::debug!(error = %e, "credits fetch failed"),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "credits fetch failed");
+                            failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                 });
             }
@@ -410,6 +428,7 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         if fetched != i64::MIN {
             app.credits = Some(fetched);
         }
+        app.credits_stale = credits_failed.load(std::sync::atomic::Ordering::SeqCst);
 
         // Check quit conditions: should_quit (from key handler) or
         // SIGINT received (from the signal handler).
