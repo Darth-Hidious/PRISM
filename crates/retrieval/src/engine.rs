@@ -116,7 +116,7 @@ pub struct RetrievalEngine {
 /// E-utilities ANDs its terms, so every added term can only SHRINK the set,
 /// and on a niche subject three or four is already enough to reach zero. Four
 /// of nine sources returned `cache (0 results)` for the live run's queries —
-/// pubmed, doaj, ntrs, preprints_europepmc — none broken, all asked a question
+/// pubmed, doaj, ntrs, osti, preprints_europepmc — none broken, all asked a question
 /// they cannot answer.
 ///
 /// This USED to shorten the query and re-ask it automatically, keeping the

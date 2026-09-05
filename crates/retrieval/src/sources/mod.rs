@@ -22,6 +22,7 @@ pub mod doaj;
 pub mod europepmc;
 pub mod ntrs;
 pub mod openalex;
+pub mod osti;
 pub mod pubmed;
 pub mod semantic_scholar;
 
@@ -48,6 +49,9 @@ pub enum SourceId {
     /// NASA Technical Reports Server — US government technical reports,
     /// generally public domain.
     Ntrs,
+    /// OSTI.GOV — the US Department of Energy's research index: national
+    /// laboratory materials work, with accepted manuscripts on most records.
+    Osti,
 }
 
 impl SourceId {
@@ -62,6 +66,7 @@ impl SourceId {
             SourceId::Chemrxiv => "chemrxiv",
             SourceId::Doaj => "doaj",
             SourceId::Ntrs => "ntrs",
+            SourceId::Osti => "osti",
         }
     }
 
@@ -85,8 +90,8 @@ impl SourceId {
             SourceId::Preprints => Duration::from_millis(500),
             SourceId::Chemrxiv => Duration::from_millis(500),
             SourceId::Doaj => Duration::from_millis(500),
-            // NTRS publishes no rate guidance; match the conservative pools.
-            SourceId::Ntrs => Duration::from_millis(500),
+            // NTRS and OSTI publish no rate guidance; match the conservative pools.
+            SourceId::Ntrs | SourceId::Osti => Duration::from_millis(500),
         }
     }
 }
@@ -102,6 +107,7 @@ pub fn all_sources() -> Vec<SourceId> {
         SourceId::Chemrxiv,
         SourceId::Doaj,
         SourceId::Ntrs,
+        SourceId::Osti,
     ]
 }
 

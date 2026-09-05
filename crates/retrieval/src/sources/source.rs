@@ -28,7 +28,9 @@ use async_trait::async_trait;
 use crate::model::SourcePage;
 
 use super::FetchCtx;
-use super::{arxiv, chemrxiv, crossref, doaj, europepmc, ntrs, openalex, pubmed, semantic_scholar};
+use super::{
+    arxiv, chemrxiv, crossref, doaj, europepmc, ntrs, openalex, osti, pubmed, semantic_scholar,
+};
 
 /// What an adapter can actually SERVE, declared per adapter and verified
 /// against its own translator by tests (`tests/capability_declarations.rs`)
@@ -225,10 +227,10 @@ impl SourceRegistry {
         }
     }
 
-    /// The nine built-in literature sources, in canonical order.
+    /// The ten built-in literature sources, in canonical order.
     pub fn builtin() -> Self {
         let mut reg = Self::new();
-        let builtins: [Arc<dyn Source>; 9] = [
+        let builtins: [Arc<dyn Source>; 10] = [
             Arc::new(Arxiv),
             Arc::new(Openalex),
             Arc::new(Crossref),
@@ -238,6 +240,7 @@ impl SourceRegistry {
             Arc::new(Chemrxiv),
             Arc::new(Doaj),
             Arc::new(Ntrs),
+            Arc::new(Osti),
         ];
         for source in builtins {
             reg.register(source)
@@ -315,6 +318,8 @@ pub struct Chemrxiv;
 pub struct Doaj;
 /// NASA Technical Reports Server.
 pub struct Ntrs;
+/// OSTI.GOV adapter — see [`osti`].
+pub struct Osti;
 
 #[async_trait]
 impl Source for Arxiv {
@@ -618,6 +623,39 @@ impl Source for Ntrs {
     }
 }
 
+#[async_trait]
+impl Source for Osti {
+    fn id(&self) -> &'static str {
+        osti::ID
+    }
+    fn min_interval(&self) -> Duration {
+        Duration::from_millis(500)
+    }
+    fn initial_cursor(&self) -> &'static str {
+        osti::INITIAL_CURSOR
+    }
+    fn capabilities(&self) -> SourceCaps {
+        SourceCaps {
+            max_page_size: osti::MAX_PAGE_SIZE,
+            // No paging ceiling is published or was observed live.
+            max_offset: None,
+        }
+    }
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+        osti::fetch(ctx, query).await.map_err(SourceError::classify)
+    }
+    async fn fetch_page(
+        &self,
+        ctx: &FetchCtx,
+        query: &str,
+        cursor: &str,
+    ) -> Result<(SourcePage, Option<String>), SourceError> {
+        osti::fetch_page(ctx, query, cursor)
+            .await
+            .map_err(SourceError::classify)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,7 +675,8 @@ mod tests {
                 "preprints_europepmc",
                 "chemrxiv",
                 "doaj",
-                "ntrs"
+                "ntrs",
+                "osti"
             ]
         );
     }
@@ -651,7 +690,7 @@ mod tests {
         assert_eq!(s.min_interval(), Duration::from_millis(3000));
     }
 
-    /// Pins ALL NINE politeness intervals through the registry. These were
+    /// Pins ALL TEN politeness intervals through the registry. These were
     /// duplicated from the old `SourceId::min_interval()` match into the
     /// adapters; nothing structural keeps them in agreement with each
     /// source's published guidance, and silent drift on a rate limit is how
@@ -659,7 +698,7 @@ mod tests {
     #[test]
     fn builtin_intervals_match_published_politeness_guidance() {
         let reg = SourceRegistry::builtin();
-        let expected: [(&str, u64); 9] = [
+        let expected: [(&str, u64); 10] = [
             ("arxiv", 3000),
             ("openalex", 200),
             ("crossref", 200),
@@ -669,6 +708,7 @@ mod tests {
             ("chemrxiv", 500),
             ("doaj", 500),
             ("ntrs", 500),
+            ("osti", 500),
         ];
         for (id, millis) in expected {
             let source = reg
@@ -682,6 +722,24 @@ mod tests {
         }
     }
 
+    /// Every enum variant is registered and every registered built-in has a
+    /// variant: a source added to one list but not the other is reachable by
+    /// name in one place and unknown in the other.
+    #[test]
+    fn the_enum_and_the_registry_name_the_same_sources() {
+        let reg = SourceRegistry::builtin();
+        let from_enum: Vec<&str> = crate::sources::all_sources()
+            .into_iter()
+            .map(|id| id.as_str())
+            .collect();
+        let from_registry: Vec<&str> = reg.all().iter().map(|s| s.id()).collect();
+        assert_eq!(from_enum, from_registry);
+        assert_eq!(
+            crate::sources::SourceId::from_name("osti"),
+            Some(crate::sources::SourceId::Osti)
+        );
+    }
+
     #[test]
     fn registering_a_test_source_does_not_touch_the_enum() {
         // A source unknown to SourceId can be registered and looked up purely
@@ -689,8 +747,8 @@ mod tests {
         let mut reg = SourceRegistry::builtin();
         reg.register(Arc::new(Demo)).expect("free id must register");
         assert_eq!(reg.get("demo").map(|s| s.id()), Some("demo"));
-        // The built-ins are untouched.
-        assert_eq!(reg.all().len(), 10);
+        // The built-ins are untouched: ten of them, plus the demo.
+        assert_eq!(reg.all().len(), 11);
     }
 
     /// The two-call contract: `register` refuses a taken id (accidental

@@ -156,6 +156,12 @@ async fn doaj_wire_page_size_matches_its_declaration() {
 }
 
 #[tokio::test]
+async fn osti_wire_page_size_matches_its_declaration() {
+    // OSTI pages with `rows`/`page`; the body is a bare array.
+    assert_wire_page_size("osti", "/records", "rows", "[]").await;
+}
+
+#[tokio::test]
 async fn ntrs_wire_page_size_matches_its_declaration() {
     // NTRS pages with `page[size]`/`page[from]` — the bare `size` parameter
     // is ignored by the live endpoint, so the declaration is only honoured

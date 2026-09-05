@@ -444,6 +444,36 @@ async fn doaj_one_skipped_record_does_not_end_the_chain() {
 }
 
 #[tokio::test]
+async fn osti_one_skipped_record_does_not_end_the_chain() {
+    // Two RAW records, one title-less (skipped by the parser): the gate and
+    // the cursor must advance on the raw count, so page=2 is requested.
+    let page1 = r#"[
+      {"osti_id": "1", "title": "Kept report"},
+      {"osti_id": "2"}
+    ]"#;
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/records")
+        .match_query(mockito::Matcher::UrlEncoded("page".into(), "1".into()))
+        .with_status(200)
+        .with_body(page1)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let page2 = server
+        .mock("GET", "/records")
+        .match_query(mockito::Matcher::UrlEncoded("page".into(), "2".into()))
+        .with_status(200)
+        .with_body("[]")
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    // OSTI's total travels in a response header the body parser never sees,
+    // so the honest `available` is None.
+    assert_chain_continues(SourceId::Osti, &server, &page2, 1, None).await;
+}
+
+#[tokio::test]
 async fn ntrs_one_skipped_record_does_not_end_the_chain() {
     // Two RAW results, one id-less (skipped by the parser): the gate and the
     // cursor must advance on the raw count, so page[from]=2 is requested.
