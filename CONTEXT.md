@@ -135,7 +135,9 @@ DONE `bb3e6fdd`: Magnitude (local inference server, 127.0.0.1:10100/inference/v1
 DONE: S2 rate-limit message names the palette entry (Ctrl-P → Search sources & keys).
 DONE `409d0849`: papers engine in the palette (search/sweep/full-text/corpus forms → /papers …, CLI-backed root, JSON presenter); palette titles clipped to their column.
 DONE `18bb282f`: parity batch 3 — 13 palette entries (ontology list/bind/relations/validate/promote/proposals, provenance stats/failures, reverify list/run/history, matkg load, predict); five new CLI-backed roots; single-body ui.view renders as one tab (was empty for doctor/providers/billing/papers); palette title/hint cells clipped.
-NEXT: remaining parity misses — ingest (CLI path), report, schedule, plugins list, discourse, publish; then live re-test of papers + provenance views.
+DONE `2f5c97fa`: parity batch 4 — schedule list/create/cancel, discourse list/run, publish, report, plugins list (8 entries, 5 forms). All 47 CLI subcommands now have a palette or slash route except daemon-only ones (ipc-serve, backend, setup, tui).
+DONE: view panel wraps long lines (was cut at the edge).
+NEXT: live re-test on the installed build (papers view wrapped; provenance stats; schedule list); then CONTEXT.md trim to 20 lines at session end.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
