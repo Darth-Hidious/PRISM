@@ -368,8 +368,8 @@ class EasternLiteratureCollector(DataCollector):
         results: List[Dict] = []
         for w in (data.get("results") or []):
             title = (w.get("display_name") or "").strip()
-            if not title:
-                continue
+            if len(title) < 3:
+                continue  # "G" (seen live) identifies nothing and cannot be cited
             doi = (w.get("doi") or "").replace("https://doi.org/", "")
             authors = [((a.get("author") or {}).get("display_name") or "")
                        for a in (w.get("authorships") or [])]

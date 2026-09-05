@@ -718,6 +718,19 @@ class TestOpenAlex:
         assert rec["journal"] == "材料保护"
 
     @patch("app.tools.data_collectors.eastern_literature_collector.requests")
+    def test_a_one_letter_title_is_noise_not_a_record(self, mock_requests):
+        """Seen live 2026-09-05: a Russian-filtered OpenAlex work titled "G".
+        A title that short identifies nothing and cannot be cited."""
+        body = {"meta": {"count": 2}, "results": [
+            {"id": "https://openalex.org/W9", "display_name": "G", "language": "ru"},
+            {"id": "https://openalex.org/W1", "display_name": "钛合金表面梯度Al2O3陶瓷涂层", "language": "zh"},
+        ]}
+        mock_requests.get.return_value = _resp(json_body=body)
+        hits, err = EasternLiteratureCollector()._search_openalex("x", 5, language="ru")
+        assert [h["title"] for h in hits] == ["钛合金表面梯度Al2O3陶瓷涂层"]
+        assert err.startswith("ok (1 of 2"), err
+
+    @patch("app.tools.data_collectors.eastern_literature_collector.requests")
     def test_english_query_is_used_when_no_native_one_and_the_status_says_so(self, mock_requests):
         mock_requests.get.return_value = _resp(json_body=OPENALEX_JSON)
         c = EasternLiteratureCollector()
