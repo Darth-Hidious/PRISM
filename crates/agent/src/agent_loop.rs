@@ -1334,6 +1334,19 @@ async fn offload_to_repl(content: &str, handle: &str) -> Option<String> {
     cell.success.then(|| handle.to_string())
 }
 
+/// What the model is told when a large result was offloaded. It names the
+/// tool that can actually see the variable. Measured 2026-09-05: the note
+/// said "the same kernel execute_python uses"; execute_python runs each call
+/// in a fresh process, so `doc_1` raised NameError and two calls were spent
+/// on a promise the harness had made.
+fn offload_note(name: &str, chars: usize) -> String {
+    format!(
+        "[The FULL text is also in the notebook kernel as `{name}` ({chars} chars): read, slice \
+         or search it with notebook_exec — a plain Python string there. execute_python does NOT \
+         see it (each call runs in a fresh process); use notebook_exec, or read the file again.]"
+    )
+}
+
 fn process_large_result(content: &str) -> String {
     if content.len() <= MAX_TOOL_RESULT_CHARS {
         return content.to_string();
@@ -5255,11 +5268,8 @@ pub(crate) async fn run_turn_inner(
                         let handle = format!("doc_{repl_offloads}");
                         match offload_to_repl(&content_after_hooks, &handle).await {
                             Some(name) => format!(
-                                "{trimmed}\n\n[The FULL text is also in the notebook kernel as \
-                                 `{name}` ({} chars). It is a plain Python string in the same \
-                                 kernel execute_python uses, so slice it, search it, or count \
-                                 over it in code instead of asking for more of it as text.]",
-                                content_after_hooks.len()
+                                "{trimmed}\n\n{}",
+                                offload_note(&name, content_after_hooks.len())
                             ),
                             // Offering the REPL is a bonus, never a cost: if
                             // the kernel is not up, the pointer the caller
@@ -6151,6 +6161,21 @@ mod tests {
         assert!(
             text.to_lowercase().contains("not searched"),
             "say what is open: {text}"
+        );
+    }
+
+    #[test]
+    fn the_offload_note_names_the_kernel_that_holds_the_text() {
+        let note = offload_note("doc_1", 33_573);
+        assert!(note.contains("`doc_1`") && note.contains("33573"), "{note}");
+        assert!(
+            note.contains("notebook_exec"),
+            "the tool that shares the kernel: {note}"
+        );
+        assert!(note.contains("execute_python does NOT see it"), "{note}");
+        assert!(
+            !note.contains("same kernel execute_python uses"),
+            "the old lie: {note}"
         );
     }
 
