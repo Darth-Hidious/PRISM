@@ -144,7 +144,8 @@ DONE `fe27d7d4`: settings hub — palette "Settings" → ten large tiles (Model,
 DONE `6730d420`: destructive words (rm/rmdir/delete/drop/…) no longer abort the model's call — they FORCE a per-call human decision (no auto-approve, no session "always", reason on the popup, 'a' approves this call only). bash.py still refuses `.git`/`.prism` — loosening that is the owner's call (classifier blocked it).
 DONE `1d86412c`: own inference does not fail — empty stream → one plain request + streaming retired; `[[fallbacks]]` in ~/.prism/config.toml tried on transport/5xx/429 (never on 4xx, never after partial text); switch announced in the activity strip. README documents it.
 DONE `68f85341`: balance refreshes itself after 2 idle min and says "stale" when a fetch failed; "Search sources & keys" opens on Semantic Scholar.
-NEXT: `prism use fallback add/list/clear` + palette form (fallbacks without hand-editing TOML); model window lists fallbacks; SSO scope (Mirdyne provider exists in `prism login`; SAML/IdP is platform-side); CONTEXT.md ≤20 lines at session end.
+DONE `b493e160`: `prism use fallback add|list|clear` (+ `/use fallback …`, palette "Add fallback model" form, "Fallback models", "Clear fallback models"); `use show` names the fallbacks.
+NEXT: model window lists fallbacks; SSO scope (Mirdyne provider exists in `prism login`; SAML/IdP is platform-side); bash.py `.git`/`.prism` deletion refusal — owner's call; CONTEXT.md ≤20 lines at session end.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
