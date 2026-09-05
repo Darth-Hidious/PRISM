@@ -45,6 +45,7 @@ installed (the FakeBackend never touches it).
 from __future__ import annotations
 
 import os
+import threading
 from typing import Literal
 
 Head = Literal[
@@ -152,7 +153,6 @@ def make_calc(
         )
 
     from huggingface_hub import hf_hub_download
-    from mace.calculators import mace_mp
 
     import torch
 
@@ -163,6 +163,28 @@ def make_calc(
         raise ValueError("MPS does not support float64; use float32 or cuda/cpu.")
 
     path = hf_hub_download(repo_id=repo_id, filename=filename)
+    return serialized_load(_construct, path, dtype, device, head)
+
+
+# Loading a MACE model deserialises a torch.fx graph module, and torch.fx's
+# symbolic tracer keeps a process-global patcher that is not thread-safe.
+# Measured 2026-09-05: three MD jobs loaded the model in the same second from
+# the runner's thread pool and one died with "CURRENT_PATCHER is None in
+# finally block". Loads are serialised; each job still gets its own calculator
+# (a calculator holds per-call results, so sharing one across threads is not
+# safe either).
+LOAD_LOCK = threading.Lock()
+
+
+def serialized_load(construct, *args):
+    """Run `construct(*args)` with no other model load in flight."""
+    with LOAD_LOCK:
+        return construct(*args)
+
+
+def _construct(path: str, dtype: str, device: str, head: str):
+    from mace.calculators import mace_mp
+
     return mace_mp(model=path, default_dtype=dtype, device=device, head=head)
 
 
