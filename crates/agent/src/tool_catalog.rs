@@ -252,6 +252,22 @@ pub struct ToolCatalog {
     definitions: Vec<ToolDefinition>,
 }
 
+/// Lower-case words of at least three letters, split on anything that is not
+/// a letter or digit — so `cache_ref` yields `cache` and `mace_get_cached_structure`
+/// yields four tokens rather than one unmatchable string.
+fn tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() > 2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// A prefix match in either direction, but only between words long enough to
+/// mean something: `cache`/`cached` yes, `get`/`getting` no.
+fn prefix_of(a: &str, b: &str) -> bool {
+    a.len() >= 4 && b.len() >= 4 && (a.starts_with(b) || b.starts_with(a))
+}
+
 impl ToolCatalog {
     #[must_use]
     pub fn from_tool_server_json(tools_json: &Value) -> Self {
@@ -380,24 +396,48 @@ impl ToolCatalog {
     #[must_use]
     pub fn search(&self, query: &str, limit: usize) -> Vec<&LoadedTool> {
         let q = query.to_lowercase();
-        let words: Vec<&str> = q.split_whitespace().filter(|w| w.len() > 2).collect();
+        let words = tokens(&q);
         let mut scored: Vec<(usize, &LoadedTool)> = self
             .tools
             .iter()
             .map(|t| {
                 let name = t.name.to_lowercase();
-                let desc = t.description.to_lowercase();
+                let name_toks = tokens(&name);
+                let desc_toks = tokens(&t.description.to_lowercase());
                 let mut score = 0usize;
-                if q.contains(&name) {
+                let mut matched = 0usize;
+                // The query names the tool outright. Only a multi-token name
+                // earns this: `status` is a substring of "job status", and the
+                // +10 that gave it put a bare CLI passthrough above five MACE
+                // tools in a query that began with the word MACE.
+                if name.contains('_') && q.contains(&name) {
                     score += 10;
                 }
                 for w in &words {
-                    if name.contains(w) {
-                        score += 5;
+                    // Best single credit per query word: an exact name token,
+                    // then a prefix of one (`cache` → `cached`), then the
+                    // description. First hit wins so a word is not counted twice.
+                    let credit = if name_toks.iter().any(|t| t == w) {
+                        5
+                    } else if name_toks.iter().any(|t| prefix_of(t, w)) {
+                        3
+                    } else if desc_toks.iter().any(|t| t == w) {
+                        2
+                    } else if desc_toks.iter().any(|t| prefix_of(t, w)) {
+                        1
+                    } else {
+                        0
+                    };
+                    if credit > 0 {
+                        matched += 1;
+                        score += credit;
                     }
-                    if desc.contains(w) {
-                        score += 1;
-                    }
+                }
+                // Breadth beats a lucky single word: three of four query words
+                // matched must outrank one bare name hit, or every tool with
+                // "structure" in its name ties and catalog order decides.
+                if matched > 1 {
+                    score += 4 * (matched - 1);
                 }
                 (score, t)
             })
@@ -1007,6 +1047,56 @@ mod tests {
         assert!(
             !q.contains("Let me know"),
             "only the admitting sentence, not the whole message: {q}"
+        );
+    }
+
+    /// Live 2026-09-06, verbatim query and catalog: the agent asked for MACE
+    /// tools and got `status` — a bare CLI passthrough — in second place,
+    /// above five of them, while `mace_get_cached_structure` came tenth. Two
+    /// causes: words kept their commas (`structure,` matched no name), and the
+    /// "query contains the tool's name" bonus fired for `status` because the
+    /// query ended "job status". Tokens must be punctuation-free, and a
+    /// single generic word must not outrank a family of specific ones.
+    #[test]
+    fn a_mace_query_ranks_the_mace_family_above_a_bare_status_passthrough() {
+        let tool = |name: &str, desc: &str| LoadedTool {
+            name: name.to_string(),
+            description: desc.to_string(),
+            input_schema: json!({ "type": "object" }),
+            requires_approval: false,
+            declared_free: true,
+            permission_mode: PermissionMode::ReadOnly,
+            source: None,
+            source_detail: None,
+        };
+        let mut catalog = ToolCatalog::default();
+        catalog.extend(vec![
+            tool("mace_relax_structure", "Build a supercell from composition + phase and relax it to a local energy minimum using a MACE foundation interatomic potential. Returns a JobHandle; poll with mace_get_job."),
+            tool("status", "Run `prism status ...` through PRISM's Rust CLI. Pass one CLI argument per entry in `args`."),
+            tool("mace_compute_elastic", "Compute the second-order elastic-constant tensor via strain-stress linear fits. Returns a JobHandle resolving to C_ij (Voigt), bulk K, shear G, Young E, Pugh G/B, and Cauchy-pressure indicators."),
+            tool("mace_get_job", "Fetch the current status + result (if ready) of a MACE job by id. Polls the local SQLite job store; if the job is still running, returns the latest progress."),
+            tool("mace_list_jobs", "List MACE jobs in the local job store, filtered by status or tool. Use to recover from session interruptions or to inventory cache hits."),
+            tool("mace_cancel_job", "Cancel a queued or running MACE job. No-op if the job already succeeded / failed. Safe to call multiple times."),
+            tool("mace_md_equilibrate", "Run NVT molecular dynamics on a structure at target temperature to equilibrate thermal motion. Returns a JobHandle. Use this to check dynamic stability or to seed phonon / elastic calcs from a thermally-relaxed configuration."),
+            tool("job_status_lookup", "Inspect a PRISM compute job by UUID without constructing CLI argv manually."),
+            tool("structure", "Build, transform, and inspect atomistic crystal structures (via pyiron / ASE). ONE tool, three actions."),
+            tool("mace_get_cached_structure", "Resolve a cache:// URI returned by a previous MACE primitive into the inline CIF text plus its provenance bundle path. Use this when threading a relaxed structure into a downstream tool (e.g. relax → compute_elastic via cache_ref)."),
+            tool("mace_phonon_harmonic", "Compute the harmonic phonon spectrum via the finite-displacement method. Returns a JobHandle that resolves to F_vib(T) and the count of imaginary modes."),
+        ]);
+        let query = "MACE machine learning interatomic potential relax structure, molecular dynamics \
+                     equilibration at temperature, elastic constants, job status";
+        let top8: Vec<&str> = catalog
+            .search(query, 8)
+            .into_iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert!(
+            !top8.contains(&"status"),
+            "a bare `status` passthrough must not outrank the MACE family: {top8:?}"
+        );
+        assert!(
+            top8.contains(&"mace_get_cached_structure"),
+            "the cached-structure tool belongs inside the family's eight slots: {top8:?}"
         );
     }
 
