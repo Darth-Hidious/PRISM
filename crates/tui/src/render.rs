@@ -493,8 +493,13 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // message it landed in — the thing that makes "explain this line" possible.
     let mut message_lines: Vec<(usize, usize)> = Vec::new();
     // Every rendered transcript row, as (index in `lines`, message index,
-    // the text on it). Lets a click say WHICH line, not just which message.
-    let mut line_rows: Vec<(usize, usize, String)> = Vec::new();
+    // the text on it, its identity). Lets a click say WHICH line, not just
+    // which message.
+    let mut line_rows: Vec<(usize, usize, String, String)> = Vec::new();
+    // Rows carrying text that changes on its own, as (index in `lines`, the
+    // tail that changes) — today only a running tool's age. The identity a
+    // row is FOUND by is stripped of it; the text it is QUOTED by is not.
+    let mut volatile_tails: Vec<(usize, String)> = Vec::new();
     // Reference marks: (index in `lines`, col_start, col_end, id). Screen rows
     // are resolved after the wrapped-row measurement below, the same way
     // figures and the anchor are.
@@ -761,11 +766,16 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     // A running tool names its age here, so a stuck call and a
                     // fast one no longer look identical. Chrome, so it takes
                     // the dim of the progress line, not the reference colour.
+                    //
+                    // The age is drawn but is NOT part of the row's identity:
+                    // the click highlight and the line cursor both find their
+                    // row by the text drawn on it, so a row whose text ticked
+                    // once a second threw the reader's cursor away — on the
+                    // one row this timer exists to keep alive.
                     if let Some(secs) = running_secs {
-                        spans.push(Span::styled(
-                            format!(" · {secs} s"),
-                            Style::default().fg(t.dim),
-                        ));
+                        let age = format!(" · {secs} s");
+                        volatile_tails.push((lines.len(), age.clone()));
+                        spans.push(Span::styled(age, Style::default().fg(t.dim)));
                     }
                     lines.push(Line::from(spans));
                 }
@@ -1061,7 +1071,18 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
             if text.trim().is_empty() {
                 continue;
             }
-            line_rows.push((first + offset, *idx, text));
+            // Two strings per row, because they answer two questions. `text`
+            // is what was on screen — what `e` quotes back, byte for byte.
+            // The identity is what the row is FOUND by, and it must hold
+            // still while the row is on screen, so anything that redraws
+            // itself (a running tool's age) is cut off the end of it.
+            let at = first + offset;
+            let identity = volatile_tails
+                .iter()
+                .find(|(row, _)| *row == at)
+                .and_then(|(_, tail)| text.strip_suffix(tail.as_str()))
+                .map_or_else(|| text.clone(), str::to_string);
+            line_rows.push((at, *idx, text, identity));
         }
     }
 
@@ -1194,13 +1215,13 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // the hit map are both computed from column positions on these same lines,
     // and a one-cell shift would send every hover to the wrong word.
     //
-    // Found by position first, by content when the list has shifted under the
+    // Found by position first, by identity when the list has shifted under the
     // cursor (Ctrl-T inserting reasoning lines above it, for one): the row the
     // reader chose keeps its highlight either way.
     if let Some(selected) = &app.selected_line
-        && let Some((line_index, _, _)) = {
-            let same = |(_, message, text): &&(usize, usize, String)| {
-                *message == selected.message && *text == selected.text
+        && let Some((line_index, ..)) = {
+            let same = |(_, message, _, identity): &&(usize, usize, String, String)| {
+                *message == selected.message && *identity == selected.identity
             };
             line_rows
                 .get(selected.line)
@@ -1221,7 +1242,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         let mut marks = reference_marks.iter().peekable();
         line_rows
             .into_iter()
-            .map(|(line, message, text)| {
+            .map(|(line, message, text, identity)| {
                 while marks.next_if(|(at, ..)| *at < line).is_some() {}
                 let mut refs: Vec<String> = Vec::new();
                 while let Some((_, _, _, id)) = marks.next_if(|(at, ..)| *at == line) {
@@ -1233,6 +1254,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     row: rows_for(line),
                     message,
                     text,
+                    identity,
                     refs,
                 }
             })
@@ -1314,6 +1336,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     line,
                     message: drawn_line.message,
                     text: drawn_line.text.clone(),
+                    identity: drawn_line.identity.clone(),
                 },
             );
         }
@@ -1526,11 +1549,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // While a turn (or a new-session wait) is running the pill carries its
-    // age, in four reserved cells so the fields to its right hold still as the
-    // clock ticks. Idle, the pill is the bare word with no digits.
+    // age. The four cells are `elapsed_mmss`'s own doing — its zero-padded
+    // seconds are never narrower than "0:09" — so the fields to the right of
+    // the pill hold still as the clock ticks. A `{:>4}` here as well would
+    // never once pad, so it is not written: the reservation lives in one
+    // place, where the test can hold it.
     let pill = match app.turn_started {
         Some(started) if app.turn_in_progress => format!(
-            " {} {:>4} ",
+            " {} {} ",
             status,
             elapsed_mmss(std::time::Instant::now().saturating_duration_since(started))
         ),

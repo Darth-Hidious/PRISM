@@ -2224,6 +2224,7 @@ impl App {
                 line,
                 message,
                 text,
+                identity,
             }) => {
                 // Selecting is not asking. The reader picks the line, sees it
                 // marked, and then decides — pressing `e` is the ask. Firing a
@@ -2232,6 +2233,7 @@ impl App {
                     line,
                     message,
                     text: text.clone(),
+                    identity: identity.clone(),
                 });
                 self.focus = Focus::Chat;
                 return;
@@ -2669,6 +2671,7 @@ impl App {
             line: next,
             message: line.message,
             text: line.text,
+            identity: line.identity,
         });
     }
 
@@ -6316,13 +6319,16 @@ impl App {
     /// Where the cursor sits in the renderer's line list.
     ///
     /// By position when the list still agrees with what was selected; by
-    /// content when it has shifted underneath (Ctrl-T inserting reasoning
-    /// lines above the cursor, for one). Either way the next step starts from
+    /// identity when it has shifted underneath (Ctrl-T inserting reasoning
+    /// lines above the cursor, for one). Identity and not the drawn text,
+    /// because a running tool's row redraws its own age every second and the
+    /// cursor must not fall off it. Either way the next step starts from
     /// the line the reader is looking at.
     fn cursor_index(&self, lines: &[DrawnLine]) -> Option<usize> {
         let selected = self.selected_line.as_ref()?;
-        let same =
-            |line: &DrawnLine| line.message == selected.message && line.text == selected.text;
+        let same = |line: &DrawnLine| {
+            line.message == selected.message && line.identity == selected.identity
+        };
         if lines.get(selected.line).is_some_and(same) {
             return Some(selected.line);
         }
@@ -10109,10 +10115,170 @@ mod tests {
         );
     }
 
-    /// Every row of a 140x30 frame joined with newlines.
-    fn frame_text(app: &App) -> String {
+    #[test]
+    fn the_wait_age_keeps_its_cells_on_an_eighty_by_twenty_four_screen() {
+        // The 80x24 half of change 7's proof, and the fixed-cells half with
+        // it. The smallest screen is where a widening timer would push the
+        // last words off the footer, so the tick is measured there.
+        use std::time::{Duration, Instant};
+
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.model = "glm-5.3-flash".to_string();
+        app.turn_in_progress = true;
+        app.is_waiting = false; // the derived word is "working"
+        app.turn_started = Some(Instant::now() - Duration::from_secs(9));
+        let nine = footer_row_at(&app, 80, 24);
+        app.turn_started = Some(Instant::now() - Duration::from_secs(10));
+        let ten = footer_row_at(&app, 80, 24);
+        assert!(nine.contains("working 0:09"), "at 80 columns: {nine:?}");
+        assert!(ten.contains("working 0:10"), "and it advances: {ten:?}");
+        assert_eq!(
+            nine.chars().count(),
+            ten.chars().count(),
+            "the row holds its width across 9s → 10s: {nine:?} vs {ten:?}"
+        );
+        // The four cells are the zero-padded m:ss itself. Asserted as a width
+        // and not as a spelling, so dropping the padding is caught here and
+        // not only by the eye.
+        for row in [&nine, &ten] {
+            let field: String = row
+                .split("working ")
+                .nth(1)
+                .unwrap_or_default()
+                .chars()
+                .take_while(|c| !c.is_whitespace())
+                .collect();
+            assert_eq!(
+                field.chars().count(),
+                4,
+                "the timer field is four cells: {field:?}"
+            );
+        }
+        for row in [&nine, &ten] {
+            assert!(
+                row.trim_end().ends_with("Ctrl-C quit"),
+                "and the last words survive the clock at 80 columns: {row:?}"
+            );
+        }
+
+        // The running tool's age is on the row, whole, at 80 columns too.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.apply_agent_msg(crate::msg::AgentMsg::ToolStart {
+            agent: None,
+            tool_name: "web".into(),
+            verb: "Searching the web".into(),
+            call_id: Some("c1".into()),
+            preview: None,
+            approval_required: Some(false),
+        });
+        *app.running_tools.get_mut("c1").unwrap() = Instant::now() - Duration::from_secs(12);
+        let frame = frame_text_at(&app, 80, 24);
+        assert!(
+            frame.contains("Searching the web · 12 s"),
+            "the running row is not clipped at 80 columns:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn a_ticking_clock_never_drops_the_line_cursor() {
+        // The age drawn on a running tool row changes every second. A row's
+        // identity is the text of the spans DRAWN on it, and the line cursor
+        // and the click highlight both find their row by that text — so the
+        // first tick after a click threw the cursor away, on the one row the
+        // timer exists to make long-lived. The age must be drawn without
+        // joining the identity the cursor is found by.
+        use std::time::{Duration, Instant};
+
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.apply_agent_msg(crate::msg::AgentMsg::ToolStart {
+            agent: None,
+            tool_name: "web".into(),
+            verb: "Searching the web".into(),
+            call_id: Some("c1".into()),
+            preview: None,
+            approval_required: Some(false),
+        });
+        *app.running_tools.get_mut("c1").unwrap() = Instant::now() - Duration::from_secs(12);
+        // A second line under it, so a step from the cursor and a restart
+        // from the edge of the view land on different rows.
+        app.push_message(ChatLine {
+            role: Role::Assistant,
+            text: "the second line".into(),
+            kind: LineKind::Text,
+        });
+
+        // Draw, then click the row that carries the age — the pointer path,
+        // which is what publishes both the hit map and the drawn lines.
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        let mut frame = |app: &App| {
+            terminal.draw(|f| crate::render::draw(f, app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let buf = frame(&app);
+        let row_of = |buf: &ratatui::buffer::Buffer, needle: &str| -> u16 {
+            (0..buf.area.height)
+                .find(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, *y)].symbol().to_string())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("no row carries {needle:?}"))
+        };
+        let running_row = row_of(&buf, "· 12 s");
+        app.pointer_pressed(6, running_row);
+        let lines = app.drawn_lines.borrow().clone();
+        let before = app.cursor_index(&lines);
+        assert!(
+            before.is_some(),
+            "the click puts the cursor on the running row"
+        );
+
+        // One second later the row reads "· 13 s". Everything the reader has
+        // hold of must still be there.
+        *app.running_tools.get_mut("c1").unwrap() = Instant::now() - Duration::from_secs(13);
+        let buf = frame(&app);
+        let lines = app.drawn_lines.borrow().clone();
+        assert_eq!(
+            app.cursor_index(&lines),
+            before,
+            "the cursor stays on its row as the clock ticks"
+        );
+        let running_row = row_of(&buf, "· 13 s");
+        assert_eq!(
+            buf[(6, running_row)].style().bg,
+            Some(app.theme().panel),
+            "and the row keeps the highlight that says the app heard the click"
+        );
+        assert_eq!(
+            app.cursor_refs(),
+            Vec::<String>::new(),
+            "a running tool row carries no references either way"
+        );
+
+        // A step goes to the NEIGHBOUR, not back to the edge of the view.
+        app.move_cursor(1);
+        let lines = app.drawn_lines.borrow().clone();
+        assert_eq!(
+            app.cursor_index(&lines),
+            before.map(|at| at + 1),
+            "and j steps from the cursor, not from the top of the view"
+        );
+    }
+
+    /// Every row of a 140x30 frame joined with newlines.
+    fn frame_text(app: &App) -> String {
+        frame_text_at(app, 140, 30)
+    }
+
+    /// Every row of a `width` x `height` frame joined with newlines.
+    fn frame_text_at(app: &App, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| crate::render::draw(f, app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..buf.area.height)
@@ -10286,8 +10452,13 @@ mod tests {
     /// The last row of a 140x20 frame, content column only (the sidebar's
     /// divider and everything right of it are not the footer).
     fn footer_row(app: &App) -> String {
+        footer_row_at(app, 140, 20)
+    }
+
+    /// The last row of a `width` x `height` frame, content column only.
+    fn footer_row_at(app: &App, width: u16, height: u16) -> String {
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 20)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| crate::render::draw(f, app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let row: String = (0..buf.area.width)
@@ -12973,7 +13144,7 @@ pub struct RefProvenance {
 /// The transcript line under the cursor.
 ///
 /// A click sets it from the hit map; j/k set it from `App::drawn_lines`. Both
-/// record the same three things, so pointing and stepping cannot disagree
+/// record the same four things, so pointing and stepping cannot disagree
 /// about what is selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedLine {
@@ -12985,6 +13156,11 @@ pub struct SelectedLine {
     pub message: usize,
     /// The text as DRAWN, byte for byte. This is what `e` quotes.
     pub text: String,
+    /// The same text with anything that redraws itself cut off — a running
+    /// tool's age. This is what the row is FOUND by when the list has shifted
+    /// or the row has repainted, so a clock ticking on the chosen row does not
+    /// take the cursor with it.
+    pub identity: String,
 }
 
 /// One non-blank transcript line as the renderer drew it last frame.
@@ -12997,6 +13173,9 @@ pub struct DrawnLine {
     pub message: usize,
     /// The text on it, as drawn.
     pub text: String,
+    /// The text on it with anything that redraws itself cut off — a running
+    /// tool's age. What the cursor and the highlight match on.
+    pub identity: String,
     /// The references marked on it, left to right, each once. What Enter
     /// opens and Tab cycles.
     pub refs: Vec<String>,

@@ -31,10 +31,16 @@ pub enum HitTarget {
     ///
     /// `line` is the row's position in the list the renderer publishes as
     /// `App::drawn_lines`, so a click and a j/k step select the same thing.
+    ///
+    /// `identity` is that same drawn text with anything that redraws itself
+    /// cut off — a running tool's age. It is what the row is later FOUND by,
+    /// so a clock ticking on the row does not lose the reader's place; `text`
+    /// stays exactly what was on screen, because that is what gets quoted.
     TranscriptLine {
         line: usize,
         message: usize,
         text: String,
+        identity: String,
     },
     /// A message in the transcript, by its index in `App::messages`.
     TranscriptMessage { index: usize },
