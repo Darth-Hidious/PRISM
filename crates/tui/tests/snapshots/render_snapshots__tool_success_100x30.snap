@@ -6,8 +6,8 @@ expression: rendered
 · PRISM ready                                                      │ [Act] Sto Too Fil Obj Str Art
                                                                    │ 1 tools · 1 ✓
 ❯ You                                                              │
-▌ sample alloy                                                     │  1. prompt "sample alloy" •
-                                                                   │  2. tool sample_material ✓
+▌ sample alloy                                                     │  1. • prompt "sample alloy"
+                                                                   │  2. ✓ tool sample_material
   ⚙ Running sample_material — {"n": 10}                            │      W0.3 Mo0.2 Ta0.3 Nb0.2
   ✓ [YELLOW screening] sample_material: W0.3 Mo0.2 Ta0.3 Nb0.2     │
     SOURCE NOT REPORTED BY sample_material                         │

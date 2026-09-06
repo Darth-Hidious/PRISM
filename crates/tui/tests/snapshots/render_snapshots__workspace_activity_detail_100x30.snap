@@ -6,8 +6,8 @@ expression: rendered
 ┌────────────────────────────────────────────────────────────────┐ │ [Act] Sto Too Fil Obj Str Art
 │ Activity — 2. tool                                             │ │ 1 tools · 1 ✓
 │                                                                │ │
-│{                                                               │ │  1. prompt "sample alloy" •
-│  "content": "W0.3 Mo0.2 Ta0.3 Nb0.2",                          │ │▸ 2. tool sample_material ✓
+│{                                                               │ │  1. • prompt "sample alloy"
+│  "content": "W0.3 Mo0.2 Ta0.3 Nb0.2",                          │ │▸ 2. ✓ tool sample_material
 │  "elapsed_ms": 292,                                            │ │      W0.3 Mo0.2 Ta0.3 Nb0.2
 │  "event": "tool_result",                                       │ │
 │  "evidence_class": "screening",                                │ │

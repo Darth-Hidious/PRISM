@@ -6,8 +6,8 @@ expression: rendered
 · PRISM ready                                                      │ [Act] Sto Too Fil Obj Str Art
                                                                    │ 1 tools · 1 ✓
 ❯ You                                                              │
-▌ Look up MgB2                                                     │  1. prompt "Look up MgB2" •
-                                                                   │  2. tool hea_descriptors ✓
+▌ Look up MgB2                                                     │  1. • prompt "Look up MgB2"
+                                                                   │  2. ✓ tool hea_descriptors
   ✓ [YELLOW screening] hea_descriptors: CoCrFeMnNi:                │      CoCrFeMnNi: solid_solutio…
 solid_solution, VEC=8.0                                            │
     SOURCE   KIND OF… FOUND EVIDENCE           FETCHED             │

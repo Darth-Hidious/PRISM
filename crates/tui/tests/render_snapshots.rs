@@ -1531,6 +1531,170 @@ fn snapshot_workspace_objects_empty_100x30() {
     insta::assert_snapshot!("workspace_objects_empty_100x30", rendered);
 }
 
+/// The sidebar column of every rendered row, leading spaces kept.
+///
+/// `sidebar_text` above trims and joins, which is right for asking whether a
+/// phrase is present and wrong for asking which column it starts in. A row
+/// test needs the cells as drawn.
+fn sidebar_rows(rendered: &str) -> Vec<String> {
+    rendered
+        .lines()
+        .filter_map(|line| line.rsplit('│').next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every Objects row leads with its state, in the same column, and no row
+/// wraps.
+///
+/// The row was `▸ {glyph} {kind:<6} {label}{★} {status}`: the state word came
+/// last, behind a label of variable width, so a reader scanning "what
+/// failed?" read a ragged right edge instead of a column. And the label
+/// budget (`w - 12`) did not count the star or the trailing state, so rows
+/// ran past the pane and wrapped — in the committed 100x30 snapshot "50%" and
+/// "FAILED" each sat alone on the next line, a state word orphaned from the
+/// object it describes.
+#[test]
+fn objects_rows_lead_with_state_and_never_wrap() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-1".into(),
+        kind: "structure".into(),
+        label: "W-BCC a=3.14A".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-2".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K 10000 steps".into(),
+        status: "running".into(),
+        progress_current: Some(5000),
+        progress_total: Some(10000),
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-3".into(),
+        kind: "alloy".into(),
+        label: "CrMnFeCoNi HEA".into(),
+        status: "failed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    // A status this build does not know, from a newer backend.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-4".into(),
+        kind: "campaign".into(),
+        label: "Queued screen".into(),
+        status: "queued".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    // The star is a suffix the old budget forgot; keep one on screen.
+    app.objects[2].tagged = true;
+    freeze_metrics(&mut app);
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.workspace_selected = 1;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    let rows = sidebar_rows(&rendered);
+    let first = rows
+        .iter()
+        .position(|r| r.contains("W-BCC"))
+        .unwrap_or_else(|| panic!("no Objects row rendered:\n{rendered}"));
+
+    let expected = [
+        ("done", "W-BCC"),
+        ("50%", "MD NPT"),
+        ("FAILED", "CrMnFeCoNi"),
+        ("?", "Queued screen"),
+    ];
+    let mut label_column: Option<usize> = None;
+    for (i, (state, label)) in expected.iter().enumerate() {
+        let row = &rows[first + i];
+        let cells: Vec<char> = row.chars().collect();
+        let prefix: String = cells.iter().take(2).collect();
+        assert!(
+            prefix == "▸ " || prefix == "  ",
+            "row {i} must open with the two-cell selection prefix: {row:?}"
+        );
+        let after_prefix: String = cells.iter().skip(2).collect();
+        assert!(
+            after_prefix.starts_with(state),
+            "the state word must start at column 2 of every row, so states \
+             read as a column: expected {state:?} at column 2 of {row:?}"
+        );
+        assert!(
+            row.contains(label),
+            "the state and its object must share one row — {label:?} wrapped \
+             away from {state:?}:\n{rendered}"
+        );
+        // The state is padded, so the glyph after it lands in one column on
+        // every row whatever the state word's width.
+        let glyph_at = 2 + 7 + 1;
+        match label_column {
+            None => label_column = Some(glyph_at),
+            Some(c) => assert_eq!(c, glyph_at),
+        }
+        assert!(
+            cells.get(glyph_at).is_some_and(|c| !c.is_whitespace()),
+            "the kind glyph must sit at column {glyph_at} on every row: {row:?}"
+        );
+    }
+    assert!(
+        rows[first + expected.len()].trim().is_empty(),
+        "four objects use four rows and nothing wrapped onto a fifth:\n{rendered}"
+    );
+}
+
+/// Activity rows put the outcome before the label for the same reason.
+///
+/// The glyph used to trail a clipped label, so whether a step succeeded was
+/// the one thing whose position moved with the length of its name.
+#[test]
+fn activity_rows_lead_with_their_outcome() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    app.push_user("sample alloy");
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "sample_material".into(),
+        content: "W0.3 Mo0.2 Ta0.3 Nb0.2".into(),
+        card_type: "result".into(),
+        elapsed_ms: Some(292),
+        call_id: Some("c1".into()),
+        provenance_id: None,
+        data: None,
+        agent: None,
+    });
+    freeze_metrics(&mut app);
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Activity;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    let rows = sidebar_rows(&rendered);
+    let row = rows
+        .iter()
+        .find(|r| r.contains("sample_material"))
+        .unwrap_or_else(|| panic!("no Activity row rendered:\n{rendered}"));
+    let glyph = row
+        .find('✓')
+        .unwrap_or_else(|| panic!("the tool row must carry its outcome: {row:?}"));
+    let label = row
+        .find("sample_material")
+        .expect("the tool row must carry its name");
+    assert!(
+        glyph < label,
+        "the outcome glyph must precede the variable-width label: {row:?}"
+    );
+}
+
 /// Snapshot: artifact metadata keeps KG promotion visible at a glance while
 /// also showing tool, summary, record count, size, and age.
 #[test]

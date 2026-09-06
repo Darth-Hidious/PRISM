@@ -6,8 +6,8 @@ expression: rendered
 · PRISM ready                                                      │ [Act] Sto Too Fil Obj Str Art
                                                                    │ 1 tools · 1 ✓
 ❯ You                                                              │
-▌ Look up MgB2                                                     │  1. prompt "Look up MgB2" •
-                                                                   │  2. tool execute_python ✓
+▌ Look up MgB2                                                     │  1. • prompt "Look up MgB2"
+                                                                   │  2. ✓ tool execute_python
   ✓ [unclassified] execute_python: stdout: 42                      │      stdout: 42
     SOURCE NOT REPORTED BY execute_python                          │
                                                                    │

@@ -5,12 +5,12 @@ expression: rendered
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
 · PRISM ready                                                      │ Act Sto Too Fil [Obj] Str Art
                                                                    │
-                                                                   │  ◇ Structure W-BCC a=3.14A done
-                                                                   │▸ ▶ Simulation MD NPT 300K 10000
-                                                                   │s… 50%
-                                                                   │  ⬡ Alloy  CrMnFeCoNi HEA ★ done
-                                                                   │  ▶ Simulation MD NVT 500K
-                                                                   │FAILED
+                                                                   │  done    ◇ W-BCC a=3.14A
+                                                                   │▸ 50%     ▶ MD NPT 300K 10000 s…
+                                                                   │  done    ⬡ CrMnFeCoNi HEA ★
+                                                                   │  FAILED  ▶ MD NVT 500K
+                                                                   │
+                                                                   │
                                                                    │
                                                                    │
                                                                    │

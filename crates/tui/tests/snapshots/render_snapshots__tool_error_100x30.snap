@@ -6,7 +6,7 @@ expression: rendered
 · PRISM ready                                                      │ [Act] Sto Too Fil Obj Str Art
                                                                    │ 1 tools
 ❯ You                                                              │
-▌ submit job                                                       │  1. prompt "submit job" •
+▌ submit job                                                       │  1. • prompt "submit job"
                                                                    │
   ⚙ Running compute_submit                                         │
   ✗ [RED indeterminate] compute_submit: Error: budget exceeded     │

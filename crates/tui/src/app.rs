@@ -9134,13 +9134,29 @@ mod tests {
         app.workspace_tab = WorkspaceTab::Activity;
         let entries = app.derive_activity().len();
         assert!(entries >= 12, "{entries} activity entries");
-        app.workspace_area
-            .set(Some(ratatui::layout::Rect::new(80, 0, 40, 30)));
-        app.mouse_scroll_at(90, 10, 3);
-        app.mouse_scroll_at(90, 10, 3);
+        // The rect is not injected: a frame must publish it. The old test
+        // handed itself the rect and passed while the renderer never wrote
+        // one, so `over_workspace` was false for every real notch.
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|f| crate::render::draw(f, &app))
+            .expect("draw");
+        let area = app
+            .workspace_area
+            .get()
+            .expect("the frame must publish where it drew the sidebar");
+        let (col, row) = (area.x + area.width / 2, area.y + area.height / 2);
+        let scroll_before = app.scroll_offset;
+        app.mouse_scroll_at(col, row, 3);
+        app.mouse_scroll_at(col, row, 3);
         assert_eq!(app.workspace_selected, 2, "two notches down = two entries");
         assert_eq!(app.focus, Focus::Workspace);
-        app.mouse_scroll_at(90, 10, -3);
+        assert_eq!(
+            app.scroll_offset, scroll_before,
+            "a notch over the sidebar leaves the transcript where it was"
+        );
+        app.mouse_scroll_at(col, row, -3);
         assert_eq!(app.workspace_selected, 1);
         app.mouse_scroll_at(10, 10, 3);
         assert_eq!(
@@ -9148,7 +9164,7 @@ mod tests {
             "a notch over the transcript leaves the workspace alone"
         );
         for _ in 0..80 {
-            app.mouse_scroll_at(90, 10, 3);
+            app.mouse_scroll_at(col, row, 3);
         }
         assert_eq!(
             app.workspace_selected,

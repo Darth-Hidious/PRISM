@@ -6,8 +6,8 @@ expression: rendered
 · PRISM ready                                                      │ [Act] Sto Too Fil Obj Str Art
                                                                    │ 1 tools · 1 ✓
 ❯ You                                                              │
-▌ run compute                                                      │  1. prompt "run compute" •
-                                                                   │  2. tool compute_submit ✓
+▌ run compute                                                      │  1. • prompt "run compute"
+                                                                   │  2. ✓ tool compute_submit
 · compute_submit: Allow compute_submit?                            │      Job submitted (auto-appro…
                                                                    │
 · [allow-all compute_submit]                                       │

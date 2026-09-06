@@ -219,6 +219,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     app.sidebar_visible.set(layout.sidebar.is_some());
     if let Some(sidebar) = layout.sidebar {
         draw_workspace(f, app, sidebar, WorkspaceSurface::Sidebar);
+    } else {
+        // No sidebar this frame, so no rect for the wheel to land on. Cleared
+        // rather than left stale from the last wide frame. The narrow overlay
+        // below writes its own rect when it draws; the wheel still falls
+        // through to the transcript there, because `mouse_scroll_at` stands
+        // down while any overlay is open.
+        app.workspace_area.set(None);
     }
 
     // Overlays: approval popup (safety-critical) > command palette >
@@ -2002,6 +2009,11 @@ enum WorkspaceSurface {
 
 fn draw_workspace(f: &mut Frame, app: &App, area: Rect, surface: WorkspaceSurface) {
     let t = app.theme();
+    // Where the wheel finds the workspace. Published before any early return,
+    // so the rect is always this frame's and never last frame's. Without it
+    // `over_workspace` was false for every notch and a wheel over the
+    // Structures list scrolled the transcript behind it.
+    app.workspace_area.set(Some(area));
     // Panel — opencode `backgroundPanel`, left-bordered beside the transcript.
     let block = match surface {
         WorkspaceSurface::Sidebar => Block::default()
@@ -2739,16 +2751,18 @@ fn build_activity_lines(
             _ => status_glyph(ToolStatus::Ok, t),
         };
         let n = i + 1;
-        let lead = format!("{prefix}{n}. {} ", it.kind);
-        let budget = w.saturating_sub(lead.width() + 2).max(3);
+        // Outcome before the label, as the Objects rows do: the glyph used to
+        // trail a clipped label, so whether a step succeeded was the one
+        // thing whose column moved with the length of its name.
+        let lead = format!("{prefix}{n}. {glyph} {} ", it.kind);
+        let budget = w.saturating_sub(lead.width()).max(3);
         let label = clip(&it.label, budget);
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(t.accent)),
             Span::styled(format!("{n}. "), Style::default().fg(t.muted)),
+            Span::styled(format!("{glyph} "), Style::default().fg(gcolor)),
             Span::styled(format!("{} ", it.kind), Style::default().fg(t.muted)),
             Span::styled(label, Style::default().fg(t.text)),
-            Span::raw(" "),
-            Span::styled(glyph.to_string(), Style::default().fg(gcolor)),
         ]));
         // What the tool FOUND, on its own dimmed line: the sidebar is too
         // narrow to carry a name and a result side by side, and a result
@@ -2914,21 +2928,27 @@ fn build_objects_lines(
             ObjectStatus::Unknown => ("?".to_string(), t.warn),
         };
         let tag_marker = if obj.tagged { " ★" } else { "" };
-        let label_budget = w.saturating_sub(12).max(3);
+        // State first, padded to the widest routine word (`running`), so the
+        // glyph and the label start in the same column on every row and a
+        // reader scanning for FAILED reads a column instead of a ragged right
+        // edge. It was last, behind a variable-width label, and the label
+        // budget did not count the star or the state, so rows overran the
+        // pane and wrapped — "50%" and "FAILED" landed alone on the next
+        // line, a state word orphaned from the object it describes. The star
+        // stays last: it is selection, not state.
+        const STATE_CELLS: usize = 7;
+        let lead_cells = prefix.width() + STATE_CELLS + 1 + glyph.width() + 1;
+        let label_budget = w.saturating_sub(lead_cells + tag_marker.width()).max(3);
         let label = clip(&obj.label, label_budget);
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(t.accent)),
-            Span::styled(format!("{glyph} "), Style::default().fg(t.dim)),
             Span::styled(
-                // Unknown kinds can be wide Unicode. Preserve the existing
-                // ten-column cap, then pad short names in display columns.
-                format!("{} ", pad_right_display(&clip(obj.kind.as_str(), 10), 6)),
-                Style::default().fg(t.muted),
+                format!("{status_str:<STATE_CELLS$} "),
+                Style::default().fg(status_color),
             ),
+            Span::styled(format!("{glyph} "), Style::default().fg(t.dim)),
             Span::styled(label, Style::default().fg(t.text)),
             Span::styled(tag_marker.to_string(), Style::default().fg(t.warn)),
-            Span::raw(" "),
-            Span::styled(status_str, Style::default().fg(status_color)),
         ]));
         // Inline expanded detail for the focused row.
         if focused && app.workspace_expanded {
@@ -7214,12 +7234,14 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
+        // The outcome glyph sits between the ordinal and the kind word since
+        // Activity rows lead with their state.
         assert!(
-            text.contains("36. tool"),
+            text.contains("36. ✓ tool"),
             "the selected entry (36.) is on screen:\n{text}"
         );
         assert!(
-            !text.contains(" 1. tool"),
+            !text.contains(" 1. ✓ tool"),
             "the top of the list scrolled away:\n{text}"
         );
         assert!(text.contains("Workspace"), "the header stayed:\n{text}");
