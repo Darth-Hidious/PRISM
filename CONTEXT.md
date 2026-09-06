@@ -19,7 +19,6 @@
 - Protected, never commit: holmquist2019_whiterose.txt, schellenberger2018_diva.txt, ontology-pfas-alternatives-candidate.ttl, pfas_alternatives_evidence_log*.md.
 
 ## Boundary conditions (owner, 2026-09-06)
-- 90 K -> 1000 K in milliseconds, no quantifiable phase change => FCC matrix only; BCC refractory HEAs are OUT (ductile-brittle transition above 90 K).
-- Built by additive manufacturing => Al+Ti drives strain-age cracking: <=6 at% prints, 8 borderline, >=12 is a process programme.
-- ~700 bar oxygen. Beat Monel K-500 (oxygen) and SX500 (strength/temperature).
-- Under these: H4 Al4Ti2Co24Cr24Fe23Ni23 is the lead (only alloy that stays mixed AND prints); O1-Fe0 second; the 15 at% Al alloys and all refractory HEAs are out.
+HARD: no Ti and no Fe on the oxidiser side (metal fuel in O2); FCC matrix only (90 K->1000 K in ms, BCC refractory OUT on DBTT); no phase change across the range; ~700 bar O2; beat Monel K-500 (oxygen) and SX500 (strength).
+NOT hard: printability. SX500 is PRINTED, not cast — high Al+Ti is a process-development risk, not an elimination.
+Standing: O1-Fe0 and O2-TF-Fe0 lead (Fe-free, Ti-free, FCC); both order in MC. H4 is DISQUALIFIED on the oxidiser side (Fe 23, Ti 2) — an earlier ranking of mine wrongly led with it. CoCrNi-type medium-entropy alloys unscreened and worth a look: Fe-free, Ti-free, FCC, single solid solution, tough at cryogenic temperature.
