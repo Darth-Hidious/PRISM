@@ -628,6 +628,21 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                 // eye on the result instead of the noise.
                 let render_body_as_markdown =
                     matches!(kind, LineKind::ToolResult { success: true, .. });
+                // A ToolStart whose result has not landed is still running:
+                // its start Instant is held in `running_tools` under its
+                // call_id, so the head line can name how long it has run. The
+                // result arm removes the entry, so a finished tool's start row
+                // shows no stale clock and the result carries the final ms.
+                let running_secs = match kind {
+                    LineKind::ToolStart {
+                        call_id: Some(cid), ..
+                    } => app.running_tools.get(cid).map(|start| {
+                        std::time::Instant::now()
+                            .saturating_duration_since(*start)
+                            .as_secs()
+                    }),
+                    _ => None,
+                };
                 let mut body = msg.text.lines();
                 if let Some(line_text) = body.next() {
                     let mut spans = vec![Span::raw("  ")];
@@ -742,6 +757,15 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                         } else {
                             spans.push(Span::styled(remainder, style));
                         }
+                    }
+                    // A running tool names its age here, so a stuck call and a
+                    // fast one no longer look identical. Chrome, so it takes
+                    // the dim of the progress line, not the reference colour.
+                    if let Some(secs) = running_secs {
+                        spans.push(Span::styled(
+                            format!(" · {secs} s"),
+                            Style::default().fg(t.dim),
+                        ));
                     }
                     lines.push(Line::from(spans));
                 }
@@ -945,14 +969,26 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         } else {
             " waiting for response…"
         };
-        lines.push(Line::from(vec![
+        let mut spinner_spans = vec![
             Span::styled("◆ ", Style::default().fg(t.accent)),
             Span::styled(
                 spinner,
                 Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(wait, Style::default().fg(t.system)),
-        ]));
+        ];
+        // The bare "waiting for response…" said nothing about how long the
+        // wait had lasted; it now carries the turn's age.
+        if let Some(started) = app.turn_started {
+            spinner_spans.push(Span::styled(
+                format!(
+                    " {}",
+                    elapsed_mmss(std::time::Instant::now().saturating_duration_since(started))
+                ),
+                Style::default().fg(t.system),
+            ));
+        }
+        lines.push(Line::from(spinner_spans));
     } else if app.is_waiting {
         // Streaming — show pulse
         let pulse = if app.stop_requested {
@@ -1454,6 +1490,14 @@ fn draw_activity_strip(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Footer — live status + hints (opencode bottom bar), replacing the old status bar.
+/// A wait's age as "M:SS" (and "MM:SS" past ten minutes), for the footer pill
+/// and the pre-token spinner. Four cells until 10:00, so nothing to its right
+/// reflows as the seconds tick over.
+fn elapsed_mmss(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let model_display = if app.model.is_empty() {
@@ -1481,12 +1525,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Focus::Approval => " [APPROVAL] ",
     };
 
+    // While a turn (or a new-session wait) is running the pill carries its
+    // age, in four reserved cells so the fields to its right hold still as the
+    // clock ticks. Idle, the pill is the bare word with no digits.
+    let pill = match app.turn_started {
+        Some(started) if app.turn_in_progress => format!(
+            " {} {:>4} ",
+            status,
+            elapsed_mmss(std::time::Instant::now().saturating_duration_since(started))
+        ),
+        _ => format!(" {} ", status),
+    };
     let mut spans = vec![
         Span::styled(" ", Style::default()),
-        Span::styled(
-            format!(" {} ", status),
-            Style::default().fg(t.status_fg).bg(t.status_bg),
-        ),
+        Span::styled(pill, Style::default().fg(t.status_fg).bg(t.status_bg)),
         Span::raw(" "),
         Span::styled("model:", Style::default().fg(t.system)),
         Span::raw(" "),

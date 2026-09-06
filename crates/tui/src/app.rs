@@ -48,6 +48,10 @@ pub enum LineKind {
         /// Which DELEGATED agent started the call. `None` is the parent's
         /// own work and renders exactly as it always did — unnamed.
         agent: Option<String>,
+        /// The backend call id. The running row reads its age from
+        /// `App::running_tools` under this key until the result lands, so a
+        /// stuck tool and a fast one no longer look alike.
+        call_id: Option<String>,
     },
     ToolResult {
         tool_name: String,
@@ -882,6 +886,16 @@ pub struct App {
     /// True from dispatch until the authoritative `ui.turn.complete` event.
     /// Unlike `is_waiting`, streaming deltas do not clear this lifecycle bit.
     pub(crate) turn_in_progress: bool,
+    /// When the current turn (or new-session wait) began. `Some` for the whole
+    /// of `turn_in_progress`, cleared in `complete_turn`. The footer pill and
+    /// the pre-token spinner read the turn's age from it, repainted on the
+    /// existing 100 ms tick — the footer once read "Ready" for fourteen hours
+    /// and a stuck backend looked no different from a slow one.
+    pub(crate) turn_started: Option<std::time::Instant>,
+    /// Start Instant per running tool call, keyed by `call_id`. A `ToolStart`
+    /// inserts; the matching `ToolCard` removes; `complete_turn` clears any
+    /// left open. The running `ToolStart` row shows "· N s" from it.
+    pub(crate) running_tools: std::collections::HashMap<String, std::time::Instant>,
     /// Messages sent while a turn was running, oldest first. Held HERE, not
     /// on the backend: the backend parks a mid-turn message silently and
     /// answers `ok`, so the transcript used to show it as sent while it was
@@ -1231,6 +1245,8 @@ impl App {
             turn_cost: 0.0,
             is_waiting: false,
             turn_in_progress: false,
+            turn_started: None,
+            running_tools: std::collections::HashMap::new(),
             queued_messages: Vec::new(),
             stop_requested: false,
             approval_pending: None,
@@ -4672,6 +4688,8 @@ impl App {
         self.focus = Focus::Input;
         self.is_waiting = true;
         self.turn_in_progress = true;
+        // The new-session wait is a wait like any other, so it shows its age.
+        self.turn_started = Some(std::time::Instant::now());
         self.status_text = "Starting new session…".to_string();
         self.push_system("[new session]");
         self.toast("starting new session", ToastKind::Info);
@@ -6468,6 +6486,7 @@ impl App {
         }
         self.is_waiting = true;
         self.turn_in_progress = true;
+        self.turn_started = Some(std::time::Instant::now());
         self.is_thinking = true;
         self.status_text = "Thinking…".to_string();
         self.auto_scroll = true;
@@ -6492,6 +6511,9 @@ impl App {
         self.clear_thinking_pulse();
         self.is_waiting = false;
         self.turn_in_progress = false;
+        // The turn ended, so its clock stops and no tool is still aging.
+        self.turn_started = None;
+        self.running_tools.clear();
         self.stop_requested = false;
         self.status_text = "Ready".to_string();
         // Turn boundary — cheap-poll the credit balance next frame.
@@ -7105,12 +7127,13 @@ impl App {
             AgentMsg::ToolStart {
                 tool_name,
                 verb,
+                call_id,
                 agent,
                 preview,
                 ..
             } => {
                 self.clear_thinking_pulse();
-                // `..` ignores call_id and approval_required.
+                // `..` ignores approval_required.
                 // Sanitize tool_name and verb before formatting —
                 // both come from the backend and could contain
                 // control sequences.
@@ -7146,6 +7169,13 @@ impl App {
                         text.push_str(preview);
                     }
                 }
+                // Remember when this call began, so the running row can show
+                // its age until the result lands. Cleared in the ToolCard arm
+                // and, for anything still open, in `complete_turn`.
+                if let Some(cid) = call_id.as_deref().filter(|c| !c.is_empty()) {
+                    self.running_tools
+                        .insert(cid.to_string(), std::time::Instant::now());
+                }
                 self.push_message(ChatLine {
                     role: Role::Tool,
                     text,
@@ -7153,6 +7183,7 @@ impl App {
                         tool_name: clean_name,
                         elapsed_ms: None,
                         agent: clean_agent,
+                        call_id,
                     },
                 });
                 self.is_waiting = false;
@@ -7167,6 +7198,10 @@ impl App {
                 call_id,
                 ..
             } => {
+                // This call finished, so its running row stops aging.
+                if let Some(cid) = call_id.as_deref().filter(|c| !c.is_empty()) {
+                    self.running_tools.remove(cid);
+                }
                 // Every result card receives an explicit class token. The
                 // backend may supply either PRISM evidence_class or RHEA-JAX
                 // claim_status; missing, unknown, and failed results are RED.
@@ -7817,6 +7852,7 @@ fn chatline_detail_json(m: &ChatLine) -> Value {
             tool_name,
             elapsed_ms,
             agent,
+            ..
         } => {
             v["event"] = "tool_start".into();
             v["tool_name"] = tool_name.clone().into();
@@ -9999,6 +10035,77 @@ mod tests {
         assert!(
             footer.trim_end().ends_with("Ctrl-C quit"),
             "the last words survive an approval too: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn every_wait_shows_its_age() {
+        // Finding 14: nothing carried elapsed time, so a stuck backend and a
+        // slow search read identically — the footer once said "Ready" for
+        // fourteen hours. The pill, the running tool row and the pre-token
+        // spinner now each show the wait's age, and the m:ss keeps a fixed
+        // width so nothing to its right reflows as the clock ticks.
+        use std::time::{Duration, Instant};
+
+        // The pill carries the turn's age, and it keeps its width from 9s to
+        // 10s (both "0:09" and "0:10" are four cells).
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.model = "glm-5.3-flash".to_string();
+        app.turn_in_progress = true;
+        app.is_waiting = false; // the derived word is "working"
+        app.turn_started = Some(Instant::now() - Duration::from_secs(9));
+        let footer_9 = footer_row(&app);
+        let pill_9 = footer_9
+            .split("model:")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        app.turn_started = Some(Instant::now() - Duration::from_secs(10));
+        let footer_10 = footer_row(&app);
+        let pill_10 = footer_10
+            .split("model:")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            pill_9.contains("0:09"),
+            "the pill shows the turn's age: {pill_9:?}"
+        );
+        assert!(pill_10.contains("0:10"), "and it advances: {pill_10:?}");
+        assert_eq!(
+            pill_9.chars().count(),
+            pill_10.chars().count(),
+            "the m:ss keeps its width as the clock ticks 9s → 10s: {pill_9:?} vs {pill_10:?}"
+        );
+
+        // An idle pill carries no timer at all.
+        let mut idle = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        idle.home.open = false;
+        let idle_footer = footer_row(&idle);
+        let idle_pill = idle_footer.split("model:").next().unwrap_or_default();
+        assert!(
+            !idle_pill.chars().any(|c| c.is_ascii_digit()),
+            "an idle pill has no digits: {idle_pill:?}"
+        );
+
+        // A running tool row names how long it has run.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.apply_agent_msg(crate::msg::AgentMsg::ToolStart {
+            agent: None,
+            tool_name: "web".into(),
+            verb: "Searching the web".into(),
+            call_id: Some("c1".into()),
+            preview: None,
+            approval_required: Some(false),
+        });
+        // Backdate the recorded start so the row reads a definite age.
+        *app.running_tools.get_mut("c1").unwrap() = Instant::now() - Duration::from_secs(12);
+        assert!(
+            frame_text(&app).contains("· 12 s"),
+            "a running tool shows its age:\n{}",
+            frame_text(&app)
         );
     }
 
