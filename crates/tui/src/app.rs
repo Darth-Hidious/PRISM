@@ -1024,9 +1024,10 @@ pub struct App {
     pub view_scroll: std::cell::Cell<u16>,
     /// Whether the renderer drew the Workspace sidebar last frame.
     ///
-    /// It is dropped entirely below a width threshold, and focus has no way to
-    /// know that on its own. Recorded here so key routing can refuse to send
-    /// input to a pane nobody can see.
+    /// It is dropped entirely below a width threshold, where Workspace focus
+    /// draws the Workspace over the transcript instead, and focus has no way
+    /// to know that on its own. Recorded here so the wheel can tell that the
+    /// transcript is covered (see [`App::workspace_overlay_open`]).
     pub sidebar_visible: std::cell::Cell<bool>,
     /// Words in the transcript that are backed by something openable.
     ///
@@ -1588,7 +1589,9 @@ impl App {
             return;
         }
 
-        // Tab cycles focus: Input → Workspace → Chat → Input
+        // Tab cycles focus: Input → Workspace → Chat → Input. Under 100
+        // columns the Workspace stop is the overlay (see render.rs), so the
+        // same key reaches it at every width.
         if key.code == KeyCode::Tab {
             self.focus = match self.focus {
                 Focus::Input => Focus::Workspace,
@@ -1624,18 +1627,14 @@ impl App {
             return;
         }
 
-        // Below the sidebar's width threshold the Workspace pane is not drawn
-        // at all. Focus does not follow it, so a reader who was in the sidebar
-        // and then narrowed the terminal kept a focus on something invisible:
-        // arrows did nothing, and typed characters were SILENTLY DROPPED
-        // because `handle_workspace_key` has no printable-character fallback.
-        // Measured live in tmux at 90x30 — three keystrokes vanished with the
-        // footer still reading [WORKSPACE]. Send input where the reader can
-        // actually see it.
-        if self.focus == Focus::Workspace && !self.sidebar_visible.get() {
-            self.focus = Focus::Input;
-        }
-
+        // Below the sidebar's width threshold the Workspace is drawn over the
+        // transcript instead (render.rs, the narrow layout) whenever focus is
+        // here, so Workspace focus never points at something invisible. It
+        // used to: the sidebar was dropped and nothing replaced it, so a
+        // reader who narrowed the terminal kept a focus on nothing — measured
+        // live in tmux at 90x30, three keystrokes vanished with the footer
+        // still reading [WORKSPACE]. The overlay is the surface those keys
+        // now act on; Esc and `i` return to the prompt.
         match self.focus {
             Focus::Input => self.handle_input_key(key),
             Focus::Chat => self.handle_chat_key(key),
@@ -2219,6 +2218,15 @@ impl App {
             || self.apikey_window.open
             || self.home.open
             || self.modal.is_some()
+            || self.workspace_overlay_open()
+    }
+
+    /// True when the Workspace is drawn over the transcript rather than beside
+    /// it: the terminal is narrower than the sidebar threshold and focus is on
+    /// the Workspace (Tab, or a `workspace.*` palette row). Mirrors the
+    /// narrow-layout arm in `render::draw`.
+    pub fn workspace_overlay_open(&self) -> bool {
+        self.focus == Focus::Workspace && !self.sidebar_visible.get()
     }
 
     /// Route a mouse-wheel delta to the scrollable surface that is active:

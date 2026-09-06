@@ -2699,8 +2699,13 @@ fn clicking_a_tab_label_switches_to_that_tab() {
 ///
 /// Measured live in tmux at 90x30 while driving the real binary: the footer
 /// read `[WORKSPACE]`, two Downs did nothing, and `xyz` vanished with the
-/// prompt still empty. A real render is required — `sidebar_visible` is
-/// recorded by the renderer, so nothing about this reproduces without drawing.
+/// prompt still empty. The first fix handed focus back to the prompt. The
+/// narrow layout makes that unnecessary: under 100 columns Workspace focus
+/// draws the Workspace over the transcript, so whenever the footer reads
+/// `[WORKSPACE]` the Workspace is what the reader is looking at, and its keys
+/// do there exactly what they do in the sidebar. A real render is required —
+/// `sidebar_visible` is recorded by the renderer, so nothing about this
+/// reproduces without drawing.
 #[test]
 fn input_is_never_routed_to_a_sidebar_that_is_not_drawn() {
     let mut app = app_with_welcome();
@@ -2713,27 +2718,35 @@ fn input_is_never_routed_to_a_sidebar_that_is_not_drawn() {
         "120 columns must draw the sidebar"
     );
 
-    // Narrow: the sidebar is gone.
-    let _ = render_app_to_string(&app, 90, 30);
+    // Narrow: the sidebar is gone, and the Workspace is drawn where the
+    // transcript was instead — the footer and the screen agree.
+    let rendered = render_app_to_string(&app, 90, 30);
     assert!(
         !app.sidebar_visible.get(),
         "90 columns must drop the sidebar entirely"
     );
+    assert!(
+        rendered.contains("[WORKSPACE]")
+            && rendered.lines().nth(1).is_some_and(|l| l.contains("[Act")),
+        "with Workspace focus and no sidebar the Workspace must be on screen as an overlay:\n{rendered}"
+    );
 
+    // Down moves the selection the reader can see; Esc returns to the prompt
+    // and the transcript comes back.
     app.handle_key(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyCode::Down,
         crossterm::event::KeyModifiers::NONE,
     ));
-    assert_eq!(
-        app.focus,
-        prism_tui::app::Focus::Input,
-        "focus must leave a pane that is not drawn"
-    );
+    assert_eq!(app.focus, prism_tui::app::Focus::Workspace);
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(app.focus, prism_tui::app::Focus::Input);
     let rendered = render_app_to_string(&app, 90, 30);
     assert!(
-        rendered.contains('x'),
-        "the keystroke must land somewhere the reader can see it, not be \
-         dropped; got:\n{rendered}"
+        !rendered.contains("[Act") && rendered.contains("PRISM ready"),
+        "Esc closes the overlay and the transcript is back:\n{rendered}"
     );
 }
 
@@ -4045,4 +4058,212 @@ fn snapshot_tool_result_descriptor_card_100x30() {
     let rendered = render_app_to_string(&app, 100, 30);
     assert_no_terminal_controls(&rendered);
     insta::assert_snapshot!("tool_result_descriptor_card_100x30", rendered);
+}
+
+// ── Narrow layout (under 100 columns) ────────────────────────────────
+//
+// Below 100 columns the sidebar is not drawn, and before this the Workspace
+// was drawn nowhere: Story and Objects had no other surface, the marks and
+// the goal vanished with the sidebar, and the `workspace.*` palette rows were
+// silent no-ops that left the footer reading [WORKSPACE]. The 80x24 case is
+// the whole layout in one frame: two marks, a goal, three objects, one Story
+// step, a finished turn.
+
+/// A session with everything the sidebar would have shown, at a size that
+/// has no sidebar.
+fn narrow_app() -> App {
+    use prism_tui::marks::Mark;
+    use prism_tui::refs::RefKind;
+    let mut app = app_with_welcome();
+    app.push_user("Which preburner liner alloys survive hydrogen-rich gas?");
+    app.apply_agent_msg(AgentMsg::TextDelta(
+        "Fake backend response: PRISM TUI is running ".into(),
+    ));
+    app.apply_agent_msg(AgentMsg::TextDelta("in deterministic test mode.".into()));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    freeze_metrics(&mut app);
+    app.goal = Some("preburner liner alloy shortlist".into());
+    app.marks.toggle(Mark {
+        id: "10.1000/rd0120".into(),
+        kind: RefKind::Doi,
+        label: "RD-0120 preburner paper".into(),
+    });
+    app.marks.toggle(Mark {
+        id: "cache://9a13e307/structure.cif".into(),
+        kind: RefKind::Structure,
+        label: "NiCr2O4".into(),
+    });
+    for (id, label, status) in [
+        ("alloy-1", "Inconel 718", "done"),
+        ("alloy-2", "Haynes 230", "running"),
+        ("alloy-3", "GRCop-84", "queued"),
+    ] {
+        app.apply_agent_msg(AgentMsg::ObjectUpdate {
+            id: id.into(),
+            kind: "alloy".into(),
+            label: label.into(),
+            status: status.into(),
+            progress_current: None,
+            progress_total: None,
+            detail: None,
+        });
+    }
+    app.apply_agent_msg(AgentMsg::Story {
+        call_id: None,
+        seq: 0,
+        tool: "web".into(),
+        status: "done".into(),
+        text: "Searched the literature for hydrogen-embrittlement data.".into(),
+    });
+    app
+}
+
+/// The row above the prompt at 80x24: header 1, transcript, strip 1,
+/// prompt 5, footer 1.
+const NARROW_STRIP_ROW: usize = 24 - 7;
+
+/// Snapshot: 80x24 with marks, a goal, objects and a Story step. The
+/// transcript tail, the footer status word and the marks line are all on
+/// screen; the header has dropped its key hint before dropping anything
+/// persistent.
+#[test]
+fn snapshot_narrow_chat_keeps_marks_and_goal_80x24() {
+    let app = narrow_app();
+    let rendered = render_app_to_string(&app, 80, 24);
+    assert_no_terminal_controls(&rendered);
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert!(
+        rendered.contains("in deterministic test mode."),
+        "the transcript tail is visible:\n{rendered}"
+    );
+    assert!(
+        lines.last().is_some_and(|l| l.contains("Ready")),
+        "the footer status word is visible:\n{rendered}"
+    );
+    assert!(
+        lines[NARROW_STRIP_ROW].contains("★ 2 marked") && lines[NARROW_STRIP_ROW].contains("goal:"),
+        "the marks count and the goal share the row above the prompt:\n{rendered}"
+    );
+    assert!(
+        !lines[0].contains("Ctrl-P"),
+        "below 100 columns the header drops its key hint first:\n{rendered}"
+    );
+    insta::assert_snapshot!("narrow_chat_80x24", rendered);
+}
+
+/// Tab opens the Workspace as an overlay in the transcript's rows, tab strip
+/// on its first row; ←/→ reach all seven tabs; Esc returns to the transcript.
+#[test]
+fn narrow_tab_opens_the_workspace_overlay_and_esc_returns_80x24() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use prism_tui::app::WorkspaceTab;
+    let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+
+    let mut app = narrow_app();
+    let before = render_app_to_string(&app, 80, 24);
+    app.handle_key(key(KeyCode::Tab));
+    let overlay = render_app_to_string(&app, 80, 24);
+    assert_no_terminal_controls(&overlay);
+    let lines: Vec<&str> = overlay.lines().collect();
+    assert_eq!(app.focus, Focus::Workspace);
+    assert!(
+        lines[1].contains("[Act"),
+        "the tab strip is the overlay's first row, under the header:\n{overlay}"
+    );
+    assert!(
+        !overlay.contains("in deterministic test mode."),
+        "the overlay covers the transcript rather than sharing rows with it:\n{overlay}"
+    );
+    assert!(
+        lines[NARROW_STRIP_ROW].contains("★ 2 marked"),
+        "the strip row stays where it was while the overlay is up:\n{overlay}"
+    );
+    insta::assert_snapshot!("narrow_workspace_overlay_80x24", overlay);
+
+    // Every tab is one → away from the last, and the strip names the one
+    // you are on. Story and Objects have no other surface at this width.
+    let mut seen: Vec<WorkspaceTab> = vec![app.workspace_tab];
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Right));
+        let rendered = render_app_to_string(&app, 80, 24);
+        let name = format!("{:?}", app.workspace_tab);
+        let strip = rendered.lines().nth(1).unwrap_or("");
+        assert!(
+            strip.contains(&format!("[{}", &name[..3])),
+            "the strip brackets the active tab {name}:\n{rendered}"
+        );
+        match app.workspace_tab {
+            WorkspaceTab::Story => assert!(
+                rendered.contains("Searched the literature"),
+                "the Story step is readable at 80 columns:\n{rendered}"
+            ),
+            WorkspaceTab::Objects => assert!(
+                rendered.contains("Inconel 718")
+                    && rendered.contains("Haynes 230")
+                    && rendered.contains("GRCop-84"),
+                "all three objects are readable at 80 columns:\n{rendered}"
+            ),
+            _ => {}
+        }
+        seen.push(app.workspace_tab);
+    }
+    seen.dedup();
+    assert_eq!(seen.len(), 7, "→ reaches all seven tabs: {seen:?}");
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(seen[5], app.workspace_tab, "← walks the same ring back");
+
+    app.handle_key(key(KeyCode::Esc));
+    let after = render_app_to_string(&app, 80, 24);
+    assert_eq!(
+        after, before,
+        "Esc returns to the transcript exactly as it was"
+    );
+}
+
+/// A `workspace.*` palette row opens the overlay when there is no sidebar to
+/// switch. Before, it set a focus nothing drew and the next key undid it.
+#[test]
+fn narrow_palette_workspace_row_opens_the_overlay_80x24() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use prism_tui::app::WorkspaceTab;
+    let mut app = narrow_app();
+    // A frame has measured the width: the sidebar is not drawn.
+    let _ = render_app_to_string(&app, 80, 24);
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    for c in "Workspace: Objects".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.workspace_tab, WorkspaceTab::Objects);
+    let rendered = render_app_to_string(&app, 80, 24);
+    assert!(
+        rendered.lines().nth(1).is_some_and(|l| l.contains("[Obj")),
+        "the Objects tab is open as an overlay:\n{rendered}"
+    );
+    assert!(rendered.contains("Haynes 230"), "{rendered}");
+    // And a key after it still reaches the Workspace: ↓ moves the selection
+    // instead of the focus silently falling back to the prompt.
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.focus, Focus::Workspace);
+    assert_eq!(app.workspace_selected, 1);
+}
+
+/// Capability check: the same frame in the mono theme reads the same glyphs.
+/// Colour is one channel; the marks glyph, the `goal:` word and the bracketed
+/// tab carry the state without it.
+#[test]
+fn narrow_frames_read_the_same_in_mono_80x24() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mono = prism_tui::theme::find("mono").expect("a mono theme exists");
+    let mut app = narrow_app();
+    let chat = render_app_to_string(&app, 80, 24);
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let overlay = render_app_to_string(&app, 80, 24);
+
+    let mut app = narrow_app();
+    app.theme_index = mono;
+    assert_eq!(render_app_to_string(&app, 80, 24), chat);
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(render_app_to_string(&app, 80, 24), overlay);
 }

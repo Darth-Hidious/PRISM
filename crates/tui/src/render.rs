@@ -43,22 +43,58 @@ struct FrameLayout {
     transcript: Rect,
     prompt: Rect,
     footer: Rect,
-    /// One row above the prompt naming background work in flight; absent
-    /// when nothing is running, so it never costs a transcript row for nothing.
-    activity: Option<Rect>,
+    /// One row above the prompt naming background work in flight and, on a
+    /// narrow terminal, the marks count and the goal the sidebar would have
+    /// shown. Absent when there is nothing to say, so it never costs a
+    /// transcript row for nothing.
+    strip: Option<Rect>,
     /// Right-hand Workspace panel, or `None` on a narrow terminal.
     sidebar: Option<Rect>,
 }
 
-fn frame_layout(area: Rect, activity_strip: bool) -> FrameLayout {
-    // Columns: left content column + right Workspace panel (opencode-style).
-    // Below the threshold the sidebar is hidden entirely — a clipped sidebar
-    // is worse than none, and the content column needs the room.
-    const SIDEBAR_MIN_WIDTH: u16 = 100;
-    let sidebar_w = if area.width >= SIDEBAR_MIN_WIDTH {
-        (area.width / 3).clamp(24, 42)
+/// The three named layouts, by terminal width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    /// 140 columns and up: the sidebar at its 42-column ceiling.
+    Wide,
+    /// 100 to 139 columns: the sidebar takes a third of the width, 24 to 42.
+    Medium,
+    /// Under 100 columns: no sidebar. A clipped sidebar is worse than none,
+    /// and the content column needs the room. The Workspace is still one key
+    /// away — Tab opens it as an overlay in the transcript's rows — the marks
+    /// count and the goal share the strip row above the prompt, and the header
+    /// drops its key hint before anything persistent goes.
+    Narrow,
+}
+
+const SIDEBAR_MIN_WIDTH: u16 = 100;
+const WIDE_MIN_WIDTH: u16 = 140;
+const SIDEBAR_MAX_WIDTH: u16 = 42;
+
+fn frame_kind(width: u16) -> FrameKind {
+    if width >= WIDE_MIN_WIDTH {
+        FrameKind::Wide
+    } else if width >= SIDEBAR_MIN_WIDTH {
+        FrameKind::Medium
     } else {
-        0
+        FrameKind::Narrow
+    }
+}
+
+/// Whether the row above the prompt is drawn this frame: background work
+/// always earns it; on a narrow terminal so do marks and a goal, which have
+/// no sidebar to live in.
+fn strip_row_needed(app: &App, kind: FrameKind) -> bool {
+    !app.activities.is_empty()
+        || (kind == FrameKind::Narrow && (!app.marks.is_empty() || app.goal.is_some()))
+}
+
+fn frame_layout(area: Rect, strip: bool) -> FrameLayout {
+    // Columns: left content column + right Workspace panel (opencode-style).
+    let sidebar_w = match frame_kind(area.width) {
+        FrameKind::Wide => SIDEBAR_MAX_WIDTH,
+        FrameKind::Medium => (area.width / 3).clamp(24, SIDEBAR_MAX_WIDTH),
+        FrameKind::Narrow => 0,
     };
     let cols = if sidebar_w > 0 {
         Layout::default()
@@ -76,18 +112,19 @@ fn frame_layout(area: Rect, activity_strip: bool) -> FrameLayout {
             .split(area)
     };
 
-    // Left column: header / transcript / [activity strip] / prompt / footer.
-    // The strip is one row that exists only while background work is in
-    // flight. It lives here, not in the footer: at 140 columns the footer is
-    // already clipped ("Ctrl-C qu"), so anything added there is cut or cuts.
+    // Left column: header / transcript / [strip] / prompt / footer.
+    // The strip is one row that exists only while it has something to name
+    // (see `strip_row_needed`). It lives here, not in the footer: at 140
+    // columns the footer is already clipped ("Ctrl-C qu"), so anything added
+    // there is cut or cuts.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                         // header bar
-            Constraint::Min(3),                            // transcript
-            Constraint::Length(u16::from(activity_strip)), // activity strip
-            Constraint::Length(5),                         // bordered prompt box (1 + 3 + 1)
-            Constraint::Length(1),                         // footer
+            Constraint::Length(1),                // header bar
+            Constraint::Min(3),                   // transcript
+            Constraint::Length(u16::from(strip)), // activity / marks / goal strip
+            Constraint::Length(5),                // bordered prompt box (1 + 3 + 1)
+            Constraint::Length(1),                // footer
         ])
         .split(cols[0]);
 
@@ -95,7 +132,7 @@ fn frame_layout(area: Rect, activity_strip: bool) -> FrameLayout {
         content: cols[0],
         header: chunks[0],
         transcript: chunks[1],
-        activity: activity_strip.then(|| chunks[2]),
+        strip: strip.then(|| chunks[2]),
         prompt: chunks[3],
         footer: chunks[4],
         sidebar: (sidebar_w > 0).then(|| cols[1]),
@@ -111,8 +148,8 @@ fn frame_layout(area: Rect, activity_strip: bool) -> FrameLayout {
 /// pane left the prompt box as the fragments `┌ Prompt` / `│ Type a` on the
 /// left edge and cut the sidebar's border out of every row it covered.
 /// Centring inside these bounds instead cannot reach either.
-fn overlay_bounds(area: Rect, activity_strip: bool) -> Rect {
-    let l = frame_layout(area, activity_strip);
+fn overlay_bounds(area: Rect, strip: bool) -> Rect {
+    let l = frame_layout(area, strip);
     Rect::new(
         l.content.x,
         l.transcript.y,
@@ -159,18 +196,20 @@ pub fn draw(f: &mut Frame, app: &App) {
         area,
     );
 
-    let layout = frame_layout(area, !app.activities.is_empty());
+    let kind = frame_kind(area.width);
+    let strip = strip_row_needed(app, kind);
+    let layout = frame_layout(area, strip);
 
     draw_header(f, app, layout.header);
     draw_chat(f, app, layout.transcript);
-    if let Some(strip) = layout.activity {
+    if let Some(strip) = layout.strip {
         draw_activity_strip(f, app, strip);
     }
     draw_prompt(f, app, layout.prompt);
     draw_footer(f, app, layout.footer);
     app.sidebar_visible.set(layout.sidebar.is_some());
     if let Some(sidebar) = layout.sidebar {
-        draw_workspace(f, app, sidebar);
+        draw_workspace(f, app, sidebar, WorkspaceSurface::Sidebar);
     }
 
     // Overlays: approval popup (safety-critical) > command palette >
@@ -219,11 +258,23 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_config_window(f, app);
     } else if app.apikey_window.open {
         draw_apikey_window(f, app);
+    } else if layout.sidebar.is_none() && app.focus == Focus::Workspace {
+        // Narrow layout: there is no sidebar column, so Workspace focus IS the
+        // Workspace, drawn where the transcript was. Before this, Story and
+        // Objects had no surface at all under 100 columns and the footer read
+        // [WORKSPACE] over nothing. Above the home screen: Tab from the home
+        // screen is how a keyboard reader reaches the Workspace there too.
+        draw_workspace(
+            f,
+            app,
+            overlay_bounds(area, strip),
+            WorkspaceSurface::Overlay,
+        );
     } else if app.home.open {
         // The home panel lives in the content column so it shares an origin
         // and a width with the prompt box and footer stacked around it —
         // never over the workspace sidebar column.
-        draw_home(f, app, overlay_bounds(area, !app.activities.is_empty()));
+        draw_home(f, app, overlay_bounds(area, strip));
     } else if let Some(modal) = app.modal {
         draw_modal(f, modal, app);
     }
@@ -264,10 +315,17 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     // researcher can act on. It stays exactly one keypress away (`t`, the
     // tools pane) and in the usage stats — surfaces you reach by asking.
     // Nothing is hidden; it is simply not advertised.
-    spans.push(Span::styled(
-        "    Ctrl-P · ? ",
-        Style::default().fg(t.muted).bg(t.status_bg),
-    ));
+    //
+    // Under 100 columns the hint is the first thing to go: it is a reminder
+    // of two keys that work regardless, and everything else on the row is
+    // state (the session, the model). At 80 columns it was clipping the
+    // model name.
+    if frame_kind(f.area().width) != FrameKind::Narrow {
+        spans.push(Span::styled(
+            "    Ctrl-P · ? ",
+            Style::default().fg(t.muted).bg(t.status_bg),
+        ));
+    }
     let line = Line::from(spans);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(t.status_bg)),
@@ -1298,17 +1356,49 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
 /// Background work in flight, on its own row above the prompt. A quiet
 /// screen must never mean an unknown state: whatever the backend is doing off
 /// the main turn is named here until it says it is done.
+///
+/// On a narrow terminal the row also carries what the sidebar would have
+/// shown and nothing else does: how many handles are marked for the agent,
+/// and the goal. Each segment is clipped to the room left after the one
+/// before it, so the row never wraps and never moves the prompt.
 fn draw_activity_strip(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
-    let text: Vec<&str> = app.activities.iter().map(|(_, s)| s.as_str()).collect();
-    let line = clip(&format!("⋯ {}", text.join(" · ")), usize::from(area.width));
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            line,
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut room = usize::from(area.width);
+    let mut push = |spans: &mut Vec<Span<'static>>, text: &str, style: Style| {
+        if room == 0 {
+            return;
+        }
+        let sep = if spans.is_empty() { "" } else { " · " };
+        let text = clip(&format!("{sep}{text}"), room);
+        room = room.saturating_sub(text.width());
+        spans.push(Span::styled(text, style));
+    };
+    if !app.activities.is_empty() {
+        let text: Vec<&str> = app.activities.iter().map(|(_, s)| s.as_str()).collect();
+        push(
+            &mut spans,
+            &format!("⋯ {}", text.join(" · ")),
             Style::default().fg(t.reference),
-        ))),
-        area,
-    );
+        );
+    }
+    if frame_kind(f.area().width) == FrameKind::Narrow {
+        if !app.marks.is_empty() {
+            push(
+                &mut spans,
+                &format!("★ {} marked for agent", app.marks.len()),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            );
+        }
+        if let Some(goal) = &app.goal {
+            push(
+                &mut spans,
+                &format!("goal: {goal}"),
+                Style::default().fg(t.text),
+            );
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Footer — live status + hints (opencode bottom bar), replacing the old status bar.
@@ -1573,13 +1663,33 @@ struct ToolEntry {
     evidence_class: Option<EvidenceClass>,
 }
 
-fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
+/// Where the Workspace is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceSurface {
+    /// Beside the transcript (medium and wide layouts): the left-bordered,
+    /// titled sidebar.
+    Sidebar,
+    /// Over the transcript (narrow layout): the tab strip is its first row —
+    /// the tabs already say what this is — and there is no border, because
+    /// the boundary it would draw is the column's own edge.
+    Overlay,
+}
+
+fn draw_workspace(f: &mut Frame, app: &App, area: Rect, surface: WorkspaceSurface) {
     let t = app.theme();
-    // Panel sidebar — opencode `backgroundPanel`, left-bordered.
-    let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(t.divider))
-        .style(Style::default().bg(t.panel));
+    // Panel — opencode `backgroundPanel`, left-bordered beside the transcript.
+    let block = match surface {
+        WorkspaceSurface::Sidebar => Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(t.divider))
+            .style(Style::default().bg(t.panel)),
+        WorkspaceSurface::Overlay => {
+            // Drawn after the transcript, so its rows must be cleared first;
+            // a block only restyles the cells it covers.
+            f.render_widget(Clear, area);
+            Block::default().style(Style::default().bg(t.panel))
+        }
+    };
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -1588,10 +1698,12 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
     let w = inner.width as usize;
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        " Workspace",
-        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-    )));
+    if surface == WorkspaceSurface::Sidebar {
+        lines.push(Line::from(Span::styled(
+            " Workspace",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        )));
+    }
     let (tabs_line, tab_spans) = workspace_tabs_line(app, t, w);
     let tabs_line_index = lines.len();
     lines.push(tabs_line);

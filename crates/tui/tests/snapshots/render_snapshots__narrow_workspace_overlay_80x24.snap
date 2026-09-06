@@ -1,0 +1,28 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: overlay
+---
+ ‹ back  New session   ◆ fake-backend
+ [Act] Sto Too Fil Obj Str Art
+ 🎯  preburner liner alloy shortlist
+ ★ marked for agent (2)  click to unmark
+   ● paper RD-0120 preburner paper
+   ● structure NiCr2O4
+
+▸ 1. prompt "Which preburner liner alloys survive hydrogen-rich gas?" •
+
+
+
+
+
+
+
+
+
+★ 2 marked for agent · goal: preburner liner alloy shortlist
+┌ Prompt ──────────────────────────────────────────────────────────────────────┐
+│type a message…  (press i to focus · ↵ send)                                  │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+  Ready  model: fake-backend   [WORKSPACE]    Ctrl-C quit

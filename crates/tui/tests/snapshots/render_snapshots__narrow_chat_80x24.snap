@@ -1,0 +1,28 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend
+· PRISM ready
+
+❯ You
+▌ Which preburner liner alloys survive hydrogen-rich gas?
+
+◆ PRISM
+  Fake backend response: PRISM TUI is running in deterministic test mode.
+
+
+
+
+
+
+
+
+
+★ 2 marked for agent · goal: preburner liner alloy shortlist
+┌ Prompt ──────────────────────────────────────────────────────────────────────┐
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)                           │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+  Ready  model: fake-backend   [INPUT]    Ctrl-C quit
