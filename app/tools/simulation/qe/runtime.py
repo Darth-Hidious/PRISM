@@ -235,8 +235,19 @@ def status(config: Mapping[str, Any]) -> dict[str, Any]:
     """What is provisioned and what is not — the answer to `prism qe status`."""
     s = settings(config)
     ready = bool(s["pw_path"]) and bool(s["pseudo_dir"])
+    # Where the wavefunction cutoff will come from. A number pinned in
+    # settings.toml silently overrode the pseudopotential hints for every run
+    # on 2026-09-06 (a five-element alloy at 60 Ry against Ni's 98 Ry hint);
+    # the pin is legitimate, being silent about it is not.
+    pinned = load_settings_file().get("ecutwfc_ry")
+    ecutwfc_source = (
+        f"pinned in settings.toml at {pinned} Ry — remove that line to use the set's per-element hints"
+        if pinned is not None
+        else "the pseudopotential set's hints, chosen per run from the species (normal accuracy)"
+    )
     return {
         "ready": ready,
+        "ecutwfc_source": ecutwfc_source,
         "pw_x": s["pw_path"],
         "mpirun": s["mpirun"],
         "pseudo_dir": s["pseudo_dir"],

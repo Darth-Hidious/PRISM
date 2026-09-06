@@ -573,3 +573,20 @@ def test_mpi_ranks_get_one_openmp_thread_each(tmp_path):
     written = (tmp_path / "run" / "pw.out").read_text()
     assert "OMP_NUM_THREADS=unset" not in written, written
     assert out["provenance"]["omp_threads_per_rank"] >= 1
+
+
+def test_status_says_where_the_cutoff_comes_from(tmp_path, monkeypatch):
+    """2026-09-06: ~/.prism/qe/settings.toml carried `ecutwfc_ry = 60.0` (the
+    CLI help's own example) and every run silently used it instead of the
+    set's hints — a five-element alloy at 60 Ry, with Ni's hint at 98 Ry. The
+    status must name the source so a pin is visible, never silent."""
+    from app.tools.simulation.qe import runtime as qe
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".prism" / "qe").mkdir(parents=True)
+    st = qe.status({})
+    assert "hint" in st["ecutwfc_source"].lower(), st["ecutwfc_source"]
+    (tmp_path / ".prism" / "qe" / "settings.toml").write_text("ecutwfc_ry = 60.0\n")
+    st = qe.status({})
+    assert "pinned" in st["ecutwfc_source"].lower() and "settings.toml" in st["ecutwfc_source"], st["ecutwfc_source"]
+    assert "60" in st["ecutwfc_source"]
