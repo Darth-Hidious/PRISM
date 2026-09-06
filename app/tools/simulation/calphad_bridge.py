@@ -235,6 +235,15 @@ def _attach_calphad_result(
     return result
 
 
+def _normalise_components(components):
+    """Species in a TDB are upper case. A caller writing 'Ni' produced comps
+    that no mole-fraction condition could match, and pycalphad reported
+    "X_AL refers to non-existent component" rather than a name mismatch."""
+    seen = {str(c).strip().upper() for c in components if str(c).strip()}
+    seen.add("VA")
+    return sorted(seen)
+
+
 class CalphadBridge:
     """Thin bridge between PRISM tools and pycalphad.
 
@@ -308,7 +317,7 @@ class CalphadBridge:
         apply_py314_workspace_shim()
         from pycalphad import equilibrium, variables as v
 
-        comps = _ensure_vacancy(components)
+        comps = _normalise_components(components)
         if phases is None:
             phase_list = self.databases.get_phases(database_name, comps, database_path)
         else:
@@ -322,7 +331,7 @@ class CalphadBridge:
             elif key == "P":
                 cond[v.P] = val
             elif key.startswith("X(") and key.endswith(")"):
-                element = key[2:-1]
+                element = key[2:-1].strip().upper()
                 cond[v.X(element)] = val
             else:
                 cond[key] = val

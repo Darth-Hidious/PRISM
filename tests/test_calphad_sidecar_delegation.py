@@ -55,3 +55,26 @@ def test_the_sidecar_never_delegates_to_itself(monkeypatch):
     monkeypatch.setattr(calphad, "sidecar_call", lambda t, a: (_ for _ in ()).throw(AssertionError("recursed")))
     out = calphad._calphad(action="list_phases", database_name="x")
     assert "error" in out, out
+
+
+def test_compute_actions_delegate_too(monkeypatch):
+    """The catalog tool was wired to the sidecar but calphad_compute — the one
+    that does the science — was not, so equilibrium still answered "pycalphad
+    is not installed" (2026-09-06)."""
+    monkeypatch.setattr(calphad, "check_calphad_available", lambda: False)
+    monkeypatch.setattr(calphad, "sidecar_available", lambda: True)
+    seen = {}
+    monkeypatch.setattr(calphad, "sidecar_call", lambda t, a: seen.update(tool=t, args=a) or {"phases": {"FCC_A1": 0.8}})
+    out = calphad._calphad_compute(action="equilibrium", components=["Ni", "Cr"], conditions={"T": 773})
+    assert seen["tool"] == "calphad_compute" and seen["args"]["action"] == "equilibrium", seen
+    assert out.get("ran_in") == "sidecar" and "phases" in out, out
+
+
+def test_components_reach_pycalphad_in_the_case_the_tdb_uses():
+    """A real 773 K equilibrium refused with "X_AL refers to non-existent
+    component" (2026-09-06): components arrived as 'Ni','Al' while every TDB
+    species is upper case, so the mole-fraction condition matched nothing."""
+    from app.tools.simulation.calphad_bridge import _normalise_components
+
+    assert _normalise_components(["Ni", "Co", "Cr", "Al"]) == ["AL", "CO", "CR", "NI", "VA"]
+    assert _normalise_components(["ni", "VA"]) == ["NI", "VA"]

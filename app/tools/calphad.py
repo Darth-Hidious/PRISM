@@ -264,6 +264,9 @@ def _calphad_compute(**kwargs) -> dict:
                 "calphad_compute(action='gibbs', components=[...], phases=[...], temperature=...)"
             ),
         }
+    remote = _delegate("calphad_compute", {"action": action, **kwargs})
+    if remote is not None:
+        return remote
     if action not in {"phase_diagram", "equilibrium", "gibbs"}:
         return {
             "error": f"Unknown action '{action}'. Valid: phase_diagram, equilibrium, gibbs"
