@@ -10045,6 +10045,95 @@ mod tests {
     }
 
     #[test]
+    fn the_focus_tag_outlives_the_credit_balance() {
+        // Finding 10: at 140 columns a negative balance alone overflowed the
+        // row and the ladder spent the focus tag first, so the one word
+        // naming the pane that holds the keys went while a number read less
+        // than once a minute stayed. Below 100 columns the sidebar is gone
+        // as well, so nothing on screen said Chat had the keys while j/k, e
+        // and m were live. The balance goes first now, and when the row is
+        // narrower still the tag shortens to its letter instead of leaving.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.focus = Focus::Chat;
+        app.model = "glm-5.3-flash".to_string();
+        app.credits = Some(-73_396);
+        app.apply_agent_msg(crate::msg::AgentMsg::ThinkingDelta("why".to_string()));
+        app.apply_agent_msg(crate::msg::AgentMsg::TextDelta("answer".to_string()));
+        app.apply_agent_msg(crate::msg::AgentMsg::TurnComplete);
+
+        let footer = footer_row(&app);
+        assert!(
+            footer.trim_end().ends_with("Ctrl-C quit"),
+            "the last words still survive: {footer:?}"
+        );
+        assert!(
+            footer.contains("[CHAT]"),
+            "and the focus tag is what the balance paid for: {footer:?}"
+        );
+        assert!(
+            !footer.contains("credits:") && !footer.contains("overdrawn"),
+            "the balance is what a narrow row spends first: {footer:?}"
+        );
+
+        // Narrower than the tag and the balance together can afford: the tag
+        // shortens to one letter and still never leaves.
+        let footer = footer_row_at(&app, 70, 20);
+        assert!(
+            footer.trim_end().ends_with("Ctrl-C quit"),
+            "the last words survive 70 columns too: {footer:?}"
+        );
+        assert!(
+            footer.contains(" C "),
+            "the focus tag shortens to its letter rather than going: {footer:?}"
+        );
+    }
+
+    /// The colour of every turn-header gutter glyph in a `width` x `height`
+    /// frame, top to bottom.
+    fn gutter_colours(app: &App, width: u16, height: u16) -> Vec<Option<ratatui::style::Color>> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .filter(|y| matches!(buf[(0, *y)].symbol(), "❯" | "◆"))
+            .map(|y| buf[(0, y)].style().fg)
+            .collect()
+    }
+
+    #[test]
+    fn the_transcript_gutter_says_when_chat_holds_the_keys() {
+        // The other half of finding 10. The footer tag is the row's to spend
+        // and the sidebar does not exist below 100 columns, so focus needs a
+        // positive mark in the one pane every layout draws. The turn-header
+        // gutter carries it; the speaker's own word keeps the speaker's
+        // colour, so identity and focus stay two separate channels.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.push_user("which carbide melts highest");
+        app.apply_agent_msg(crate::msg::AgentMsg::TextDelta(
+            "hafnium carbide".to_string(),
+        ));
+        app.apply_agent_msg(crate::msg::AgentMsg::TurnComplete);
+        let t = app.theme();
+        for (w, h) in [(80u16, 24u16), (180u16, 50u16)] {
+            app.focus = Focus::Chat;
+            assert_eq!(
+                gutter_colours(&app, w, h),
+                vec![Some(t.accent), Some(t.accent)],
+                "under Chat focus both turn headers carry the accent gutter at {w}x{h}"
+            );
+            app.focus = Focus::Input;
+            assert_eq!(
+                gutter_colours(&app, w, h),
+                vec![Some(t.dim), Some(t.dim)],
+                "and while the reader is typing neither does at {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
     fn every_wait_shows_its_age() {
         // Finding 14: nothing carried elapsed time, so a stuck backend and a
         // slow search read identically — the footer once said "Ready" for

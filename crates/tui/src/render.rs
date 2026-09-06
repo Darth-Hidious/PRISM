@@ -483,6 +483,19 @@ fn probe_line(line: &Line<'_>, marks: &[(u16, u16)]) -> Line<'static> {
 
 fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
+    // The transcript's own focus mark. The footer tag is the first thing a
+    // narrow row shortens and the sidebar does not exist below 100 columns,
+    // so the pane that every layout draws carries it: the turn-header gutter
+    // glyph is accent while the transcript holds the keys and dim while it
+    // does not. The word beside it keeps the speaker's own colour, so
+    // identity and focus stay two separate channels.
+    let gutter = Style::default()
+        .fg(if app.focus == Focus::Chat {
+            t.accent
+        } else {
+            t.dim
+        })
+        .add_modifier(Modifier::BOLD);
     let mut lines: Vec<Line> = Vec::new();
     let mut thinking_shown = false;
     // Index in `lines` of the newest `❯ You` header, for the scroll anchor.
@@ -548,10 +561,13 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                 // Recorded BEFORE the header is pushed, so the anchor lands on
                 // the header row itself rather than the first body row.
                 last_user_line = Some(lines.len());
-                lines.push(Line::from(Span::styled(
-                    "❯ You",
-                    Style::default().fg(t.user).add_modifier(Modifier::BOLD),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled("❯", gutter),
+                    Span::styled(
+                        " You",
+                        Style::default().fg(t.user).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
                 for line_text in msg.text.lines() {
                     lines.push(Line::from(vec![
                         Span::styled("▌ ", Style::default().fg(t.user)),
@@ -561,10 +577,13 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
             }
             // ── Assistant turn: labeled header + markdown body ──────
             (Role::Assistant, LineKind::Text) => {
-                lines.push(Line::from(Span::styled(
-                    "◆ PRISM",
-                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled("◆", gutter),
+                    Span::styled(
+                        " PRISM",
+                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
                 // Mark the words backed by something openable. Coordinates
                 // come back in the coordinates of the ANNOTATED lines, so the
                 // two-space indent below is added to `col_start` rather than
@@ -1541,11 +1560,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else {
         &app.status_text
     };
-    let focus_indicator = match app.focus {
-        Focus::Chat => " [CHAT] ",
-        Focus::Input => " [INPUT] ",
-        Focus::Workspace => " [WORKSPACE] ",
-        Focus::Approval => " [APPROVAL] ",
+    // The tag in full, and the one letter a row too narrow for the word
+    // keeps. Which pane holds the keys is read on every keystroke, so the
+    // ladder below shortens this rather than removing it. The letter carries
+    // no spaces of its own: the groups either side already bring two and
+    // three, so the bare letter buys back eight cells, which is what lets
+    // "Ctrl-C quit" survive a 100-column frame with the sidebar up.
+    let (focus_indicator, focus_letter) = match app.focus {
+        Focus::Chat => (" [CHAT] ", "C"),
+        Focus::Input => (" [INPUT] ", "I"),
+        Focus::Workspace => (" [WORKSPACE] ", "W"),
+        Focus::Approval => (" [APPROVAL] ", "A"),
     };
 
     // While a turn (or a new-session wait) is running the pill carries its
@@ -1648,7 +1673,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw("  "));
     }
 
-    let focus_idx = spans.len();
     spans.push(Span::styled(focus_indicator, Style::default().fg(t.warn)));
     // What the reader can do with the line they just picked. Selection is
     // only half of pointing: without this the mark appears and the reader is
@@ -1668,37 +1692,42 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // A column too narrow for every word loses the least useful ones, never
     // the last ones: at 140 columns with the sidebar this row read
     // "Ctrl-C qu", and with throughput and cost shown it ended in
-    // "[Ctrl-T: show reas". Drop order: the focus tag (the prompt border
-    // already shows focus; a pending approval is a state, so it stays), the
-    // throughput, the cost, then the reasoning hint takes its short form,
-    // the copy-mode banner loses its explanation, and the cursor hint loses
-    // its verbs and then everything but the count. The hint was once outside
-    // the ladder: with two references it is 22 cells longer than the old
-    // "e ask about this line · Esc clear", and at 80x24 it pushed the quit
-    // key off the row.
+    // "[Ctrl-T: show reas". Drop order: the balance first (a number read
+    // less than once a minute), then the cost and the throughput, then the
+    // reasoning hint takes its short form, then the focus tag shortens to
+    // its letter — it is never removed, because it is read on every key and
+    // below 100 columns the sidebar that would otherwise name the pane does
+    // not exist. Then the copy-mode banner loses its explanation and the
+    // cursor hint loses its verbs and then everything but the count. The
+    // hint was once outside the ladder: with two references it is 22 cells
+    // longer than the old "e ask about this line · Esc clear", and at 80x24
+    // it pushed the quit key off the row.
     let mut line = Line::from(spans);
     let width = usize::from(area.width);
     let trims = [
-        FooterTrim::Focus,
-        FooterTrim::Group("tok/s:"),
+        FooterTrim::Group("credits:"),
         FooterTrim::Group("cost:"),
+        FooterTrim::Group("tok/s:"),
         FooterTrim::ShortReasoning,
+        FooterTrim::ShortFocus,
         FooterTrim::ShortCopyBanner,
         FooterTrim::CursorHint(HintStage::Keys),
         FooterTrim::CursorHint(HintStage::Count),
-        // Last resort, seen live with an approval pending (the focus tag is a
-        // state then and stays): the balance goes before the quit hint does.
-        FooterTrim::Group("credits:"),
     ];
     for trim in trims {
         if line.width() <= width {
             break;
         }
         match trim {
-            FooterTrim::Focus if app.focus != Focus::Approval => {
-                line.spans.remove(focus_idx);
+            // Located by content, not by index: the groups above it are
+            // removed first, so any index taken before the loop is stale.
+            FooterTrim::ShortFocus => {
+                for span in &mut line.spans {
+                    if span.content == focus_indicator {
+                        span.content = focus_letter.into();
+                    }
+                }
             }
-            FooterTrim::Focus => {}
             FooterTrim::Group(label) => remove_labelled_group(&mut line, label),
             FooterTrim::ShortReasoning => {
                 for span in &mut line.spans {
@@ -1735,8 +1764,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
 /// One step of making the footer fit, in the order they are tried.
 enum FooterTrim {
-    /// The focus tag; the prompt border already shows focus.
-    Focus,
+    /// The focus tag as one letter. Shortened, never removed: the prompt
+    /// border shows focus by hue alone and the sidebar is gone below 100
+    /// columns, so this is the row's only word for the pane that has the
+    /// keys.
+    ShortFocus,
     /// A labelled group such as throughput or cost.
     Group(&'static str),
     /// The reasoning hint's short form.

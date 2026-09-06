@@ -1,6 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 586
+assertion_line: 659
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend
@@ -14,4 +14,4 @@ running in deterministic test mode.    █
 │                                      │
 │                                      │
 └──────────────────────────────────────┘
-  Ready  model: fake-backend     Ctrl-C
+  Ready  model: fake-backend  I   Ctrl-C
