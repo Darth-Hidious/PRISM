@@ -1436,12 +1436,23 @@ impl App {
             return;
         }
 
+        // A panel takes the scroll and Enter keys only when it OWNS them: it
+        // was pinned by a click (asked for deliberately — there is no "leaving"
+        // a click), or focus is anywhere but the input. A hover panel resting
+        // under the pointer while the reader types must keep its hands off the
+        // prompt — the same rule the `m` binding below already follows (finding
+        // 9). Both interceptors read this one value so they cannot disagree.
+        let panel_owns_keys = self
+            .ref_panel
+            .as_ref()
+            .is_some_and(|p| p.pinned || self.focus != Focus::Input);
+
         // An open reference panel takes the scroll keys. Before this they went
         // to whatever list was BEHIND the panel: pressing Down moved the
         // sidebar selection while the panel kept showing the old entity, so
         // the panel went stale while looking live, and its content below the
         // fold was unreachable by any key.
-        if self.ref_panel.is_some()
+        if panel_owns_keys
             && let Some(delta) = match key.code {
                 KeyCode::Down => Some(1isize),
                 KeyCode::Up => Some(-1),
@@ -1637,15 +1648,20 @@ impl App {
             return;
         }
 
-        // Esc closes the reference panel first: it is the newest thing on
-        // screen, so it is what "go back" means while it is up.
+        // Enter on a panel the panel owns opens its reference — but through
+        // the same " Open link " confirm the link picker uses, never straight
+        // to a browser subprocess, and never while the reader is mid-sentence
+        // in the prompt (a hover panel yields Enter to the textarea instead).
         if key.code == KeyCode::Enter
+            && panel_owns_keys
             && let Some(id) = self.ref_panel.as_ref().map(|p| p.id.clone())
             && let Some(url) = self.reference_url(&id)
         {
-            self.open_in_browser(&url);
+            self.confirm_open_link(url);
             return;
         }
+        // Esc closes the reference panel first: it is the newest thing on
+        // screen, so it is what "go back" means while it is up.
         if key.code == KeyCode::Esc && self.ref_panel.is_some() {
             self.ref_panel = None;
             return;
@@ -5894,6 +5910,17 @@ impl App {
             self.open_in_browser(&url);
         }
         self.link_picker.open = false;
+    }
+
+    /// Route one URL through the link picker's confirm dialog, so opening a
+    /// reference panel's link is the same guarded step as opening a link from
+    /// the picker — never a browser spawned on a single keystroke. `y`/Enter
+    /// opens; `n`/Esc backs out (and, with one URL, closes).
+    fn confirm_open_link(&mut self, url: String) {
+        self.link_picker.urls = vec![url];
+        self.link_picker.selected = 0;
+        self.link_picker.confirm = true;
+        self.link_picker.open = true;
     }
 
     /// Open a URL in the reader's browser. The owner reversed the earlier
@@ -10856,6 +10883,96 @@ mod tests {
         assert!(app.ref_panel.is_some(), "the panel stays up while marking");
         app.pointer_pressed(11, 5);
         assert!(!app.marks.is_marked(id), "the third click unmarks");
+    }
+
+    /// A hover panel — one the pointer opened over a word, not a click — must
+    /// not take Enter or the arrows away from the prompt while the reader is
+    /// typing (finding 9). Pinned by a click, the panel owns those keys again,
+    /// and its Enter asks before it opens a browser.
+    #[test]
+    fn hover_panels_never_take_keys_from_the_prompt() {
+        let doi = "doi:10.1016/j.corsci.2017.08.015";
+        let url = "https://doi.org/10.1016/j.corsci.2017.08.015";
+        // The buggy path opens a browser on Enter; keep it off the machine so
+        // the failing run writes to the transcript instead of spawning one.
+        let _guard = env_guard("PRISM_NO_BROWSER", "1");
+
+        fn hover(id: &str) -> RefPanel {
+            RefPanel {
+                scroll: 0,
+                id: id.to_string(),
+                label: "corsci 2017".to_string(),
+                kind: Some(crate::refs::RefKind::Doi),
+                state: RefPanelState::Ready("a\nb\nc\nd\ne\nf".to_string()),
+                anchor: (4, 4),
+                pinned: false,
+            }
+        }
+
+        // ── Typing over a hover DOI: Enter sends, the panel keeps its hands off.
+        let mut app = fresh();
+        app.focus = Focus::Input;
+        app.ref_panel = Some(hover(doi));
+        for c in "hello".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "hello",
+            "the letters reach the prompt, not the panel"
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert!(
+            !app.link_picker.open,
+            "Enter over a hover panel must not open the browser confirm"
+        );
+        assert!(
+            app.input.lines().join("").is_empty(),
+            "Enter sent the message and cleared the box"
+        );
+        assert!(
+            app.messages.iter().any(|m| m.text == "hello"),
+            "the message was sent, not swallowed by the panel"
+        );
+
+        // ── The arrows move the textarea cursor, not the hover panel.
+        let mut app = fresh();
+        app.focus = Focus::Input;
+        app.ref_panel = Some(hover(doi));
+        app.input.insert_str("ab\ncd");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.cursor().0, 0, "Up moves the textarea cursor up");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.input.cursor().0,
+            1,
+            "Down moves the textarea cursor down"
+        );
+        assert_eq!(
+            app.ref_panel.as_ref().unwrap().scroll,
+            0,
+            "the hover panel did not scroll while the reader typed"
+        );
+
+        // ── A pinned panel owns its keys again, and Enter asks before opening.
+        let mut app = fresh();
+        app.focus = Focus::Input;
+        app.ref_panel = Some(RefPanel {
+            pinned: true,
+            ..hover(doi)
+        });
+        app.handle_key(key(KeyCode::Enter));
+        assert!(
+            app.link_picker.open && app.link_picker.confirm,
+            "a pinned panel's Enter opens the link confirm dialog"
+        );
+        assert_eq!(
+            app.link_picker.urls,
+            vec![url.to_string()],
+            "the confirm dialog names the DOI url"
+        );
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(!app.link_picker.open, "n backs out of the confirm dialog");
     }
 
     #[test]

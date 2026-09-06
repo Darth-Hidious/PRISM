@@ -6636,6 +6636,14 @@ fn panel_window(lines: &[String], height: usize, scroll: usize) -> (Vec<String>,
     (lines[start..end].to_vec(), Some(label))
 }
 
+/// The host a reference link points at, for the panel title ("open doi.org").
+/// A whole URL in the title would run off the border; the host says where
+/// Enter goes without pretending to show the full address.
+fn ref_link_host(url: &str) -> &str {
+    let after = url.split_once("://").map_or(url, |(_, rest)| rest);
+    after.split('/').next().unwrap_or(after)
+}
+
 fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
     let Some(panel) = &app.ref_panel else {
         return;
@@ -6787,10 +6795,27 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
     let (_, position) = panel_window(&rendered, visible_rows, panel.scroll);
     let max_scroll = lines.len().saturating_sub(visible_rows);
     let offset = panel.scroll.min(max_scroll);
-    let title = match &position {
-        Some(pos) => format!(" × esc  ↑↓ scroll  {pos} "),
-        None => " × esc ".to_string(),
-    };
+    // The title spells the live keys, so the panel never hides that Enter
+    // opens the reference or that `m` marks it (finding 9). While the reader is
+    // typing over a hover panel those keys belong to the prompt, not the panel
+    // (see `panel_owns_keys` in app.rs), so the title then offers only what the
+    // panel still owns: Esc, and — as a fact, not an offer — its scroll spot.
+    let owns_keys = panel.pinned || app.focus != crate::app::Focus::Input;
+    let mut parts: Vec<String> = vec!["× esc".to_string()];
+    if let Some(pos) = &position {
+        parts.push(if owns_keys {
+            format!("↑↓ scroll {pos}")
+        } else {
+            pos.clone()
+        });
+    }
+    if owns_keys {
+        if let Some(url) = app.reference_url(&panel.id) {
+            parts.push(format!("↵ open {}", ref_link_host(&url)));
+        }
+        parts.push("m mark".to_string());
+    }
+    let title = format!(" {} ", parts.join("  "));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.reference))
