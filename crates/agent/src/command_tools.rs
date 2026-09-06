@@ -3765,6 +3765,17 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
     }
 }
 
+/// Each command tool's name and the permission class it declares for itself.
+/// The declaration sits beside the argv the tool actually runs, so it is the
+/// authoritative answer; `permissions` is checked against it.
+#[cfg(test)]
+pub(crate) fn declared_permissions() -> Vec<(&'static str, crate::permissions::PermissionMode)> {
+    COMMAND_TOOLS
+        .iter()
+        .map(|spec| (spec.name, spec.permission_mode))
+        .collect()
+}
+
 fn spec_by_name(tool_name: &str) -> Option<&'static CommandToolSpec> {
     COMMAND_TOOLS.iter().find(|spec| {
         spec.name.eq_ignore_ascii_case(tool_name)

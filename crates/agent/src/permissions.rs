@@ -280,17 +280,17 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         let mut m = HashMap::new();
 
         // Read-only: no side effect outside the process.
+        m.insert("agent", ReadOnly);
         m.insert("agent_capabilities", ReadOnly);
-        m.insert("analyze_phases", ReadOnly);
-        m.insert("billing", ReadOnly);
+        m.insert("bash_task", ReadOnly);
         m.insert("billing_balance", ReadOnly);
         m.insert("billing_history", ReadOnly);
         m.insert("billing_prices", ReadOnly);
         m.insert("billing_read", ReadOnly);
         m.insert("billing_usage", ReadOnly);
-        m.insert("calphad", ReadOnly);
         m.insert("check_background_research", ReadOnly);
         m.insert("check_hpc_queue", ReadOnly);
+        m.insert("cold_start_campaign_handoff", ReadOnly);
         m.insert("compare_materials", ReadOnly);
         m.insert("compute_descriptor", ReadOnly);
         m.insert("compute_estimate", ReadOnly);
@@ -303,28 +303,25 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         m.insert("deploy_read", ReadOnly);
         m.insert("deploy_status", ReadOnly);
         m.insert("describe_structure", ReadOnly);
-        m.insert("discourse", ReadOnly);
         m.insert("discourse_list", ReadOnly);
         m.insert("discourse_read", ReadOnly);
         m.insert("discourse_show", ReadOnly);
         m.insert("discourse_status", ReadOnly);
         m.insert("discourse_turns", ReadOnly);
         m.insert("doctor", ReadOnly);
-        m.insert("evaluate_candidate", ReadOnly);
         m.insert("evaluation_tier_status", ReadOnly);
         m.insert("fetch_artifact", ReadOnly);
         m.insert("goal_list", ReadOnly);
         m.insert("goal_status", ReadOnly);
         m.insert("hea_descriptors", ReadOnly);
-        m.insert("hea_phase_stability", ReadOnly);
         m.insert("job_status_lookup", ReadOnly);
         m.insert("knowledge_corpora", ReadOnly);
         m.insert("knowledge_entity", ReadOnly);
         m.insert("knowledge_paths", ReadOnly);
+        m.insert("labs", ReadOnly);
         m.insert("list_artifacts", ReadOnly);
         m.insert("list_background_research", ReadOnly);
         m.insert("list_models", ReadOnly);
-        m.insert("list_potentials", ReadOnly);
         m.insert("list_predictable_properties", ReadOnly);
         m.insert("lookup_structure", ReadOnly);
         m.insert("lpbf_kou_cracking_index", ReadOnly);
@@ -333,14 +330,12 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         m.insert("mace_get_cached_structure", ReadOnly);
         m.insert("mace_get_job", ReadOnly);
         m.insert("mace_list_jobs", ReadOnly);
-        m.insert("marketplace", ReadOnly);
         m.insert("marketplace_find", ReadOnly);
         m.insert("marketplace_info", ReadOnly);
         m.insert("marketplace_read", ReadOnly);
         m.insert("marketplace_search", ReadOnly);
         m.insert("materials_search", ReadOnly);
         m.insert("mcp_services", ReadOnly);
-        m.insert("mesh", ReadOnly);
         m.insert("mesh_discover", ReadOnly);
         m.insert("mesh_health", ReadOnly);
         m.insert("mesh_peers", ReadOnly);
@@ -351,7 +346,6 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         m.insert("models_list", ReadOnly);
         m.insert("models_read", ReadOnly);
         m.insert("models_search", ReadOnly);
-        m.insert("node", ReadOnly);
         m.insert("node_logs", ReadOnly);
         m.insert("node_probe", ReadOnly);
         m.insert("node_read", ReadOnly);
@@ -365,11 +359,9 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         m.insert("pareto_screen", ReadOnly);
         m.insert("phase_stability", ReadOnly);
         m.insert("plan_simulations", ReadOnly);
-        m.insert("platform_jobs", ReadOnly);
-        m.insert("platform_workflows", ReadOnly);
+        m.insert("plugins", ReadOnly);
         m.insert("policy_evaluate", ReadOnly);
         m.insert("predict", ReadOnly);
-        m.insert("predict_properties", ReadOnly);
         m.insert("predict_property", ReadOnly);
         m.insert("predict_synthesizability", ReadOnly);
         m.insert("prior_art_search", ReadOnly);
@@ -378,116 +370,124 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         m.insert("qe_status", ReadOnly);
         m.insert("query", ReadOnly);
         m.insert("query_materials_project", ReadOnly);
+        m.insert("reverify_candidates", ReadOnly);
         m.insert("reverify_history", ReadOnly);
         m.insert("schedule_list", ReadOnly);
-        m.insert("scheil_solidification", ReadOnly);
         m.insert("screen_materials", ReadOnly);
         m.insert("search_artifacts", ReadOnly);
-        m.insert("select_materials", ReadOnly);
-        m.insert("session_context", ReadOnly);
         m.insert("show_scratchpad", ReadOnly);
         m.insert("status", ReadOnly);
         m.insert("structure", ReadOnly);
         m.insert("structure_similarity", ReadOnly);
+        m.insert("suggest_next_experiments", ReadOnly);
         m.insert("symbolic_check", ReadOnly);
         m.insert("tool_reasoning", ReadOnly);
         m.insert("tools", ReadOnly);
         m.insert("usage_status", ReadOnly);
-        m.insert("web", ReadOnly);
         m.insert("web_browse", ReadOnly);
         m.insert("workflow_list", ReadOnly);
         m.insert("workflow_show", ReadOnly);
 
         // Workspace write: local files and local compute. Reversible, free.
+        m.insert("analyze_phases", WorkspaceWrite);
+        m.insert("calphad", WorkspaceWrite);
         m.insert("calphad_compute", WorkspaceWrite);
-        m.insert("cancel_background_research", WorkspaceWrite);
         m.insert("cold_start_active_learning", WorkspaceWrite);
         m.insert("cold_start_calphad_augmentation", WorkspaceWrite);
-        m.insert("cold_start_campaign_handoff", WorkspaceWrite);
         m.insert("cold_start_foundation_bootstrap", WorkspaceWrite);
         m.insert("dataset", WorkspaceWrite);
+        m.insert("discourse", WorkspaceWrite);
+        m.insert("discourse_create", WorkspaceWrite);
+        m.insert("discourse_run", WorkspaceWrite);
+        m.insert("discourse_write", WorkspaceWrite);
         m.insert("example", WorkspaceWrite);
         m.insert("file", WorkspaceWrite);
         m.insert("generate_report", WorkspaceWrite);
+        m.insert("hea_phase_stability", WorkspaceWrite);
+        m.insert("ingest", WorkspaceWrite);
+        m.insert("ingest_file", WorkspaceWrite);
+        m.insert("ingest_watch", WorkspaceWrite);
+        m.insert("list_potentials", WorkspaceWrite);
         m.insert("mace_cancel_job", WorkspaceWrite);
-        m.insert("mace_compute_dilute_solute", WorkspaceWrite);
-        m.insert("mace_compute_elastic", WorkspaceWrite);
-        m.insert("mace_md_equilibrate", WorkspaceWrite);
-        m.insert("mace_phonon_harmonic", WorkspaceWrite);
         m.insert("mace_relax_structure", WorkspaceWrite);
+        m.insert("marketplace", WorkspaceWrite);
+        m.insert("marketplace_install", WorkspaceWrite);
+        m.insert("marketplace_write", WorkspaceWrite);
         m.insert("materials_discovery", WorkspaceWrite);
+        m.insert("model_train", WorkspaceWrite);
         m.insert("notebook_reset", WorkspaceWrite);
+        m.insert("ontology_proposals_accept", WorkspaceWrite);
+        m.insert("ontology_proposals_reject", WorkspaceWrite);
+        m.insert("ontology_write", WorkspaceWrite);
+        m.insert("papers_ingest", WorkspaceWrite);
         m.insert("plot", WorkspaceWrite);
+        m.insert("predict_properties", WorkspaceWrite);
+        m.insert("provision", WorkspaceWrite);
         m.insert("qe_run", WorkspaceWrite);
         m.insert("qe_write_input", WorkspaceWrite);
-        m.insert("report_bug", WorkspaceWrite);
-        m.insert("research_query", WorkspaceWrite);
+        m.insert("reverify_assertion", WorkspaceWrite);
         m.insert("run_convergence_test", WorkspaceWrite);
         m.insert("run_workflow", WorkspaceWrite);
+        m.insert("scheil_solidification", WorkspaceWrite);
+        m.insert("select_materials", WorkspaceWrite);
+        m.insert("session_context", WorkspaceWrite);
         m.insert("sim_job", WorkspaceWrite);
-        m.insert("sim_run", WorkspaceWrite);
-        m.insert("start_background_research", WorkspaceWrite);
+        m.insert("stop_bash_task", WorkspaceWrite);
         m.insert("structure_import", WorkspaceWrite);
-        m.insert("suggest_next_experiments", WorkspaceWrite);
+        m.insert("web", WorkspaceWrite);
+        m.insert("workflow", WorkspaceWrite);
+        m.insert("workflow_run", WorkspaceWrite);
 
         // Full access: runs code, spends money or a paid quota, or mutates
         // state other people can see. Never auto-approved unattended.
         m.insert("acquire_materials", FullAccess);
-        m.insert("agent", FullAccess);
-        m.insert("bash_task", FullAccess);
+        m.insert("billing", FullAccess);
+        m.insert("cancel_background_research", FullAccess);
         m.insert("compute_cancel", FullAccess);
         m.insert("compute_submit", FullAccess);
         m.insert("deploy", FullAccess);
         m.insert("deploy_create", FullAccess);
         m.insert("deploy_stop", FullAccess);
         m.insert("deploy_write", FullAccess);
-        m.insert("discourse_create", FullAccess);
-        m.insert("discourse_run", FullAccess);
-        m.insert("discourse_write", FullAccess);
         m.insert("doctor_fix", FullAccess);
+        m.insert("evaluate_candidate", FullAccess);
         m.insert("execute_bash", FullAccess);
         m.insert("execute_python", FullAccess);
         m.insert("goal_resume", FullAccess);
         m.insert("goal_start", FullAccess);
-        m.insert("ingest", FullAccess);
         m.insert("ingest_and_wait", FullAccess);
-        m.insert("ingest_file", FullAccess);
-        m.insert("ingest_watch", FullAccess);
         m.insert("knowledge_ingest", FullAccess);
         m.insert("knowledge_write", FullAccess);
-        m.insert("labs", FullAccess);
-        m.insert("marketplace_install", FullAccess);
-        m.insert("marketplace_write", FullAccess);
+        m.insert("mace_compute_dilute_solute", FullAccess);
+        m.insert("mace_compute_elastic", FullAccess);
+        m.insert("mace_md_equilibrate", FullAccess);
+        m.insert("mace_phonon_harmonic", FullAccess);
         m.insert("mcp_services_invoke", FullAccess);
+        m.insert("mesh", FullAccess);
         m.insert("mesh_publish", FullAccess);
         m.insert("mesh_subscribe", FullAccess);
         m.insert("mesh_sync", FullAccess);
         m.insert("mesh_unsubscribe", FullAccess);
         m.insert("mesh_write", FullAccess);
-        m.insert("model_train", FullAccess);
+        m.insert("node", FullAccess);
         m.insert("notebook_exec", FullAccess);
-        m.insert("ontology_proposals_accept", FullAccess);
-        m.insert("ontology_proposals_reject", FullAccess);
-        m.insert("ontology_write", FullAccess);
-        m.insert("papers_ingest", FullAccess);
+        m.insert("platform_jobs", FullAccess);
         m.insert("platform_jobs_submit", FullAccess);
+        m.insert("platform_workflows", FullAccess);
         m.insert("platform_workflows_run", FullAccess);
-        m.insert("plugins", FullAccess);
-        m.insert("provision", FullAccess);
         m.insert("publish", FullAccess);
         m.insert("publish_artifact", FullAccess);
+        m.insert("report_bug", FullAccess);
         m.insert("research", FullAccess);
-        m.insert("reverify_assertion", FullAccess);
-        m.insert("reverify_candidates", FullAccess);
+        m.insert("research_query", FullAccess);
         m.insert("run", FullAccess);
         m.insert("run_model", FullAccess);
         m.insert("run_submit", FullAccess);
         m.insert("schedule_cancel", FullAccess);
         m.insert("schedule_create", FullAccess);
-        m.insert("stop_bash_task", FullAccess);
+        m.insert("sim_run", FullAccess);
+        m.insert("start_background_research", FullAccess);
         m.insert("wf", FullAccess);
-        m.insert("workflow", FullAccess);
-        m.insert("workflow_run", FullAccess);
 
         m
     })
@@ -729,6 +729,32 @@ mod tests {
         );
     }
 
+    /// A command tool declares its own `permission_mode` in the spec table.
+    /// That declaration is authoritative — it sits next to the argv the tool
+    /// actually runs. On 2026-09-06 a hand-written map contradicted 26 of
+    /// them, including `billing` (declared FullAccess with an approval prompt
+    /// because one of its subcommands opens a Stripe checkout) which the map
+    /// called ReadOnly. The map may never disagree again.
+    #[test]
+    fn the_map_never_contradicts_a_command_tools_own_declaration() {
+        let map = tool_permissions();
+        let mut wrong = Vec::new();
+        for (name, declared) in crate::command_tools::declared_permissions() {
+            if let Some(mapped) = map.get(name)
+                && *mapped != declared
+            {
+                wrong.push(format!(
+                    "{name}: map says {mapped}, the tool declares {declared}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} contradictions: {wrong:#?}",
+            wrong.len()
+        );
+    }
+
     /// The tools that spend money or mutate state other people can see must
     /// require the highest class, so no unattended mode can run them quietly.
     #[test]
@@ -745,7 +771,10 @@ mod tests {
             "compute_submit",
             "deploy_create",
             "publish",
-            "marketplace_install",
+            // `marketplace_install` is deliberately absent: its items ship
+            // inside PRISM, so it writes bundled content to a guarded local
+            // path rather than fetching or running third-party code. The
+            // tool declares WorkspaceWrite and the code agrees.
             "schedule_create",
             "notebook_exec",
         ] {
