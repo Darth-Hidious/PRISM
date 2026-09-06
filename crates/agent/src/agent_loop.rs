@@ -162,6 +162,11 @@ const EMPTY_RESULT_MAX: usize = 2;
 // VS2-P1b: bounded verify-by-execution. Three attempts means the initial
 // execution plus two repairs; after that the agent must report honestly.
 const CODE_REPAIR_MAX: usize = 3;
+/// Consecutive failures of ANY other tool before it is stopped for the turn.
+/// Looser than the code cap: a search that misses is normal; eight misses is a loop.
+const TOOL_FAILURE_MAX: usize = 4;
+// The general cap is looser than the code cap, never tighter.
+const _: () = assert!(TOOL_FAILURE_MAX > CODE_REPAIR_MAX);
 /// Canonical code-execution tool names whose failures count toward that cap.
 const CODE_EXEC_TOOLS: &[&str] = &["execute_python", "execute_bash", "notebook_exec"];
 /// How many times the execution-contract gate may reject a finalization in one
@@ -2316,18 +2321,27 @@ fn tool_evidence_requires_success(tool_name: &str) -> bool {
 /// pushed to history separately (h12) BEFORE this directive so the model has
 /// both the honest failure and the instruction to stop.
 fn code_repair_directive(tool: &str, streak: usize) -> Option<String> {
-    if streak < CODE_REPAIR_MAX {
-        return None;
+    if CODE_EXEC_TOOLS.contains(&tool) {
+        if streak < CODE_REPAIR_MAX {
+            return None;
+        }
+        return Some(format!(
+            "{tool} failed {streak} consecutive times. Self-repair beyond 2 attempts rarely \
+             fixes the root cause — STOP editing and retrying. Report honestly: quote the \
+             traceback (the final error line is the real cause), and either ask the user for \
+             help or take a fundamentally different approach. Do not narrate the trace; act on \
+             the final error line."
+        ));
     }
-    if !CODE_EXEC_TOOLS.contains(&tool) {
+    // Any other tool: a run of failures with varying arguments is still a loop
+    // (`tools reload`, `tools --help`, … eight times, live). Stop it.
+    if streak < TOOL_FAILURE_MAX {
         return None;
     }
     Some(format!(
-        "{tool} failed {streak} consecutive times. Self-repair beyond 2 attempts rarely \
-         fixes the root cause — STOP editing and retrying. Report honestly: quote the \
-         traceback (the final error line is the real cause), and either ask the user for \
-         help or take a fundamentally different approach. Do not narrate the trace; act on \
-         the final error line."
+        "{tool} failed {streak} consecutive times, with different arguments each time. \
+         Retrying it is not working — STOP calling {tool} this turn. Quote the last error \
+         honestly, then use a different tool or ask the user."
     ))
 }
 
@@ -3783,9 +3797,10 @@ pub(crate) async fn run_turn_inner(
     let mut discovery_streak: usize = 0;
     // Track consecutive empty results per tool name
     let mut empty_result_streak: HashMap<String, usize> = HashMap::new();
-    // VS2-P1b: track consecutive FAILED code-exec calls per tool name. Resets
-    // on any successful code-exec call. Mirrors empty_result_streak's pattern.
-    let mut code_failure_streak: HashMap<String, usize> = HashMap::new();
+    // Consecutive FAILED calls per tool name, every tool. Resets on that
+    // tool's next success. Code-exec tools trip at CODE_REPAIR_MAX, the rest
+    // at TOOL_FAILURE_MAX (see code_repair_directive).
+    let mut failure_streak: HashMap<String, usize> = HashMap::new();
     let mut announced_needs_human: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut story_seq = 0usize;
@@ -5430,9 +5445,9 @@ pub(crate) async fn run_turn_inner(
             // notebook -> notebook_exec) so alias-invoked cells count toward
             // the cap and share the streak with the canonical name.
             let canonical_tool = command_tools::canonical_code_exec_tool(tool_name.as_str());
-            if CODE_EXEC_TOOLS.contains(&canonical_tool) {
+            {
                 if is_error {
-                    let streak = code_failure_streak
+                    let streak = failure_streak
                         .entry(canonical_tool.to_string())
                         .or_insert(0);
                     *streak += 1;
@@ -5490,7 +5505,7 @@ pub(crate) async fn run_turn_inner(
                     }
                 } else {
                     // Success: reset this tool's failure streak.
-                    code_failure_streak.remove(canonical_tool);
+                    failure_streak.remove(canonical_tool);
                 }
             }
 
@@ -6824,12 +6839,20 @@ mod tests {
         assert!(code_repair_directive("execute_bash", 5).is_some());
     }
 
+    /// Live 2026-09-06: `tools` errored eight times in a row with different
+    /// arguments each time (`reload`, `--help`, …) and nothing stopped it —
+    /// the repetition guard wants identical arguments and the repair cap was
+    /// code-exec only. Every tool gets a cap; code tools keep the tighter one.
     #[test]
-    fn p1b_code_repair_directive_none_for_non_code_tools() {
-        // A non-code tool failing repeatedly is NOT a verify-by-execution spiral
-        // — don't gate it with the repair directive.
+    fn every_tool_has_a_failure_cap_and_code_tools_keep_the_tighter_one() {
         assert_eq!(code_repair_directive("read_file", 3), None);
-        assert_eq!(code_repair_directive("search", 10), None);
+        assert_eq!(code_repair_directive("tools", TOOL_FAILURE_MAX - 1), None);
+        let msg = code_repair_directive("tools", TOOL_FAILURE_MAX)
+            .expect("a non-code tool that keeps failing is stopped too");
+        assert!(msg.contains("tools failed"), "{msg}");
+        assert!(msg.to_lowercase().contains("stop"), "{msg}");
+        assert!(code_repair_directive("search", 10).is_some());
+        assert!(code_repair_directive("execute_python", CODE_REPAIR_MAX).is_some());
     }
 
     #[test]
