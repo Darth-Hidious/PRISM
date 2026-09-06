@@ -24,8 +24,6 @@ pub struct NodeConfig {
     #[serde(default)]
     pub ontology: OntologySection,
     #[serde(default)]
-    pub auth: AuthSection,
-    #[serde(default)]
     pub audit: AuditSection,
     #[serde(default)]
     pub llm: LlmSection,
@@ -101,16 +99,6 @@ pub struct OntologySection {
     /// on-device model), else cloud.
     #[serde(default = "default_locality")]
     pub locality: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthSection {
-    #[serde(default = "default_session_timeout")]
-    pub session_timeout: String,
-    #[serde(default = "default_true")]
-    pub require_platform_auth: bool,
-    #[serde(default = "default_true")]
-    pub allow_local_users: bool,
 }
 
 /// Cross-org audit envelopes (F5). When enabled (the default), the node
@@ -491,9 +479,6 @@ fn default_llm_provider() -> String {
 fn default_locality() -> String {
     "auto".into()
 }
-fn default_session_timeout() -> String {
-    "24h".into()
-}
 fn default_true() -> bool {
     true
 }
@@ -559,16 +544,6 @@ impl Default for OntologySection {
             llm_provider: default_llm_provider(),
             mapping_file: None,
             locality: default_locality(),
-        }
-    }
-}
-
-impl Default for AuthSection {
-    fn default() -> Self {
-        Self {
-            session_timeout: default_session_timeout(),
-            require_platform_auth: true,
-            allow_local_users: true,
         }
     }
 }
@@ -655,7 +630,7 @@ impl NodeConfig {
     /// whole-struct replacement (`config = pc`) behind a comment promising a
     /// merge: because every section is `#[serde(default)]`, a project file
     /// containing only `[ingest]` parsed cleanly and erased `[llm]`,
-    /// `[ontology]`, `[auth]` and `[platform]` from the global file. Merging
+    /// `[ontology]` and `[platform]` from the global file. Merging
     /// at the TOML table's top level gives exactly what the search order
     /// promised — a key a file states wins; a key it omits is inherited.
     pub fn load_from_paths(global: Option<&Path>, project: Option<&Path>) -> (Self, Vec<String>) {
@@ -680,6 +655,17 @@ impl NodeConfig {
                     path.display()
                 )),
             }
+        }
+        // `[auth]` was a section whose every key was read by no code — a
+        // default-true `require_platform_auth` that enforced nothing. The
+        // struct is gone; a file that still carries it is told, not humoured.
+        if table.contains_key("auth") {
+            diagnostics.push(
+                "ignoring [auth]: PRISM has no authentication section. `require_platform_auth` \
+                 and `allow_local_users` were never read by any code, so they enforced \
+                 nothing; remove the section."
+                    .to_string(),
+            );
         }
         let config = match table.try_into::<Self>() {
             Ok(config) => config,
@@ -716,6 +702,28 @@ impl NodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[auth]` shipped as a section with `require_platform_auth = true` by
+    /// default, in the sample config, and no code ever read it — a security
+    /// assurance that enforced nothing. The struct is gone; a file that still
+    /// carries the section must be TOLD so, not silently accepted.
+    #[test]
+    fn an_auth_section_is_reported_not_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prism.toml");
+        std::fs::write(
+            &path,
+            "[auth]\nrequire_platform_auth = true\nallow_local_users = true\n",
+        )
+        .unwrap();
+        let (_config, diagnostics) = NodeConfig::load_from_paths(Some(&path), None);
+        let about_auth = diagnostics
+            .iter()
+            .find(|d| d.contains("[auth]"))
+            .unwrap_or_else(|| panic!("no diagnostic about [auth]: {diagnostics:?}"));
+        assert!(about_auth.contains("never read"), "{about_auth}");
+        assert!(about_auth.contains("require_platform_auth"), "{about_auth}");
+    }
 
     /// One stray comma must not silently revert the active ontology.
     #[test]
@@ -867,11 +875,6 @@ publish_port = 7328
 engine = "llm"
 llm_provider = "platform"
 mapping_file = "mappings/materials.yaml"
-
-[auth]
-session_timeout = "24h"
-require_platform_auth = true
-allow_local_users = true
 
 [indexer]
 mode = "managed"
