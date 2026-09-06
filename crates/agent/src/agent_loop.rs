@@ -883,14 +883,44 @@ const MAX_BUDGET_REFUSALS: usize = 2;
 const BUDGET_CUTOFF_NOTE: &str = "[Time budget spent and the model kept asking for tools; the \
 turn ends with what is written above. What was not searched is the open list.]";
 
-/// The tool result a call receives once the deadline has passed: a refusal,
-/// so the history stays well-formed (every call has its result) and the
-/// model is told, in the slot it is reading, to write the answer.
+/// Tools that stay callable after the deadline: the ones that WRITE the
+/// answer into the document. Measured 2026-09-06: three research runs
+/// (9, 10, 11) reached the deadline with their section fully drafted and
+/// lost it, because the deadline removed every tool including the file
+/// writer — the model was told to "synthesise now" and left with no way to
+/// save. Search and compute stay refused; saving never is.
+pub fn survives_deadline(tool_name: &str) -> bool {
+    matches!(tool_name, "file" | "apply_patch")
+}
+
+/// Split a round's tool calls at the deadline: the write tools run, the rest
+/// are refused.
+pub fn partition_deadline_calls<T>(
+    calls: &[T],
+    name: impl Fn(&T) -> &str,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut allowed = Vec::new();
+    let mut refused = Vec::new();
+    for (i, c) in calls.iter().enumerate() {
+        if survives_deadline(name(c)) {
+            allowed.push(i);
+        } else {
+            refused.push(i);
+        }
+    }
+    (allowed, refused)
+}
+
+/// The tool result a search or compute call receives once the deadline has
+/// passed: a refusal, so the history stays well-formed (every call has its
+/// result) and the model is told, in the slot it is reading, to write the
+/// answer — and that the file tools still work for exactly that.
 fn budget_refusal_result(call_id: &str) -> ChatMessage {
     ChatMessage {
         role: "tool".to_string(),
         content: Some(
-            "refused: the time budget is spent — no tool runs. Write the answer now from what \
+            "refused: the time budget is spent — no search or compute tool runs. The file tools \
+             (`file`, `apply_patch`) still do: write the answer into the document now from what \
              has been found, with its citations, and list what was not searched as open items."
                 .to_string(),
         ),
@@ -921,8 +951,10 @@ fn synthesis_now_message(minutes_used: u64) -> ChatMessage {
             "TIME BUDGET REACHED after {minutes_used} min. Synthesise the answer NOW from what \
              has been found: state the findings with their citations (DOI, database id, \
              source), then list what was not searched or is still unanswered as open items. \
-             No more tool calls this turn — none are offered. An honest partial answer with \
-             open items beats no answer."
+             No more search or compute calls this turn — only the file tools (`file`, \
+             `apply_patch`) are still offered, so write the section into the document NOW. \
+             An honest partial answer saved to the file beats a finished one that was never \
+             written."
         )),
         tool_calls: None,
         tool_call_id: None,
@@ -3874,7 +3906,9 @@ pub(crate) async fn run_turn_inner(
         }
 
         if budget_exhausted {
-            relevant_tools.clear();
+            // Only the file writers remain: the deadline stops searching and
+            // computing, never saving.
+            relevant_tools.retain(|t| survives_deadline(&t.function.name));
         }
         let mut capability_menu = influence_meta
             .is_none()
@@ -4271,7 +4305,7 @@ pub(crate) async fn run_turn_inner(
         history.push(response.message.clone());
 
         // ── 2g. Check for tool calls ──────────────────────────────
-        let tool_calls = match &response.message.tool_calls {
+        let mut tool_calls = match &response.message.tool_calls {
             Some(calls) if !calls.is_empty() => calls.clone(),
             _ => {
                 // No tool calls → turn complete.
@@ -4609,11 +4643,19 @@ pub(crate) async fn run_turn_inner(
         // answered with a refusal instead; after two such rounds the turn
         // ends with the text written so far.
         if budget_exhausted {
-            budget_refusals += 1;
-            for tool_call in &tool_calls {
-                history.push(budget_refusal_result(&tool_call.id));
+            let (allowed, refused) =
+                partition_deadline_calls(&tool_calls, |c| c.function.name.as_str());
+            for i in &refused {
+                history.push(budget_refusal_result(&tool_calls[*i].id));
             }
-            if budget_refusals >= MAX_BUDGET_REFUSALS {
+            if !allowed.is_empty() {
+                // The write tools run; only the refused calls are dropped.
+                let kept: Vec<_> = allowed.iter().map(|i| tool_calls[*i].clone()).collect();
+                tool_calls = kept;
+            } else {
+                budget_refusals += 1;
+            }
+            if allowed.is_empty() && budget_refusals >= MAX_BUDGET_REFUSALS {
                 emit(AgentEvent::TextDelta {
                     text: format!("\n\n{BUDGET_CUTOFF_NOTE}"),
                 });
@@ -4631,7 +4673,9 @@ pub(crate) async fn run_turn_inner(
                 });
                 return Ok(());
             }
-            continue;
+            if tool_calls.is_empty() {
+                continue;
+            }
         }
 
         // ── 2h. Process each tool call ────────────────────────────
@@ -6295,7 +6339,9 @@ mod tests {
         let text = refusal.content.clone().unwrap_or_default().to_lowercase();
         assert!(text.starts_with("refused"), "{text}");
         assert!(
-            text.contains("no tool runs") && text.contains("open items"),
+            text.contains("no search or compute tool runs")
+                && text.contains("file tools")
+                && text.contains("open items"),
             "{text}"
         );
         assert_eq!(
@@ -6319,11 +6365,39 @@ mod tests {
         let text = msg.content.clone().unwrap_or_default();
         assert!(text.contains("17 min"), "{text}");
         assert!(text.to_lowercase().contains("synthesise"), "{text}");
-        assert!(text.to_lowercase().contains("no more tool calls"), "{text}");
+        let low = text.to_lowercase();
+        assert!(low.contains("no more search or compute calls"), "{text}");
+        // The whole point of the change: the writer survives the deadline.
+        assert!(
+            low.contains("`file`") && low.contains("apply_patch"),
+            "{text}"
+        );
         assert!(
             text.to_lowercase().contains("not searched"),
             "say what is open: {text}"
         );
+    }
+
+    /// Three runs reached the deadline with their section drafted and lost it,
+    /// because the deadline removed the file writer too. Saving survives.
+    #[test]
+    fn the_deadline_keeps_the_file_tools_and_refuses_the_rest() {
+        assert!(survives_deadline("file"));
+        assert!(survives_deadline("apply_patch"));
+        assert!(!survives_deadline("web"));
+        assert!(!survives_deadline("qe_run"));
+        assert!(!survives_deadline("mace_md_equilibrate"));
+        let calls = ["web", "file", "prior_art_search", "apply_patch"];
+        let (allowed, refused) = partition_deadline_calls(&calls, |c| c);
+        assert_eq!(allowed, vec![1, 3]);
+        assert_eq!(refused, vec![0, 2]);
+        let msg = synthesis_now_message(40).content.unwrap_or_default();
+        assert!(
+            msg.contains("`file`") && msg.contains("apply_patch"),
+            "{msg}"
+        );
+        let refusal = budget_refusal_result("c1").content.unwrap_or_default();
+        assert!(refusal.contains("file tools"), "{refusal}");
     }
 
     #[test]
