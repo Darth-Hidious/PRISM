@@ -1550,7 +1550,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // knows mouse selection is enabled and how to leave.
     if app.copy_mode {
         spans.push(Span::styled(
-            " COPY MODE — mouse selection enabled, Ctrl-Y to exit ",
+            COPY_MODE_BANNER,
             Style::default()
                 .fg(t.status_fg)
                 .bg(t.accent)
@@ -1561,19 +1561,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
     let focus_idx = spans.len();
     spans.push(Span::styled(focus_indicator, Style::default().fg(t.warn)));
-    // What the reader can do with the line they just clicked. Selection is
+    // What the reader can do with the line they just picked. Selection is
     // only half of pointing: without this the mark appears and the reader is
-    // left to guess what it bought them.
-    if app.selected_line.is_some() {
-        // Says what the line opens, so the reader knows before pressing Enter
-        // whether there is anything behind it. Drawn after the transcript, so
-        // the count is this frame's.
-        let hint = match app.cursor_refs().len() {
-            0 => "   e ask about this line · Esc clear".to_string(),
-            1 => "   1 ref · ↵ open · m mark · e ask · Esc clear".to_string(),
-            n => format!("   {n} refs · ↵ open · Tab next · m mark · e ask · Esc clear"),
-        };
-        spans.push(Span::styled(hint, Style::default().fg(t.reference)));
+    // left to guess what it bought them. Says what the line opens, so the
+    // reader knows before pressing Enter whether there is anything behind
+    // it. Drawn after the transcript, so the count is this frame's.
+    let cursor_refs = app.selected_line.is_some().then(|| app.cursor_refs().len());
+    let mut hint_stage = HintStage::Full;
+    if let Some(refs) = cursor_refs {
+        spans.push(Span::styled(
+            cursor_hint(refs, hint_stage),
+            Style::default().fg(t.reference),
+        ));
     }
     spans.push(Span::styled("   Ctrl-C quit", Style::default().fg(t.muted)));
 
@@ -1582,7 +1581,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // "Ctrl-C qu", and with throughput and cost shown it ended in
     // "[Ctrl-T: show reas". Drop order: the focus tag (the prompt border
     // already shows focus; a pending approval is a state, so it stays), the
-    // throughput, the cost, then the reasoning hint takes its short form.
+    // throughput, the cost, then the reasoning hint takes its short form,
+    // the copy-mode banner loses its explanation, and the cursor hint loses
+    // its verbs and then everything but the count. The hint was once outside
+    // the ladder: with two references it is 22 cells longer than the old
+    // "e ask about this line · Esc clear", and at 80x24 it pushed the quit
+    // key off the row.
     let mut line = Line::from(spans);
     let width = usize::from(area.width);
     let trims = [
@@ -1590,6 +1594,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         FooterTrim::Group("tok/s:"),
         FooterTrim::Group("cost:"),
         FooterTrim::ShortReasoning,
+        FooterTrim::ShortCopyBanner,
+        FooterTrim::CursorHint(HintStage::Keys),
+        FooterTrim::CursorHint(HintStage::Count),
         // Last resort, seen live with an approval pending (the focus tag is a
         // state then and stays): the balance goes before the quit hint does.
         FooterTrim::Group("credits:"),
@@ -1611,6 +1618,24 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     }
                 }
             }
+            FooterTrim::ShortCopyBanner => {
+                for span in &mut line.spans {
+                    if span.content == COPY_MODE_BANNER {
+                        span.content = " COPY MODE · Ctrl-Y to exit ".into();
+                    }
+                }
+            }
+            FooterTrim::CursorHint(stage) => {
+                if let Some(refs) = cursor_refs {
+                    let current = cursor_hint(refs, hint_stage);
+                    for span in &mut line.spans {
+                        if span.content.as_ref() == current.as_str() {
+                            span.content = cursor_hint(refs, stage).into();
+                        }
+                    }
+                    hint_stage = stage;
+                }
+            }
         }
     }
     f.render_widget(
@@ -1627,6 +1652,44 @@ enum FooterTrim {
     Group(&'static str),
     /// The reasoning hint's short form.
     ShortReasoning,
+    /// The copy-mode banner without its explanation; the mode and its exit
+    /// key stay.
+    ShortCopyBanner,
+    /// The cursor hint at a shorter stage.
+    CursorHint(HintStage),
+}
+
+/// The copy-mode banner at full length. Copy mode is a modal input state, so
+/// the row names it and the key that leaves it; the explanation is what a
+/// narrow row gives up.
+const COPY_MODE_BANNER: &str = " COPY MODE — mouse selection enabled, Ctrl-Y to exit ";
+
+/// How much of the cursor hint the footer can afford: every word, the count
+/// and the bare keys, or the count alone.
+#[derive(Clone, Copy)]
+enum HintStage {
+    Full,
+    Keys,
+    Count,
+}
+
+/// What the cursor line offers, at the given length. Three leading cells
+/// separate it from the focus tag, as every footer group is separated.
+fn cursor_hint(refs: usize, stage: HintStage) -> String {
+    let words = match (refs, stage) {
+        (0, HintStage::Full) => "e ask about this line · Esc clear".to_string(),
+        (0, HintStage::Keys) => "e ask · Esc clear".to_string(),
+        (0, HintStage::Count) => "e · Esc".to_string(),
+        (1, HintStage::Full) => "1 ref · ↵ open · m mark · e ask · Esc clear".to_string(),
+        (1, HintStage::Keys) => "1 ref · ↵ m e Esc".to_string(),
+        (1, HintStage::Count) => "1 ref".to_string(),
+        (n, HintStage::Full) => {
+            format!("{n} refs · ↵ open · Tab next · m mark · e ask · Esc clear")
+        }
+        (n, HintStage::Keys) => format!("{n} refs · ↵ Tab m e Esc"),
+        (n, HintStage::Count) => format!("{n} refs"),
+    };
+    format!("   {words}")
 }
 
 /// Remove a footer group `label`, " ", value, "  " (four spans) by its label.

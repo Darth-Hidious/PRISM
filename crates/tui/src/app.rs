@@ -2526,7 +2526,11 @@ impl App {
                 }
             }
             KeyCode::Char('i') => self.focus = Focus::Input,
-            KeyCode::Char('o') => {
+            // `o` opens only when there is something to open; otherwise it is
+            // a letter and lands in the prompt below, like `e` with nothing
+            // selected. Without the guard it was a dead key: no panel, no
+            // toast, and the keystroke swallowed.
+            KeyCode::Char('o') if !self.cursor_refs().is_empty() => {
                 self.open_cursor_reference();
             }
             // The link picker moved to the shifted letter so that `o` could

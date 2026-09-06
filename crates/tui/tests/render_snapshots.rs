@@ -4291,6 +4291,30 @@ fn narrow_frames_read_the_same_in_mono_80x24() {
     assert_eq!(render_app_to_string(&app, 80, 24), overlay);
 }
 
+/// A transcript with one line that carries two references — a provenance
+/// record and the tool that produced it — the smallest line on which Enter,
+/// Tab and `m` all have something to do.
+fn two_reference_line_app() -> App {
+    use prism_tui::refs::{RefKind, ReferenceEntry};
+
+    let mut app = fake_app();
+    app.references.insert(ReferenceEntry {
+        id: "provenance://materials_search/0".into(),
+        kind: RefKind::Provenance,
+        tokens: vec!["OQMD".into()],
+    });
+    app.references.insert(ReferenceEntry {
+        id: "tool://materials_search".into(),
+        kind: RefKind::Tool,
+        tokens: vec!["materials_search".into()],
+    });
+    app.apply_agent_msg(AgentMsg::TextDelta(
+        "OQMD via materials_search returned 12 rows.\nThe solidus sits near 1878 K.\n".into(),
+    ));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    app
+}
+
 /// The keyboard reaches what the pointer reaches.
 ///
 /// Over SSH, in tmux with the mouse off, and in macOS Terminal (which reports
@@ -4306,24 +4330,9 @@ fn keyboard_cursor_reaches_every_reference(copy_mode: bool) {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use prism_tui::app::explain_request;
     use prism_tui::hit_map::HitTarget;
-    use prism_tui::refs::{RefKind, ReferenceEntry};
 
-    let mut app = fake_app();
+    let mut app = two_reference_line_app();
     app.copy_mode = copy_mode;
-    app.references.insert(ReferenceEntry {
-        id: "provenance://materials_search/0".into(),
-        kind: RefKind::Provenance,
-        tokens: vec!["OQMD".into()],
-    });
-    app.references.insert(ReferenceEntry {
-        id: "tool://materials_search".into(),
-        kind: RefKind::Tool,
-        tokens: vec!["materials_search".into()],
-    });
-    app.apply_agent_msg(AgentMsg::TextDelta(
-        "OQMD via materials_search returned 12 rows.\nThe solidus sits near 1878 K.\n".into(),
-    ));
-    app.apply_agent_msg(AgentMsg::TextFlush);
     let rendered = render_app_to_string(&app, 120, 30);
     assert!(rendered.contains("OQMD via materials_search"), "{rendered}");
 
@@ -4359,12 +4368,17 @@ fn keyboard_cursor_reaches_every_reference(copy_mode: bool) {
         selected.text, drawn,
         "the cursor holds the line as DRAWN, byte for byte"
     );
-    // Wide enough for the footer to hold the hint beside the copy-mode banner;
-    // what the row drops when it is short is the trim ladder's business.
+    // Wide enough for the footer to hold the whole hint beside the copy-mode
+    // banner; what the row shortens when it is narrow is
+    // `the_footer_keeps_its_last_words_with_a_line_selected`'s business.
     let rendered = render_app_to_string(&app, 170, 30);
     assert!(
         rendered.contains("2 refs · ↵ open · Tab next"),
         "the footer says what the line opens and which keys do it:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Ctrl-C quit"),
+        "and the hint never evicts the footer's last words:\n{rendered}"
     );
 
     app.handle_key(key(KeyCode::Enter));
@@ -4401,6 +4415,14 @@ fn keyboard_cursor_reaches_every_reference(copy_mode: bool) {
     assert!(
         wire.contains("tool://materials_search"),
         "m marks the reference the panel shows, and the mark travels on the wire: {wire}"
+    );
+    // `m` toggles: the second press withdraws the mark, and the withdrawal
+    // reaches the wire too — that is what lets the agent forget it.
+    app.handle_key(key(KeyCode::Char('m')));
+    let wire = app.marks.wire().to_string();
+    assert!(
+        !wire.contains("tool://materials_search"),
+        "a second m unmarks it: {wire}"
     );
 
     app.handle_key(key(KeyCode::Esc));
@@ -4441,6 +4463,90 @@ fn keyboard_cursor_reaches_every_reference_with_the_mouse_captured() {
 #[test]
 fn keyboard_cursor_reaches_every_reference_in_copy_mode() {
     keyboard_cursor_reaches_every_reference(true);
+}
+
+/// The cursor hint never evicts the footer's last words.
+///
+/// The hint for a line with two references is 22 cells longer than the old
+/// "e ask about this line · Esc clear", and as a span the trim ladder did not
+/// know about it pushed "Ctrl-C quit" off the row: measured at 80x24 with no
+/// sidebar and no banner, and at 120x30 where the sidebar leaves 79 columns,
+/// with and without the copy-mode banner. The hint is a rung of the ladder
+/// now — it loses its verbs, then everything but the count — and the banner
+/// loses its explanation before the count goes, so the quit key, the count,
+/// and the mode all survive.
+#[test]
+fn the_footer_keeps_its_last_words_with_a_line_selected() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+    for (width, height, copy_mode) in [(80u16, 24u16, false), (120, 30, false), (120, 30, true)] {
+        let mut app = two_reference_line_app();
+        app.copy_mode = copy_mode;
+        let _ = render_app_to_string(&app, width, height);
+        app.focus = Focus::Chat;
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.cursor_refs().len(),
+            2,
+            "j twice puts the cursor on the two-reference line at {width}x{height}"
+        );
+        let rendered = render_app_to_string(&app, width, height);
+        let footer = rendered.lines().last().expect("a footer row");
+        assert!(
+            footer.contains("Ctrl-C quit"),
+            "the last words survive the cursor hint at {width}x{height} copy_mode={copy_mode}:\n{rendered}"
+        );
+        assert!(
+            footer.contains("2 refs"),
+            "and the count survives with them at {width}x{height} copy_mode={copy_mode}:\n{rendered}"
+        );
+        if copy_mode {
+            assert!(
+                footer.contains("COPY MODE") && footer.contains("Ctrl-Y"),
+                "the mode and its exit key survive too:\n{rendered}"
+            );
+        }
+    }
+}
+
+/// `o` with nothing to open is a letter, like `e` with nothing selected.
+///
+/// Before the guard it was a dead key in Chat focus: no panel, no toast, and
+/// the keystroke swallowed — the one thing the letters-type-everywhere rule
+/// forbids.
+#[test]
+fn o_with_nothing_to_open_types_into_the_prompt() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = two_reference_line_app();
+    let _ = render_app_to_string(&app, 120, 30);
+    let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+
+    // No cursor at all.
+    app.focus = Focus::Chat;
+    app.handle_key(key(KeyCode::Char('o')));
+    assert_eq!(
+        app.focus,
+        Focus::Input,
+        "an unbound o means \"I am writing\""
+    );
+    assert_eq!(app.input.lines().join(""), "o");
+    assert!(app.ref_panel.is_none());
+
+    // A cursor on a line with no references: line 1 is the `◆ PRISM` header.
+    app.focus = Focus::Chat;
+    app.handle_key(key(KeyCode::Char('j')));
+    assert!(app.selected_line.is_some());
+    assert!(
+        app.cursor_refs().is_empty(),
+        "the header line opens nothing"
+    );
+    app.handle_key(key(KeyCode::Char('o')));
+    assert_eq!(app.focus, Focus::Input);
+    assert_eq!(app.input.lines().join(""), "oo");
+    assert!(app.ref_panel.is_none());
 }
 
 /// The view follows the cursor, one row at a time.
