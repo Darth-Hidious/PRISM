@@ -209,6 +209,26 @@ Ten of the fifteen compositions were searched. **These verdicts are unverified**
 **The four not found in the searches** (O1-Fe0, O2-TF, F1, F2) each have a named nearest published neighbour, listed above, typically a nickel-base high-entropy superalloy sharing the element set. "Not found in the literature searched" is a statement about the search, not a novelty claim.
 
 
+## 5b. Configurational thermodynamics — does the solid solution survive? (class: execution)
+
+Cluster expansions fitted to MACE energies (76 structures each, 5-fold cross-validation) and canonical Monte Carlo at 773, 1000 and 1273 K. All ten fits pass a 15 meV/atom cross-validation gate. Warren-Cowley parameters are given as the largest absolute value over significant pairs; a value near zero means a random solid solution.
+
+| alloy | lattice | CE cutoffs Å | structures fitted | CV error meV/atom | SRO at 773 K | SRO at 1000 K | SRO at 1273 K | verdict |
+|---|---|---|---|---|---|---|---|---|
+| O2-TF-Fe0 (Ni60Co12Cr12Al8W4Mo4) | FCC | 4.5 / 3.5 | 76 | 8.0 | very strong (max α=1.00) | very strong (0.99) | strong (0.92) | not a random SS at any T; Ni–Al order + W/Mo–Al/W–Mo avoidance; strengthens on cooling, no transition in-window |
+| H6 (Ni55Al15Co10Cr10W5Mo5) | FCC | 4.5 / 3.5 | 76 | 8.8 | very strong (max α=1.88) | very strong (1.65) | very strong (1.35) | not a random SS at any T; strongest FCC SRO; Cr–Mo pairing = σ precursor |
+| H4 (Al4Ti2Co24Cr24Fe23Ni23) | FCC | 4.5 / 3.5 | 76 | 6.3 | matrix ~random; Al–Ti +0.96, Ti–Ni −0.70, Ni–Al −0.56 | matrix ~random; Ti–Ni −0.45 | solute SRO only (Al–Ti +0.87) | matrix stays disordered at all 3 T; only dilute Al/Ti order with Ni (γ′/η precursors), growing below ~1000 K |
+| H1 (Al20Cr20Mo20Nb20Ti20) | BCC | 5.0 / 4.0 | 76 | 6.4 | very strong (max α=1.20) | very strong (1.15) | very strong (1.07) | not a random SS at any T; Ti–Cr/Cr–Mo attraction, Al–Cr avoidance, B2-like Al–Ti order |
+| N1 (Nb20Mo20Ta20Ti20Ni20) | BCC | 5.0 / 4.0 | 76 | 7.0 | very strong (max α=1.53) | very strong (1.33) | strong (1.19) | not a random SS at any T; Ni–Ti ordering, Ni–Mo avoidance |
+| N2 (Nb20Mo20Ta20W20Ni20) | BCC | 5.0 / 4.0 | 76 | 7.1 | very strong (max α=1.86) | very strong (1.82) | very strong (1.61) | not a random SS at any T; Ni–Ta ordering, Nb–Ta / Ni–Mo near-total avoidance |
+| O1-Fe0 (Ni45Co20Cr15W10Mo5Al5) | FCC | 4.5 / 3.5 | 76 | 9.5 | very strong (max α=1.04) | very strong (0.94) | strong (0.77) | not a random SS at any T; Ni–Al order + Al–Cr/Mo–Al/W–Mo avoidance |
+| H3 (Al20Mo10Nb20Ta10Ti20Zr20) | BCC | 4.5 / 3.5 | 76 | 7.7 | very strong (max α=1.27) | very strong (1.18) | strong (0.89) | not a random SS at any T; Ti–Mo and Al–Zr ordering, Al–Mo avoidance |
+| O3-Fe0 (Ni60Al15Co10Cr10W5) | FCC | 4.5 / 3.5 | 76 | 4.3 | very strong (max α=1.69) | very strong (1.24) | strong (0.99) | not a random SS at any T; W–Al near-total avoidance, Co–W ordering, Ni–Al order |
+| H2 (Al13Cr7Mo19Nb18Ta26Ti17) | BCC | 4.5 / 3.5 | 76 | 8.5 | extreme (max α=2.30) | extreme (2.02) | extreme (1.64) | not a random SS at any T; strongest SRO in the set: B2 Al–Ti order + Mo–Ta/Ta–Cr sorting |
+
+**The central result.** Nine of the ten candidates do **not** remain random solid solutions at any temperature between 773 and 1273 K. Only H4 (Al4Ti2Co24Cr24Fe23Ni23) keeps a disordered matrix, with ordering confined to its dilute aluminium and titanium. Every refractory high-entropy alloy tested (H1, H2, H3, N1, N2) orders strongly, H2 most extremely of all. For the nickel-base γ/γ′ compositions the ordering is partly by design — the nickel-aluminium ordering is the γ′ the alloy is meant to form — but the accompanying tungsten, molybdenum and chromium clustering is not, and is a topologically-close-packed-phase precursor. This is the discriminator the empirical descriptors could not provide.
+
+
 ## 6. Limitations and open items
 
 **What would change these recommendations.**
