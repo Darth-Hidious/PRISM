@@ -60,6 +60,216 @@ impl std::fmt::Display for PermissionMode {
     }
 }
 
+/// Every tool PRISM ships: the Python tool server's registry plus the Rust
+/// command tools, captured on 2026-09-06. The test below fails if the permission map drifts
+/// from this list in either direction — a tool with no class, or a class for a
+/// tool that no longer exists.
+pub const SHIPPED_TOOLS: &[&str] = &[
+    "acquire_materials",
+    "agent",
+    "agent_capabilities",
+    "analyze_phases",
+    "bash_task",
+    "billing",
+    "billing_balance",
+    "billing_history",
+    "billing_prices",
+    "billing_read",
+    "billing_usage",
+    "calphad",
+    "calphad_compute",
+    "cancel_background_research",
+    "check_background_research",
+    "check_hpc_queue",
+    "cold_start_active_learning",
+    "cold_start_calphad_augmentation",
+    "cold_start_campaign_handoff",
+    "cold_start_foundation_bootstrap",
+    "compare_materials",
+    "compute_cancel",
+    "compute_descriptor",
+    "compute_estimate",
+    "compute_gpus",
+    "compute_providers",
+    "compute_read",
+    "compute_status",
+    "compute_submit",
+    "dataset",
+    "deploy",
+    "deploy_create",
+    "deploy_health",
+    "deploy_list",
+    "deploy_read",
+    "deploy_status",
+    "deploy_stop",
+    "deploy_write",
+    "describe_structure",
+    "discourse",
+    "discourse_create",
+    "discourse_list",
+    "discourse_read",
+    "discourse_run",
+    "discourse_show",
+    "discourse_status",
+    "discourse_turns",
+    "discourse_write",
+    "doctor",
+    "doctor_fix",
+    "evaluate_candidate",
+    "evaluation_tier_status",
+    "example",
+    "execute_bash",
+    "execute_python",
+    "fetch_artifact",
+    "file",
+    "generate_report",
+    "goal_list",
+    "goal_resume",
+    "goal_start",
+    "goal_status",
+    "hea_descriptors",
+    "hea_phase_stability",
+    "ingest",
+    "ingest_and_wait",
+    "ingest_file",
+    "ingest_watch",
+    "job_status_lookup",
+    "knowledge_corpora",
+    "knowledge_entity",
+    "knowledge_ingest",
+    "knowledge_paths",
+    "knowledge_write",
+    "labs",
+    "list_artifacts",
+    "list_background_research",
+    "list_models",
+    "list_potentials",
+    "list_predictable_properties",
+    "lookup_structure",
+    "lpbf_kou_cracking_index",
+    "lpbf_printability_map",
+    "mace_cancel_job",
+    "mace_compute_dilute_solute",
+    "mace_compute_elastic",
+    "mace_estimate_cost",
+    "mace_get_cached_structure",
+    "mace_get_job",
+    "mace_list_jobs",
+    "mace_md_equilibrate",
+    "mace_phonon_harmonic",
+    "mace_relax_structure",
+    "marketplace",
+    "marketplace_find",
+    "marketplace_info",
+    "marketplace_install",
+    "marketplace_read",
+    "marketplace_search",
+    "marketplace_write",
+    "materials_discovery",
+    "materials_search",
+    "mcp_services",
+    "mcp_services_invoke",
+    "mesh",
+    "mesh_discover",
+    "mesh_health",
+    "mesh_peers",
+    "mesh_publish",
+    "mesh_read",
+    "mesh_subscribe",
+    "mesh_subscriptions",
+    "mesh_sync",
+    "mesh_unsubscribe",
+    "mesh_write",
+    "model_train",
+    "models",
+    "models_info",
+    "models_list",
+    "models_read",
+    "models_search",
+    "node",
+    "node_logs",
+    "node_probe",
+    "node_read",
+    "node_status",
+    "notebook_exec",
+    "notebook_reset",
+    "notebook_status",
+    "ontology_proposals",
+    "ontology_proposals_accept",
+    "ontology_proposals_reject",
+    "ontology_proposals_show",
+    "ontology_read",
+    "ontology_write",
+    "papers",
+    "papers_fulltext",
+    "papers_ingest",
+    "pareto_screen",
+    "phase_stability",
+    "plan_simulations",
+    "platform_jobs",
+    "platform_jobs_submit",
+    "platform_workflows",
+    "platform_workflows_run",
+    "plot",
+    "plugins",
+    "policy_evaluate",
+    "predict",
+    "predict_properties",
+    "predict_property",
+    "predict_synthesizability",
+    "prior_art_search",
+    "provision",
+    "publish",
+    "publish_artifact",
+    "qe_parse_output",
+    "qe_resolve_pseudopotentials",
+    "qe_run",
+    "qe_status",
+    "qe_write_input",
+    "query",
+    "query_materials_project",
+    "report_bug",
+    "research",
+    "research_query",
+    "reverify_assertion",
+    "reverify_candidates",
+    "reverify_history",
+    "run",
+    "run_convergence_test",
+    "run_model",
+    "run_submit",
+    "run_workflow",
+    "schedule_cancel",
+    "schedule_create",
+    "schedule_list",
+    "scheil_solidification",
+    "screen_materials",
+    "search_artifacts",
+    "select_materials",
+    "session_context",
+    "show_scratchpad",
+    "sim_job",
+    "sim_run",
+    "start_background_research",
+    "status",
+    "stop_bash_task",
+    "structure",
+    "structure_import",
+    "structure_similarity",
+    "suggest_next_experiments",
+    "symbolic_check",
+    "tool_reasoning",
+    "tools",
+    "usage_status",
+    "web",
+    "web_browse",
+    "wf",
+    "workflow",
+    "workflow_list",
+    "workflow_run",
+    "workflow_show",
+];
+
 // ── TOOL_PERMISSIONS ───────────────────────────────────────────────
 
 /// Global tool → minimum permission mapping for loaded Python tools.
@@ -69,109 +279,215 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         use PermissionMode::*;
         let mut m = HashMap::new();
 
-        // Read-only tools (safe, no side effects)
-        m.insert("materials_search", ReadOnly);
-        m.insert("query_materials_project", ReadOnly);
-        m.insert("literature_search", ReadOnly);
-        m.insert("patent_search", ReadOnly);
-        m.insert("web_search", ReadOnly);
-        m.insert("web_read", ReadOnly);
-        m.insert("show_scratchpad", ReadOnly);
-        m.insert("list_models", ReadOnly);
-        m.insert("list_predictable_properties", ReadOnly);
-        m.insert("discover_capabilities", ReadOnly);
-        m.insert("knowledge_search", ReadOnly);
-        m.insert("knowledge_entity", ReadOnly);
-        m.insert("knowledge_paths", ReadOnly);
-        m.insert("knowledge_stats", ReadOnly);
-        m.insert("semantic_search", ReadOnly);
-        m.insert("list_corpora", ReadOnly);
-        m.insert("list_lab_services", ReadOnly);
-        m.insert("get_lab_service_info", ReadOnly);
-        m.insert("check_lab_subscriptions", ReadOnly);
+        // Read-only: no side effect outside the process.
+        m.insert("agent_capabilities", ReadOnly);
+        m.insert("analyze_phases", ReadOnly);
+        m.insert("billing", ReadOnly);
+        m.insert("billing_balance", ReadOnly);
+        m.insert("billing_history", ReadOnly);
+        m.insert("billing_prices", ReadOnly);
+        m.insert("billing_read", ReadOnly);
+        m.insert("billing_usage", ReadOnly);
+        m.insert("calphad", ReadOnly);
+        m.insert("check_background_research", ReadOnly);
+        m.insert("check_hpc_queue", ReadOnly);
+        m.insert("compare_materials", ReadOnly);
+        m.insert("compute_descriptor", ReadOnly);
+        m.insert("compute_estimate", ReadOnly);
         m.insert("compute_gpus", ReadOnly);
         m.insert("compute_providers", ReadOnly);
+        m.insert("compute_read", ReadOnly);
         m.insert("compute_status", ReadOnly);
-        m.insert("bash_task", ReadOnly);
-        m.insert("status", ReadOnly);
-        m.insert("tools", ReadOnly);
-        m.insert("provision", WorkspaceWrite);
-        m.insert("query", ReadOnly);
-        m.insert("query_local", ReadOnly);
-        m.insert("query_platform", ReadOnly);
-        m.insert("query_federated", ReadOnly);
-        m.insert("job-status", ReadOnly);
-        m.insert("job_status_lookup", ReadOnly);
-        m.insert("workflow_list", ReadOnly);
-        m.insert("workflow_show", ReadOnly);
-        m.insert("marketplace_search", ReadOnly);
-        m.insert("marketplace_info", ReadOnly);
-        m.insert("node_probe", ReadOnly);
-        m.insert("node_status", ReadOnly);
-        m.insert("node_logs", ReadOnly);
-        m.insert("mesh_discover", ReadOnly);
-        m.insert("mesh_peers", ReadOnly);
-        m.insert("mesh_subscriptions", ReadOnly);
-        m.insert("models", ReadOnly);
-        m.insert("models_list", ReadOnly);
-        m.insert("models_search", ReadOnly);
-        m.insert("models_info", ReadOnly);
-        m.insert("deploy_list", ReadOnly);
-        m.insert("deploy_status", ReadOnly);
         m.insert("deploy_health", ReadOnly);
+        m.insert("deploy_list", ReadOnly);
+        m.insert("deploy_read", ReadOnly);
+        m.insert("deploy_status", ReadOnly);
+        m.insert("describe_structure", ReadOnly);
+        m.insert("discourse", ReadOnly);
         m.insert("discourse_list", ReadOnly);
+        m.insert("discourse_read", ReadOnly);
         m.insert("discourse_show", ReadOnly);
         m.insert("discourse_status", ReadOnly);
         m.insert("discourse_turns", ReadOnly);
+        m.insert("doctor", ReadOnly);
+        m.insert("evaluate_candidate", ReadOnly);
+        m.insert("evaluation_tier_status", ReadOnly);
+        m.insert("fetch_artifact", ReadOnly);
+        m.insert("goal_list", ReadOnly);
+        m.insert("goal_status", ReadOnly);
+        m.insert("hea_descriptors", ReadOnly);
+        m.insert("hea_phase_stability", ReadOnly);
+        m.insert("job_status_lookup", ReadOnly);
+        m.insert("knowledge_corpora", ReadOnly);
+        m.insert("knowledge_entity", ReadOnly);
+        m.insert("knowledge_paths", ReadOnly);
+        m.insert("list_artifacts", ReadOnly);
+        m.insert("list_background_research", ReadOnly);
+        m.insert("list_models", ReadOnly);
+        m.insert("list_potentials", ReadOnly);
+        m.insert("list_predictable_properties", ReadOnly);
+        m.insert("lookup_structure", ReadOnly);
+        m.insert("lpbf_kou_cracking_index", ReadOnly);
+        m.insert("lpbf_printability_map", ReadOnly);
+        m.insert("mace_estimate_cost", ReadOnly);
+        m.insert("mace_get_cached_structure", ReadOnly);
+        m.insert("mace_get_job", ReadOnly);
+        m.insert("mace_list_jobs", ReadOnly);
+        m.insert("marketplace", ReadOnly);
+        m.insert("marketplace_find", ReadOnly);
+        m.insert("marketplace_info", ReadOnly);
+        m.insert("marketplace_read", ReadOnly);
+        m.insert("marketplace_search", ReadOnly);
+        m.insert("materials_search", ReadOnly);
+        m.insert("mcp_services", ReadOnly);
+        m.insert("mesh", ReadOnly);
+        m.insert("mesh_discover", ReadOnly);
+        m.insert("mesh_health", ReadOnly);
+        m.insert("mesh_peers", ReadOnly);
+        m.insert("mesh_read", ReadOnly);
+        m.insert("mesh_subscriptions", ReadOnly);
+        m.insert("models", ReadOnly);
+        m.insert("models_info", ReadOnly);
+        m.insert("models_list", ReadOnly);
+        m.insert("models_read", ReadOnly);
+        m.insert("models_search", ReadOnly);
+        m.insert("node", ReadOnly);
+        m.insert("node_logs", ReadOnly);
+        m.insert("node_probe", ReadOnly);
+        m.insert("node_read", ReadOnly);
+        m.insert("node_status", ReadOnly);
+        m.insert("notebook_status", ReadOnly);
+        m.insert("ontology_proposals", ReadOnly);
+        m.insert("ontology_proposals_show", ReadOnly);
+        m.insert("ontology_read", ReadOnly);
+        m.insert("papers", ReadOnly);
+        m.insert("papers_fulltext", ReadOnly);
+        m.insert("pareto_screen", ReadOnly);
+        m.insert("phase_stability", ReadOnly);
+        m.insert("plan_simulations", ReadOnly);
+        m.insert("platform_jobs", ReadOnly);
+        m.insert("platform_workflows", ReadOnly);
+        m.insert("policy_evaluate", ReadOnly);
+        m.insert("predict", ReadOnly);
+        m.insert("predict_properties", ReadOnly);
+        m.insert("predict_property", ReadOnly);
+        m.insert("predict_synthesizability", ReadOnly);
+        m.insert("prior_art_search", ReadOnly);
+        m.insert("qe_parse_output", ReadOnly);
+        m.insert("qe_resolve_pseudopotentials", ReadOnly);
+        m.insert("qe_status", ReadOnly);
+        m.insert("query", ReadOnly);
+        m.insert("query_materials_project", ReadOnly);
+        m.insert("reverify_history", ReadOnly);
+        m.insert("schedule_list", ReadOnly);
+        m.insert("scheil_solidification", ReadOnly);
+        m.insert("screen_materials", ReadOnly);
+        m.insert("search_artifacts", ReadOnly);
+        m.insert("select_materials", ReadOnly);
+        m.insert("session_context", ReadOnly);
+        m.insert("show_scratchpad", ReadOnly);
+        m.insert("status", ReadOnly);
+        m.insert("structure", ReadOnly);
+        m.insert("structure_similarity", ReadOnly);
+        m.insert("symbolic_check", ReadOnly);
+        m.insert("tool_reasoning", ReadOnly);
+        m.insert("tools", ReadOnly);
+        m.insert("usage_status", ReadOnly);
+        m.insert("web", ReadOnly);
+        m.insert("web_browse", ReadOnly);
+        m.insert("workflow_list", ReadOnly);
+        m.insert("workflow_show", ReadOnly);
 
-        // Workspace-write tools (create/modify files, run code)
-        // `file` covers read|write|edit in one tool, so it takes the STRICTEST
-        // of the three names it replaced: a tool that can overwrite a file
-        // cannot be classified by its cheapest action. The cost is stated
-        // rather than hidden — a plain read through `file` now needs
-        // workspace-write and is denied in plan mode, and closing that needs
-        // per-action permissions, which this map cannot express.
+        // Workspace write: local files and local compute. Reversible, free.
+        m.insert("calphad_compute", WorkspaceWrite);
+        m.insert("cancel_background_research", WorkspaceWrite);
+        m.insert("cold_start_active_learning", WorkspaceWrite);
+        m.insert("cold_start_calphad_augmentation", WorkspaceWrite);
+        m.insert("cold_start_campaign_handoff", WorkspaceWrite);
+        m.insert("cold_start_foundation_bootstrap", WorkspaceWrite);
+        m.insert("dataset", WorkspaceWrite);
+        m.insert("example", WorkspaceWrite);
         m.insert("file", WorkspaceWrite);
-        m.insert("export_results_csv", WorkspaceWrite);
-        m.insert("import_dataset", WorkspaceWrite);
-        m.insert("execute_python", WorkspaceWrite);
-        m.insert("predict_property", WorkspaceWrite);
-        m.insert("predict_structure", WorkspaceWrite);
-        m.insert("plot_materials_comparison", WorkspaceWrite);
-        m.insert("plot_property_distribution", WorkspaceWrite);
-        m.insert("plot_correlation_matrix", WorkspaceWrite);
-        m.insert("knowledge_ingest", WorkspaceWrite);
-        m.insert("compute_estimate", WorkspaceWrite);
-        m.insert("workflow", WorkspaceWrite);
-        m.insert("workflow_run", WorkspaceWrite);
-        m.insert("marketplace", WorkspaceWrite);
-        m.insert("marketplace_install", WorkspaceWrite);
-        m.insert("ingest", WorkspaceWrite);
-        m.insert("ingest_file", WorkspaceWrite);
-        m.insert("ingest_watch", WorkspaceWrite);
-        m.insert("discourse", WorkspaceWrite);
-        m.insert("discourse_create", WorkspaceWrite);
-        m.insert("discourse_run", WorkspaceWrite);
+        m.insert("generate_report", WorkspaceWrite);
+        m.insert("mace_cancel_job", WorkspaceWrite);
+        m.insert("mace_compute_dilute_solute", WorkspaceWrite);
+        m.insert("mace_compute_elastic", WorkspaceWrite);
+        m.insert("mace_md_equilibrate", WorkspaceWrite);
+        m.insert("mace_phonon_harmonic", WorkspaceWrite);
+        m.insert("mace_relax_structure", WorkspaceWrite);
+        m.insert("materials_discovery", WorkspaceWrite);
+        m.insert("notebook_reset", WorkspaceWrite);
+        m.insert("plot", WorkspaceWrite);
+        m.insert("qe_run", WorkspaceWrite);
+        m.insert("qe_write_input", WorkspaceWrite);
+        m.insert("report_bug", WorkspaceWrite);
+        m.insert("research_query", WorkspaceWrite);
+        m.insert("run_convergence_test", WorkspaceWrite);
+        m.insert("run_workflow", WorkspaceWrite);
+        m.insert("sim_job", WorkspaceWrite);
+        m.insert("sim_run", WorkspaceWrite);
+        m.insert("start_background_research", WorkspaceWrite);
+        m.insert("structure_import", WorkspaceWrite);
+        m.insert("suggest_next_experiments", WorkspaceWrite);
 
-        // Full-access tools (destructive, costly, or system-level)
-        m.insert("execute_bash", FullAccess);
-        m.insert("stop_bash_task", FullAccess);
-        m.insert("compute_submit", FullAccess);
-        m.insert("compute_cancel", FullAccess);
-        m.insert("submit_lab_job", FullAccess);
-        m.insert("mesh", FullAccess);
-        m.insert("mesh_publish", FullAccess);
-        m.insert("mesh_subscribe", FullAccess);
-        m.insert("mesh_unsubscribe", FullAccess);
-        m.insert("node", FullAccess);
+        // Full access: runs code, spends money or a paid quota, or mutates
+        // state other people can see. Never auto-approved unattended.
+        m.insert("acquire_materials", FullAccess);
         m.insert("agent", FullAccess);
-        m.insert("run", FullAccess);
-        m.insert("research", FullAccess);
-        m.insert("research_query", FullAccess);
+        m.insert("bash_task", FullAccess);
+        m.insert("compute_cancel", FullAccess);
+        m.insert("compute_submit", FullAccess);
         m.insert("deploy", FullAccess);
         m.insert("deploy_create", FullAccess);
         m.insert("deploy_stop", FullAccess);
+        m.insert("deploy_write", FullAccess);
+        m.insert("discourse_create", FullAccess);
+        m.insert("discourse_run", FullAccess);
+        m.insert("discourse_write", FullAccess);
+        m.insert("doctor_fix", FullAccess);
+        m.insert("execute_bash", FullAccess);
+        m.insert("execute_python", FullAccess);
+        m.insert("goal_resume", FullAccess);
+        m.insert("goal_start", FullAccess);
+        m.insert("ingest", FullAccess);
+        m.insert("ingest_and_wait", FullAccess);
+        m.insert("ingest_file", FullAccess);
+        m.insert("ingest_watch", FullAccess);
+        m.insert("knowledge_ingest", FullAccess);
+        m.insert("knowledge_write", FullAccess);
+        m.insert("labs", FullAccess);
+        m.insert("marketplace_install", FullAccess);
+        m.insert("marketplace_write", FullAccess);
+        m.insert("mcp_services_invoke", FullAccess);
+        m.insert("mesh_publish", FullAccess);
+        m.insert("mesh_subscribe", FullAccess);
+        m.insert("mesh_sync", FullAccess);
+        m.insert("mesh_unsubscribe", FullAccess);
+        m.insert("mesh_write", FullAccess);
+        m.insert("model_train", FullAccess);
+        m.insert("notebook_exec", FullAccess);
+        m.insert("ontology_proposals_accept", FullAccess);
+        m.insert("ontology_proposals_reject", FullAccess);
+        m.insert("ontology_write", FullAccess);
+        m.insert("papers_ingest", FullAccess);
+        m.insert("platform_jobs_submit", FullAccess);
+        m.insert("platform_workflows_run", FullAccess);
+        m.insert("plugins", FullAccess);
+        m.insert("provision", FullAccess);
         m.insert("publish", FullAccess);
+        m.insert("publish_artifact", FullAccess);
+        m.insert("research", FullAccess);
+        m.insert("reverify_assertion", FullAccess);
+        m.insert("reverify_candidates", FullAccess);
+        m.insert("run", FullAccess);
+        m.insert("run_model", FullAccess);
+        m.insert("run_submit", FullAccess);
+        m.insert("schedule_cancel", FullAccess);
+        m.insert("schedule_create", FullAccess);
+        m.insert("stop_bash_task", FullAccess);
+        m.insert("wf", FullAccess);
+        m.insert("workflow", FullAccess);
+        m.insert("workflow_run", FullAccess);
 
         m
     })
@@ -385,6 +701,61 @@ impl Default for ToolPermissionContext {
 
 #[cfg(test)]
 mod tests {
+
+    /// 2026-09-06: the map held 91 entries, 80 of which named tools that no
+    /// longer exist, while `acquire_materials` (orders material — spends
+    /// money) and `platform_jobs_submit` (submits a paid job) were unmapped
+    /// and fell through to the WorkspaceWrite default. A default is the wrong
+    /// answer for a tool nobody classified: the map must name every tool the
+    /// product actually ships, and money or shared state must never be a
+    /// silent default.
+    #[test]
+    fn every_shipped_tool_is_classified_and_none_are_stale() {
+        let map = tool_permissions();
+        let shipped: Vec<&str> = SHIPPED_TOOLS.to_vec();
+
+        let unmapped: Vec<&&str> = shipped.iter().filter(|t| !map.contains_key(**t)).collect();
+        assert!(
+            unmapped.is_empty(),
+            "{} shipped tools have no permission class: {unmapped:?}",
+            unmapped.len()
+        );
+
+        let stale: Vec<&&str> = map.keys().filter(|k| !shipped.contains(k)).collect();
+        assert!(
+            stale.is_empty(),
+            "{} entries name tools that do not exist: {stale:?}",
+            stale.len()
+        );
+    }
+
+    /// The tools that spend money or mutate state other people can see must
+    /// require the highest class, so no unattended mode can run them quietly.
+    #[test]
+    fn spending_and_shared_state_are_never_below_full_access() {
+        let map = tool_permissions();
+        for tool in [
+            "acquire_materials",
+            "platform_jobs_submit",
+            "platform_workflows_run",
+            "knowledge_write",
+            "mcp_services_invoke",
+            "execute_bash",
+            "execute_python",
+            "compute_submit",
+            "deploy_create",
+            "publish",
+            "marketplace_install",
+            "schedule_create",
+            "notebook_exec",
+        ] {
+            assert_eq!(
+                map.get(tool).copied(),
+                Some(PermissionMode::FullAccess),
+                "{tool} spends money, runs code or mutates shared state — it must be FullAccess"
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -416,9 +787,15 @@ mod tests {
 
     #[test]
     fn all_known_tools_mapped() {
-        // 52 read-only + 22 workspace-write + 18 full-access = 92
+        // Was a literal 92 — a count that had already drifted from the truth
+        // (91 entries, 80 of them naming tools that no longer existed). Tied
+        // to the shipped list instead, so it cannot go stale silently.
         let perms = tool_permissions();
-        assert_eq!(perms.len(), 92);
+        assert_eq!(
+            perms.len(),
+            SHIPPED_TOOLS.len(),
+            "one class per shipped tool, no more and no fewer"
+        );
     }
 
     #[test]
