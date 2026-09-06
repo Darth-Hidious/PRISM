@@ -81,11 +81,20 @@ fn frame_kind(width: u16) -> FrameKind {
     }
 }
 
-/// Whether the row above the prompt is drawn this frame: background work
-/// always earns it; on a narrow terminal so do marks and a goal, which have
-/// no sidebar to live in.
+/// Whether the row above the prompt is drawn this frame: a running turn
+/// holds it for its whole length, background work outside a turn earns it,
+/// and on a narrow terminal so do marks and a goal, which have no sidebar to
+/// live in.
+///
+/// The turn holds the row whether or not anything is in flight this instant:
+/// the thinking pulse is pushed on every reasoning delta and dropped on the
+/// first visible token, so gating the row on `activities` alone made it
+/// appear and vanish several times in one turn — and the transcript above it
+/// lost and regained a line each time, under a reader who was following the
+/// tail.
 fn strip_row_needed(app: &App, kind: FrameKind) -> bool {
-    !app.activities.is_empty()
+    app.turn_in_progress
+        || !app.activities.is_empty()
         || (kind == FrameKind::Narrow && (!app.marks.is_empty() || app.goal.is_some()))
 }
 
@@ -1511,6 +1520,11 @@ fn draw_activity_strip(f: &mut Frame, app: &App, area: Rect) {
             &format!("⋯ {}", text.join(" · ")),
             Style::default().fg(t.reference),
         );
+    } else if app.turn_in_progress {
+        // The row is the turn's for its whole length, so between two named
+        // pieces of work it holds a lone ellipsis rather than collapsing and
+        // taking a transcript row with it.
+        push(&mut spans, "⋯", Style::default().fg(t.dim));
     }
     if frame_kind(f.area().width) == FrameKind::Narrow {
         if !app.marks.is_empty() {
@@ -1539,6 +1553,20 @@ fn elapsed_mmss(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
 }
+
+/// Cells reserved for the status word: "stopping", the widest the pill says
+/// on a routine turn.
+const PILL_WORD: usize = 8;
+/// Cells reserved for the throughput reading ("~123.4") and for the cost
+/// ("$0.0062"), so neither group changes width as the numbers arrive.
+const RATE_CELLS: usize = 6;
+const COST_CELLS: usize = 7;
+/// Cells reserved for each of the balance's two warnings, so a refresh that
+/// fails mid-turn writes into a cell that was already there.
+const OVERDRAWN_CELLS: usize = " overdrawn".len();
+const STALE_CELLS: usize = " stale".len();
+/// What a reserved slot says while it has no number to show.
+const NO_READING: &str = "—";
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
@@ -1579,17 +1607,31 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // the pill hold still as the clock ticks. A `{:>4}` here as well would
     // never once pad, so it is not written: the reservation lives in one
     // place, where the test can hold it.
-    let pill = match app.turn_started {
-        Some(started) if app.turn_in_progress => format!(
-            " {} {} ",
-            status,
-            elapsed_mmss(std::time::Instant::now().saturating_duration_since(started))
-        ),
-        _ => format!(" {} ", status),
+    //
+    // The word is padded to the widest one the pill routinely says, so the
+    // pill is one block of the same size in every state. Unpadded it cycled
+    // busy / working / Ready / stopping and shoved every field to its right
+    // along on each transition — three times in a turn that reasons, calls a
+    // tool and answers. A longer word (a session starting, say) still widens
+    // it; padding is a floor, not a clip. The tight spelling beside it is
+    // what the last step of the trim ladder falls back to: a row too narrow
+    // for the reservation gives it up rather than losing its last words.
+    let (pill, tight_pill) = match app.turn_started {
+        Some(started) if app.turn_in_progress => {
+            let age = elapsed_mmss(std::time::Instant::now().saturating_duration_since(started));
+            (
+                format!(" {status:<PILL_WORD$} {age} "),
+                format!(" {status} {age} "),
+            )
+        }
+        _ => (format!(" {status:<PILL_WORD$} "), format!(" {status} ")),
     };
     let mut spans = vec![
         Span::styled(" ", Style::default()),
-        Span::styled(pill, Style::default().fg(t.status_fg).bg(t.status_bg)),
+        Span::styled(
+            pill.clone(),
+            Style::default().fg(t.status_fg).bg(t.status_bg),
+        ),
         Span::raw(" "),
         Span::styled("model:", Style::default().fg(t.system)),
         Span::raw(" "),
@@ -1609,35 +1651,63 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             prism_client::billing::format_credits(millicredits),
             Style::default().fg(if overdrawn { t.warn } else { t.ok }),
         ));
-        if overdrawn {
-            spans.push(Span::styled(" overdrawn", Style::default().fg(t.warn)));
-        }
-        if app.credits_stale {
-            // The last refresh failed; this is the last number known.
-            spans.push(Span::styled(" stale", Style::default().fg(t.muted)));
-        }
+        // Both warnings have cells of their own whether or not they are being
+        // said. Appended, they arrived mid-turn — a refresh fails, the
+        // balance goes negative — and pushed every group to their right
+        // along; each keeps its own word and its own colour, so neither is
+        // read off the other.
+        spans.push(Span::styled(
+            format!(
+                "{:<OVERDRAWN_CELLS$}",
+                if overdrawn { " overdrawn" } else { "" }
+            ),
+            Style::default().fg(t.warn),
+        ));
+        // The last refresh failed; this is the last number known.
+        spans.push(Span::styled(
+            format!(
+                "{:<STALE_CELLS$}",
+                if app.credits_stale { " stale" } else { "" }
+            ),
+            Style::default().fg(t.muted),
+        ));
         spans.push(Span::raw("  "));
     }
 
-    // Show tokens/sec when streaming (if metrics enabled)
-    if app.show_metrics && app.tokens_per_sec > 0.0 {
+    // Throughput, in a slot of its own once the reader has asked for
+    // metrics. It used to be pushed only while the rate was above zero, so
+    // it popped into the row on the first token and out again at the next
+    // reset, carrying the cost and everything after it sideways. A dash says
+    // "nothing to report yet" and holds the cells while it says it.
+    if app.show_metrics {
         spans.push(Span::styled("tok/s:", Style::default().fg(t.system)));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("~{:.1}", app.tokens_per_sec),
-            Style::default().fg(t.ok),
-        ));
+        let (rate, style) = if app.tokens_per_sec > 0.0 {
+            (
+                format!("~{:.1}", app.tokens_per_sec),
+                Style::default().fg(t.ok),
+            )
+        } else {
+            (NO_READING.to_string(), Style::default().fg(t.dim))
+        };
+        spans.push(Span::styled(format!("{rate:>RATE_CELLS$}"), style));
         spans.push(Span::raw("  "));
     }
 
-    // Show cost only if enabled (hide for local models)
-    if app.show_cost && app.session_cost > 0.0 {
+    // Cost, the same way: shown only if enabled (hidden for local models),
+    // and once shown it keeps its cells from the unpriced first turn on.
+    if app.show_cost {
         spans.push(Span::styled("cost:", Style::default().fg(t.system)));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("${:.4}", app.session_cost),
-            Style::default().fg(t.text),
-        ));
+        let (cost, style) = if app.session_cost > 0.0 {
+            (
+                format!("${:.4}", app.session_cost),
+                Style::default().fg(t.text),
+            )
+        } else {
+            (NO_READING.to_string(), Style::default().fg(t.dim))
+        };
+        spans.push(Span::styled(format!("{cost:>COST_CELLS$}"), style));
         spans.push(Span::raw("  "));
     }
 
@@ -1698,10 +1768,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // its letter — it is never removed, because it is read on every key and
     // below 100 columns the sidebar that would otherwise name the pane does
     // not exist. Then the copy-mode banner loses its explanation and the
-    // cursor hint loses its verbs and then everything but the count. The
-    // hint was once outside the ladder: with two references it is 22 cells
-    // longer than the old "e ask about this line · Esc clear", and at 80x24
-    // it pushed the quit key off the row.
+    // cursor hint loses its verbs and then everything but the count, and
+    // last of all the pill gives up the cells it holds for the widest status
+    // word. The hint was once outside the ladder: with two references it is
+    // 22 cells longer than the old "e ask about this line · Esc clear", and
+    // at 80x24 it pushed the quit key off the row. The pill's reservation is
+    // last because it is spent on every frame of every turn, where the hint
+    // is only there while a line is picked — but a row that cannot afford it
+    // still keeps its last words, which is the ladder's whole rule.
     let mut line = Line::from(spans);
     let width = usize::from(area.width);
     let trims = [
@@ -1713,6 +1787,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         FooterTrim::ShortCopyBanner,
         FooterTrim::CursorHint(HintStage::Keys),
         FooterTrim::CursorHint(HintStage::Count),
+        FooterTrim::TightPill,
     ];
     for trim in trims {
         if line.width() <= width {
@@ -1729,6 +1804,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
             FooterTrim::Group(label) => remove_labelled_group(&mut line, label),
+            FooterTrim::TightPill => {
+                for span in &mut line.spans {
+                    if span.content == pill {
+                        span.content = tight_pill.clone().into();
+                    }
+                }
+            }
             FooterTrim::ShortReasoning => {
                 for span in &mut line.spans {
                     if span.content == "[Ctrl-T: show reasoning]" {
@@ -1778,6 +1860,10 @@ enum FooterTrim {
     ShortCopyBanner,
     /// The cursor hint at a shorter stage.
     CursorHint(HintStage),
+    /// The status pill without the cells it holds for the widest status
+    /// word. Last in the ladder: a row that cannot afford the reservation
+    /// keeps its last words instead, and only that row's fields move.
+    TightPill,
 }
 
 /// The copy-mode banner at full length. Copy mode is a modal input state, so
@@ -1813,11 +1899,20 @@ fn cursor_hint(refs: usize, stage: HintStage) -> String {
     format!("   {words}")
 }
 
-/// Remove a footer group `label`, " ", value, "  " (four spans) by its label.
+/// Remove a footer group by its label: the label, its value, and any cells
+/// the group reserved after the value, up to and including the two spaces
+/// that end every group. Counting spans instead (label, " ", value, "  ")
+/// left the balance's reserved " stale" and " overdrawn" cells on the row
+/// after the number they belonged to had gone.
 fn remove_labelled_group(line: &mut Line, label: &str) {
     if let Some(i) = line.spans.iter().position(|s| s.content == label) {
-        let end = (i + 4).min(line.spans.len());
-        line.spans.drain(i..end);
+        let end = line
+            .spans
+            .iter()
+            .skip(i)
+            .position(|s| s.content == "  ")
+            .map_or(line.spans.len(), |offset| i + offset + 1);
+        line.spans.drain(i..end.min(line.spans.len()));
     }
 }
 

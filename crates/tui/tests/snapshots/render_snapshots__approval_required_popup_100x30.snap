@@ -31,4 +31,4 @@ expression: rendered
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
-  Ready  model: fake-backend   [APPROVAL]    Ctrl-C quit           │
+  Ready     model: fake-backend   [APPROVAL]    Ctrl-C quit        │

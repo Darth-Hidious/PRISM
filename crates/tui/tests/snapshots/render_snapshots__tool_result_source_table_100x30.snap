@@ -1,6 +1,5 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 3929
 expression: rendered
 ---
  ‹ back  New session    Ctrl-P · ?                                 │ Workspace
@@ -32,4 +31,4 @@ UTC                                                                │
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
-  Ready  model: —   [INPUT]    Ctrl-C quit                         │
+  Ready     model: —  tok/s:      —   [INPUT]    Ctrl-C quit       │

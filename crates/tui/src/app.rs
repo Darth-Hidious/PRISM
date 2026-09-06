@@ -943,8 +943,9 @@ pub struct App {
     pub approval_max_scroll: std::cell::Cell<u16>,
     pub should_quit: bool,
     pub status_text: String,
-    /// Background work in flight, by id, in arrival order. Rendered in the
-    /// footer while non-empty so a quiet screen never means an unknown state.
+    /// Background work in flight, by id, in arrival order. Rendered on the
+    /// strip row above the prompt — which a running turn holds whether this
+    /// is empty or not — so a quiet screen never means an unknown state.
     pub activities: Vec<(String, String)>,
     pub tool_count: u64,
     pub prism_version: String,
@@ -7711,10 +7712,13 @@ impl App {
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
         self.activities.retain(|(k, _)| k != "thinking");
+        // The count is padded because it gains a digit while the reader is
+        // watching, and everything after it on the row — the clock, the key
+        // that shows the reasoning — would step right when it did.
         self.activities.push((
             "thinking".to_string(),
             format!(
-                "model reasoning… {chars} chars · {}:{:02} · Ctrl-T shows it",
+                "model reasoning… {chars:>6} chars · {}:{:02} · Ctrl-T shows it",
                 secs / 60,
                 secs % 60
             ),
@@ -9922,14 +9926,18 @@ mod tests {
 
     #[test]
     fn a_balance_that_could_not_be_refreshed_says_so() {
+        // Read on a row with room for it: throughput and cost now hold their
+        // cells whether or not they have a number, and the balance is what
+        // the ladder spends first, so at 140 columns with the sidebar up it
+        // is trimmed before the word can be read.
         let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
         app.home.open = false;
         app.credits = Some(12_500);
         app.credits_stale = true;
-        let footer = footer_row(&app);
+        let footer = footer_row_at(&app, 180, 20);
         assert!(footer.contains("stale"), "{footer:?}");
         app.credits_stale = false;
-        let footer = footer_row(&app);
+        let footer = footer_row_at(&app, 180, 20);
         assert!(!footer.contains("stale"), "{footer:?}");
     }
 
@@ -9940,11 +9948,12 @@ mod tests {
         let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
         app.home.open = false;
         app.credits = Some(-73_396);
-        let footer = footer_row(&app);
+        // 180 columns for the same reason as the stale test above.
+        let footer = footer_row_at(&app, 180, 20);
         assert!(footer.contains("overdrawn"), "{footer:?}");
         assert!(footer.contains("-73.4"), "{footer:?}");
         app.credits = Some(12_500);
-        let footer = footer_row(&app);
+        let footer = footer_row_at(&app, 180, 20);
         assert!(!footer.contains("overdrawn"), "{footer:?}");
     }
 
@@ -10220,8 +10229,10 @@ mod tests {
         let nine = footer_row_at(&app, 80, 24);
         app.turn_started = Some(Instant::now() - Duration::from_secs(10));
         let ten = footer_row_at(&app, 80, 24);
-        assert!(nine.contains("working 0:09"), "at 80 columns: {nine:?}");
-        assert!(ten.contains("working 0:10"), "and it advances: {ten:?}");
+        // The word sits in the eight cells the widest one needs, so the
+        // clock starts at the same column whatever the pill says.
+        assert!(nine.contains("working  0:09"), "at 80 columns: {nine:?}");
+        assert!(ten.contains("working  0:10"), "and it advances: {ten:?}");
         assert_eq!(
             nine.chars().count(),
             ten.chars().count(),
@@ -10232,9 +10243,10 @@ mod tests {
         // not only by the eye.
         for row in [&nine, &ten] {
             let field: String = row
-                .split("working ")
+                .split("working")
                 .nth(1)
                 .unwrap_or_default()
+                .trim_start()
                 .chars()
                 .take_while(|c| !c.is_whitespace())
                 .collect();
@@ -10268,6 +10280,184 @@ mod tests {
             frame.contains("Searching the web · 12 s"),
             "the running row is not clipped at 80 columns:\n{frame}"
         );
+    }
+
+    /// The strip row above the prompt belongs to the turn, not to whatever
+    /// happens to be in flight this millisecond.
+    ///
+    /// Finding 1: the row existed only while `activities` was non-empty, and
+    /// the thinking pulse was pushed on every `ThinkingDelta` and dropped on
+    /// the first `TextDelta` — so a reasoning model that also calls tools
+    /// made the row appear and vanish several times a turn, and the
+    /// transcript above it lost and regained a line each time. Read from the
+    /// top of the transcript, the last row still on screen names the
+    /// viewport's height, so a row spent on the strip shows up here.
+    #[test]
+    fn the_transcript_keeps_its_rows_while_the_model_streams() {
+        for (w, h) in [(100u16, 30u16), (180u16, 50u16)] {
+            let mut app = fresh();
+            for i in 0..60 {
+                app.push_system(&format!("row {i:02}"));
+            }
+            app.auto_scroll = false;
+            app.anchor_user_turn.set(false);
+            app.scroll_offset = 0;
+            app.turn_in_progress = true;
+            app.is_waiting = true;
+            let fold = |app: &App| -> Option<(usize, String)> {
+                frame_text_at(app, w, h)
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, l)| l.contains("row "))
+                    .map(|(y, l)| {
+                        // The row's own name only: the scrollbar beside it
+                        // moves as the reply grows, which is its job.
+                        let at = l.find("row ").expect("filtered on it");
+                        (y, l[at..at + 6].to_string())
+                    })
+                    .last()
+            };
+            let waiting = fold(&app);
+            assert!(waiting.is_some(), "the transcript is on screen at {w}x{h}");
+            app.apply_agent_msg(AgentMsg::ThinkingDelta("weighing the case".into()));
+            let reasoning = fold(&app);
+            app.apply_agent_msg(AgentMsg::TextDelta("MCrAlY overlays".into()));
+            let answering = fold(&app);
+            assert_eq!(
+                waiting, reasoning,
+                "the reasoning pulse must not cost the transcript a row at {w}x{h}"
+            );
+            assert_eq!(
+                waiting, answering,
+                "nor must the first visible text give one back at {w}x{h}"
+            );
+        }
+    }
+
+    /// The status pill's width in cells, measured by the background it is
+    /// painted on — the pill is a block, and its cells are what a reader
+    /// sees move.
+    fn pill_cells(app: &App) -> usize {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let y = buf.area.height - 1;
+        let bg = app.theme().status_bg;
+        (0..buf.area.width)
+            .filter(|x| buf[(*x, y)].style().bg == Some(bg))
+            .count()
+    }
+
+    #[test]
+    fn the_status_pill_is_the_same_width_in_every_state() {
+        // Finding 2: the pill was ` {status} ` with no padding, so it cycled
+        // busy (6 cells) / working (9) / Ready (7) and everything to its
+        // right reflowed on every transition — three times in a turn that
+        // reasons, calls a tool and answers.
+        let widest = " stopping ".chars().count();
+        let mut app = fresh();
+
+        let ready = pill_cells(&app);
+        app.turn_in_progress = true;
+        app.is_waiting = true;
+        let busy = pill_cells(&app);
+        app.is_waiting = false;
+        let working = pill_cells(&app);
+        app.stop_requested = true;
+        let stopping = pill_cells(&app);
+
+        for (word, cells) in [
+            ("Ready", ready),
+            ("busy", busy),
+            ("working", working),
+            ("stopping", stopping),
+        ] {
+            assert_eq!(
+                cells, widest,
+                "the pill is the same block in every state; {word} took {cells} cells"
+            );
+        }
+    }
+
+    /// Where each footer group starts, in columns from the left of the
+    /// content column.
+    fn footer_columns(app: &App) -> Vec<(&'static str, Option<usize>)> {
+        let row = footer_row_at(app, 180, 20);
+        ["model:", "credits:", "tok/s:", "cost:", "Ctrl-C quit"]
+            .into_iter()
+            .map(|label| {
+                (
+                    label,
+                    row.find(label).map(|byte| row[..byte].chars().count()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_footer_groups_hold_still_while_the_model_streams() {
+        // The other half of finding 2. Throughput was pushed only while
+        // `tokens_per_sec > 0.0` and cost only after the first priced turn,
+        // so both popped into the row mid-stream and out again at reset,
+        // shoving every group to their right — and " stale" and " overdrawn"
+        // were appended to the balance rather than living in cells of their
+        // own.
+        let mut app = fresh();
+        app.model = "glm-5.3-flash".to_string();
+        app.credits = Some(12_500);
+        app.show_metrics = true;
+        app.show_cost = true;
+        app.turn_in_progress = true;
+        app.is_waiting = true;
+
+        let start = footer_columns(&app);
+        for (label, at) in &start {
+            assert!(at.is_some(), "the footer names {label}: {start:?}");
+        }
+        app.apply_agent_msg(AgentMsg::TextDelta("MCrAlY overlays".into()));
+        assert_eq!(
+            footer_columns(&app),
+            start,
+            "busy → working must not move a group"
+        );
+        app.apply_agent_msg(AgentMsg::Cost {
+            turn_cost: 0.0021,
+            session_cost: 0.0062,
+            input_tokens: None,
+            output_tokens: None,
+            cache_tokens: None,
+        });
+        assert_eq!(
+            footer_columns(&app),
+            start,
+            "the first priced turn must not move a group"
+        );
+        app.apply_agent_msg(AgentMsg::TurnComplete);
+        assert_eq!(
+            footer_columns(&app),
+            start,
+            "and neither must the end of the turn"
+        );
+
+        // The balance's two warnings have cells of their own, so a refresh
+        // that fails mid-turn does not shove the row along.
+        let gap = |app: &App| -> usize {
+            let cols = footer_columns(app);
+            let at = |label: &str| cols.iter().find(|(l, _)| *l == label).unwrap().1.unwrap();
+            at("tok/s:") - at("credits:")
+        };
+        for balance in [12_500, -73_396] {
+            app.credits = Some(balance);
+            app.credits_stale = false;
+            let fresh_gap = gap(&app);
+            app.credits_stale = true;
+            assert_eq!(
+                gap(&app),
+                fresh_gap,
+                "a stale balance of {balance} must not widen the group"
+            );
+        }
     }
 
     #[test]

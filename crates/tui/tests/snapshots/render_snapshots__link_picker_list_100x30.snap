@@ -1,6 +1,5 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1343
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
@@ -32,4 +31,4 @@ expression: rendered
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
-  Ready  model: fake-backend   [CHAT]    Ctrl-C quit               │
+  Ready     model: fake-backend   [CHAT]    Ctrl-C quit            │
