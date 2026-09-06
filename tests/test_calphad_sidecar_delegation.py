@@ -38,12 +38,17 @@ def test_local_pycalphad_is_used_without_the_sidecar(monkeypatch):
     assert called["sidecar"] is False, "no sidecar hop when the local interpreter can do it"
 
 
-def test_with_neither_the_error_names_both_routes(monkeypatch):
+def test_with_neither_the_engine_gate_speaks_once_and_names_both_routes(monkeypatch):
+    """No local pycalphad and no sidecar: _delegate must fall through so the
+    ONE canonical missing-extra shape answers — the same one the gate-order
+    tests pin — naming the pip route and the sidecar provision route."""
     monkeypatch.setattr(calphad, "check_calphad_available", lambda: False)
     monkeypatch.setattr(calphad, "sidecar_available", lambda: False)
+    assert calphad._delegate("calphad", {"action": "list_phases"}) is None
     out = calphad._calphad(action="list_phases", database_name="x")
-    assert "error" in out, out
-    assert "sidecar" in str(out).lower(), f"say the sidecar route exists: {out}"
+    assert out.get("requires_extra") == "calphad", out
+    assert "pip install" in out.get("install_hint", ""), out
+    assert "provision" in out.get("provision_command", ""), out
 
 
 def test_the_sidecar_never_delegates_to_itself(monkeypatch):

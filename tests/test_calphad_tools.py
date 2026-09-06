@@ -50,7 +50,7 @@ class TestCreateCalphadTools:
 class TestGuardedTools:
     """Calculation tools return error when pycalphad is missing."""
 
-    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    @patch("app.tools.calphad.check_calphad_available", return_value=False)
     def test_phase_diagram_guard(self, mock_check):
         result = _calculate_phase_diagram(
             database_name="test", components=["Al", "Ni"]
@@ -58,7 +58,7 @@ class TestGuardedTools:
         assert "error" in result
         assert "pycalphad" in result["error"]
 
-    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    @patch("app.tools.calphad.check_calphad_available", return_value=False)
     def test_equilibrium_guard(self, mock_check):
         result = _calculate_equilibrium(
             database_name="test",
@@ -67,7 +67,7 @@ class TestGuardedTools:
         )
         assert "error" in result
 
-    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    @patch("app.tools.calphad.check_calphad_available", return_value=False)
     def test_gibbs_energy_guard(self, mock_check):
         result = _calculate_gibbs_energy(
             database_name="test",
@@ -77,7 +77,7 @@ class TestGuardedTools:
         )
         assert "error" in result
 
-    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    @patch("app.tools.calphad.check_calphad_available", return_value=False)
     def test_list_phases_guard(self, mock_check):
         result = _list_phases(database_name="test")
         assert "error" in result
@@ -211,8 +211,9 @@ class TestComputeGateOrder:
     for a computation that could never run.
     """
 
-    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
-    def test_missing_pycalphad_short_circuits_source_resolution(self, _check):
+    @patch("app.tools.calphad.sidecar_available", return_value=False)
+    @patch("app.tools.calphad.check_calphad_available", return_value=False)
+    def test_missing_pycalphad_short_circuits_source_resolution(self, _check, _sidecar):
         from app.tools.calphad import _calphad_compute
 
         resolver = MagicMock()
@@ -232,8 +233,9 @@ class TestComputeGateOrder:
         assert "pycalphad" in result["error"]
         assert result["install_hint"] == "pip install pycalphad scheil"
 
-    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
-    def test_argument_errors_still_beat_the_engine_gate(self, _check):
+    @patch("app.tools.calphad.sidecar_available", return_value=False)
+    @patch("app.tools.calphad.check_calphad_available", return_value=False)
+    def test_argument_errors_still_beat_the_engine_gate(self, _check, _sidecar):
         """Cheap local argument validation stays first — a missing `action`
         must still say so rather than be masked by the dependency gate."""
         from app.tools.calphad import _calphad_compute

@@ -203,16 +203,13 @@ def _delegate(tool: str, kwargs: dict) -> "dict | None":
     wheel, which is precisely why the sidecar venv (3.12) exists and registers
     these same tools. Measured 2026-09-06: without this hop the tool answered
     "pycalphad is not installed" on a machine where it was installed and
-    working. Returns None when the caller should run locally instead.
+    working. Returns None when the caller should run locally — either
+    because it can, or because nothing can: with no sidecar either, the
+    engine gate in _guard answers with the one canonical missing-extra
+    shape, which names both the pip route and the provision route.
     """
-    if check_calphad_available() or _in_sidecar():
+    if check_calphad_available() or _in_sidecar() or not sidecar_available():
         return None
-    if not sidecar_available():
-        return {
-            "error": "pycalphad is not available in this interpreter and the science "
-            "sidecar is not provisioned.",
-            "remedy": "prism provision extra calphad (creates ~/.prism/venv-sci and installs pycalphad)",
-        }
     out = sidecar_call(tool, kwargs)
     if isinstance(out, dict):
         out.setdefault("ran_in", "sidecar")
