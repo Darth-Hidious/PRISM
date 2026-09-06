@@ -17,3 +17,9 @@
 - Verify the 10 novelty verdicts, assess the 5 remaining; query a real patent database.
 - Install the Obscura binary (needs explicit OK) and wire papers_fulltext.
 - Protected, never commit: holmquist2019_whiterose.txt, schellenberger2018_diva.txt, ontology-pfas-alternatives-candidate.ttl, pfas_alternatives_evidence_log*.md.
+
+## Boundary conditions (owner, 2026-09-06)
+- 90 K -> 1000 K in milliseconds, no quantifiable phase change => FCC matrix only; BCC refractory HEAs are OUT (ductile-brittle transition above 90 K).
+- Built by additive manufacturing => Al+Ti drives strain-age cracking: <=6 at% prints, 8 borderline, >=12 is a process programme.
+- ~700 bar oxygen. Beat Monel K-500 (oxygen) and SX500 (strength/temperature).
+- Under these: H4 Al4Ti2Co24Cr24Fe23Ni23 is the lead (only alloy that stays mixed AND prints); O1-Fe0 second; the 15 at% Al alloys and all refractory HEAs are out.
