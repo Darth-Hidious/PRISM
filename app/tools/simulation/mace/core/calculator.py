@@ -44,6 +44,7 @@ installed (the FakeBackend never touches it).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 from typing import Literal
@@ -163,23 +164,90 @@ def make_calc(
         raise ValueError("MPS does not support float64; use float32 or cuda/cpu.")
 
     path = hf_hub_download(repo_id=repo_id, filename=filename)
-    return serialized_load(_construct, path, dtype, device, head)
+    return guard_forward(serialized_load(_construct, path, dtype, device, head))
 
 
-# Loading a MACE model deserialises a torch.fx graph module, and torch.fx's
-# symbolic tracer keeps a process-global patcher that is not thread-safe.
-# Measured 2026-09-05: three MD jobs loaded the model in the same second from
-# the runner's thread pool and one died with "CURRENT_PATCHER is None in
-# finally block". Loads are serialised; each job still gets its own calculator
-# (a calculator holds per-call results, so sharing one across threads is not
-# safe either).
-LOAD_LOCK = threading.Lock()
+# torch.fx patches `torch.nn.Module.__call__` **globally** while it traces, and
+# loading a MACE model deserialises a traced GraphModule. So a load in one
+# thread does not merely race other loads — it corrupts any forward pass
+# running in another thread, which surfaces far from the cause as
+# "CURRENT_PATCHER is None in finally block" (2026-09-05) or
+# "NameError: module is not installed as a submodule" raised inside
+# torch.fx's module_call_wrapper during an ordinary MD force evaluation
+# (2026-09-06, four jobs, three hours after loads alone were serialised).
+#
+# The gate below is therefore a readers-writer lock: a load is an exclusive
+# writer, every forward pass is a shared reader. Inference stays parallel,
+# which matters because MD is thousands of forward passes; only the rare load
+# stops the world.
+class ModelGate:
+    """Excludes forward passes while a model is being loaded."""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._readers = 0
+        self._loading = False
+
+    def readers(self) -> int:
+        with self._cv:
+            return self._readers
+
+    def is_loading(self) -> bool:
+        with self._cv:
+            return self._loading
+
+    @contextlib.contextmanager
+    def loading(self):
+        """Exclusive: no other load and no forward pass may run."""
+        with self._cv:
+            while self._loading or self._readers:
+                self._cv.wait()
+            self._loading = True
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._loading = False
+                self._cv.notify_all()
+
+    @contextlib.contextmanager
+    def running(self):
+        """Shared: many forward passes may run, but never during a load."""
+        with self._cv:
+            while self._loading:
+                self._cv.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._readers -= 1
+                self._cv.notify_all()
+
+
+MODEL_GATE = ModelGate()
+# Kept as the load side of the gate under its old name.
+LOAD_LOCK = MODEL_GATE
 
 
 def serialized_load(construct, *args):
-    """Run `construct(*args)` with no other model load in flight."""
-    with LOAD_LOCK:
+    """Run `construct(*args)` with no other load and no forward pass in flight."""
+    with MODEL_GATE.loading():
         return construct(*args)
+
+
+def guard_forward(calculator):
+    """Wrap a calculator so every evaluation takes the shared side of the gate.
+    Without this the gate protects nothing: the corruption happens in the
+    forward pass, not in the load."""
+    inner = calculator.calculate
+
+    def calculate(*args, **kwargs):
+        with MODEL_GATE.running():
+            return inner(*args, **kwargs)
+
+    calculator.calculate = calculate
+    return calculator
 
 
 def _construct(path: str, dtype: str, device: str, head: str):
