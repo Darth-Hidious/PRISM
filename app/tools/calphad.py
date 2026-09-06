@@ -6,6 +6,12 @@ All tools follow the same pattern as simulation.py:
 """
 from app.tools.base import Tool, ToolRegistry
 
+# Imported at module level so the delegation below (and tests) can see one
+# authoritative answer to "can this interpreter run pycalphad".
+from app.tools.simulation.calphad_bridge import check_calphad_available
+
+import os
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -167,6 +173,52 @@ def _import_database(**kwargs) -> dict:
 # Round 5 unified dispatchers
 # ---------------------------------------------------------------------------
 
+def sidecar_available() -> bool:
+    """Whether the science sidecar is provisioned with CALPHAD support."""
+    try:
+        from app.tools._sidecar import SIDECAR_VENV
+
+        return (SIDECAR_VENV / ".provisioned").exists() or (
+            SIDECAR_VENV / "bin" / "python3"
+        ).exists()
+    except Exception:
+        return False
+
+
+def sidecar_call(tool: str, args: dict) -> dict:
+    from app.tools._sidecar import call_tool
+
+    return call_tool(tool, args)
+
+
+def _in_sidecar() -> bool:
+    """True when this process IS the sidecar — it must never delegate to itself."""
+    return os.environ.get("PRISM_IN_SIDECAR") == "1"
+
+
+def _delegate(tool: str, kwargs: dict) -> "dict | None":
+    """Run a CALPHAD action in the sidecar when this interpreter cannot.
+
+    The main venv is Python 3.14; pycalphad pins a dependency with no 3.14
+    wheel, which is precisely why the sidecar venv (3.12) exists and registers
+    these same tools. Measured 2026-09-06: without this hop the tool answered
+    "pycalphad is not installed" on a machine where it was installed and
+    working. Returns None when the caller should run locally instead.
+    """
+    if check_calphad_available() or _in_sidecar():
+        return None
+    if not sidecar_available():
+        return {
+            "error": "pycalphad is not available in this interpreter and the science "
+            "sidecar is not provisioned.",
+            "remedy": "prism provision extra calphad (creates ~/.prism/venv-sci and installs pycalphad)",
+        }
+    out = sidecar_call(tool, kwargs)
+    if isinstance(out, dict):
+        out.setdefault("ran_in", "sidecar")
+    return out
+
+
 def _calphad(**kwargs) -> dict:
     """Read-only CALPHAD dispatcher: catalog + import. No approval gate.
 
@@ -189,6 +241,9 @@ def _calphad(**kwargs) -> dict:
     if action == "list_phases":
         if not kwargs.get("database_name"):
             return {"error": "Action 'list_phases' requires `database_name`"}
+        remote = _delegate("calphad", {"action": "list_phases", **kwargs})
+        if remote is not None:
+            return remote
         return _list_phases(**kwargs)
     if action == "import":
         if not kwargs.get("source_path"):
