@@ -30,12 +30,17 @@ five-component system.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
-from app.tools.evidence import EvidenceClass, coerce_evidence_class
+from app.tools.evidence import (
+    EvidenceClass,
+    EvidenceSource,
+    coerce_evidence_class,
+    evidence_for_result,
+)
 
 DEFAULT_CONFIG_PATH = Path.home() / ".prism" / "licensed_sources.json"
 # Read-only access endpoint. Its server implementation must resolve against the
@@ -84,6 +89,24 @@ def _sequence(value: object, field_name: str) -> Sequence[object]:
 
 def _system_name(system: Sequence[str]) -> str:
     return "-".join(system)
+
+
+def tdb_declared_elements(path: Path) -> frozenset[str] | None:
+    """Element symbols the TDB itself declares; None when it declares none.
+
+    None is "unverifiable", not "empty": a stub without ELEMENT lines can
+    neither confirm nor deny a declaration. Plain text parsing, no pycalphad.
+    """
+    declared: set[str] = set()
+    seen = False
+    for line in path.read_text(errors="replace").splitlines():
+        tokens = line.split()
+        if len(tokens) < 2 or tokens[0].upper() != "ELEMENT":
+            continue
+        seen = True
+        if tokens[1].upper() not in {"/-", "VA"}:
+            declared.add(_element(tokens[1]))
+    return frozenset(declared) if seen else None
 
 
 @dataclass(frozen=True)
@@ -237,6 +260,8 @@ class LicensedSource:
     access_kind: str
     path: Path | None = None
     access_reference: str | None = None
+    # "declared" until the file is read; then "elements_match" or "unverifiable".
+    verification: str = "declared"
 
     def matches(self, preferred_source: str | None) -> bool:
         if not preferred_source:
@@ -257,6 +282,7 @@ class LicensedSource:
             "origin": self.origin.value,
             "evidence_class": self.evidence_class.value,
             "coverage": self.coverage.as_dict(),
+            "verification": self.verification,
         }
         if self.source_type == SourceType.THERMODYNAMIC_DATABASE:
             metadata["database"] = self.name
@@ -279,6 +305,30 @@ def _required_text(raw: Mapping[str, object], *keys: str) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     raise ValueError(f"missing required field: {' or '.join(keys)}")
+
+
+def _verified_tdb(source: LicensedSource) -> LicensedSource:
+    """Hold a TDB declaration to its file: over-declaration raises, a stub caps."""
+    declared = tdb_declared_elements(source.path)
+    if declared is None:
+        # The cited-computation ceiling is SCREENING; a lower class stays lower.
+        return replace(
+            source,
+            evidence_class=evidence_for_result(
+                EvidenceSource.CITED_COMPUTATION, [source.evidence_class]
+            ),
+            verification="unverifiable",
+        )
+    present = {item.casefold() for item in declared}
+    overdeclared = [
+        item for item in source.coverage.elements if item.casefold() not in present
+    ]
+    if overdeclared:
+        raise ValueError(
+            f"declares elements not present in the file: {', '.join(overdeclared)}; "
+            f"file declares {len(declared)} elements"
+        )
+    return replace(source, verification="elements_match")
 
 
 class LocalFileSourceProvider:
@@ -311,24 +361,25 @@ class LocalFileSourceProvider:
                 if source_type == SourceType.THERMODYNAMIC_DATABASE:
                     if path.suffix.lower() != ".tdb":
                         raise ValueError(f"thermodynamic database is not a .tdb file: {path}")
-                sources.append(
-                    LicensedSource(
-                        source_id=_required_text(raw, "id", "source_id"),
-                        source_type=source_type,
-                        name=_required_text(raw, "name"),
-                        version=_required_text(raw, "version"),
-                        licence=_required_text(raw, "licence", "license"),
-                        evidence_class=coerce_evidence_class(raw.get("evidence_class")),
-                        coverage=SourceCoverage.from_mapping(
-                            raw.get("coverage")
-                            if isinstance(raw.get("coverage"), Mapping)
-                            else None
-                        ),
-                        origin=SourceOrigin.LOCAL_FILE,
-                        access_kind="file",
-                        path=path,
-                    )
+                source = LicensedSource(
+                    source_id=_required_text(raw, "id", "source_id"),
+                    source_type=source_type,
+                    name=_required_text(raw, "name"),
+                    version=_required_text(raw, "version"),
+                    licence=_required_text(raw, "licence", "license"),
+                    evidence_class=coerce_evidence_class(raw.get("evidence_class")),
+                    coverage=SourceCoverage.from_mapping(
+                        raw.get("coverage")
+                        if isinstance(raw.get("coverage"), Mapping)
+                        else None
+                    ),
+                    origin=SourceOrigin.LOCAL_FILE,
+                    access_kind="file",
+                    path=path,
                 )
+                if source_type == SourceType.THERMODYNAMIC_DATABASE:
+                    source = _verified_tdb(source)
+                sources.append(source)
             except Exception as exc:
                 errors.append(f"{self.config_path} source[{index}]: {exc}")
         return ProviderResponse(tuple(sources), tuple(errors))
@@ -385,28 +436,40 @@ class PlatformSourceProvider:
                     if isinstance(path_value, str) and path_value
                     else None
                 )
-                reference = access.get("reference")
-                sources.append(
-                    LicensedSource(
-                        source_id=_required_text(raw, "id", "source_id"),
-                        source_type=source_type,
-                        name=_required_text(raw, "name"),
-                        version=_required_text(raw, "version"),
-                        licence=_required_text(raw, "licence", "license"),
-                        evidence_class=coerce_evidence_class(raw.get("evidence_class")),
-                        coverage=SourceCoverage.from_mapping(
-                            raw.get("coverage")
-                            if isinstance(raw.get("coverage"), Mapping)
-                            else None
-                        ),
-                        origin=SourceOrigin.ENTITLED_REMOTE,
-                        access_kind=str(access.get("kind") or "platform_reference"),
-                        path=path,
-                        access_reference=(
-                            str(reference) if reference is not None else None
-                        ),
-                    )
+                # The path is server-supplied but the file it names is local:
+                # hold it to the same checks as a configured one.
+                verify = (
+                    path is not None
+                    and source_type == SourceType.THERMODYNAMIC_DATABASE
                 )
+                if verify:
+                    if not path.is_file():
+                        raise ValueError(f"mounted file does not exist: {path}")
+                    if path.suffix.lower() != ".tdb":
+                        raise ValueError(f"thermodynamic database is not a .tdb file: {path}")
+                reference = access.get("reference")
+                source = LicensedSource(
+                    source_id=_required_text(raw, "id", "source_id"),
+                    source_type=source_type,
+                    name=_required_text(raw, "name"),
+                    version=_required_text(raw, "version"),
+                    licence=_required_text(raw, "licence", "license"),
+                    evidence_class=coerce_evidence_class(raw.get("evidence_class")),
+                    coverage=SourceCoverage.from_mapping(
+                        raw.get("coverage")
+                        if isinstance(raw.get("coverage"), Mapping)
+                        else None
+                    ),
+                    origin=SourceOrigin.ENTITLED_REMOTE,
+                    access_kind=str(access.get("kind") or "platform_reference"),
+                    path=path,
+                    access_reference=(
+                        str(reference) if reference is not None else None
+                    ),
+                )
+                if verify:
+                    source = _verified_tdb(source)
+                sources.append(source)
             except Exception as exc:
                 errors.append(f"platform source[{index}]: {exc}")
         return ProviderResponse(tuple(sources), tuple(errors))

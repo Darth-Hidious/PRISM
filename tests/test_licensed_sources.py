@@ -131,6 +131,9 @@ def test_request_outside_coverage_returns_structured_refusal_without_number(
         "app.tools.simulation.calphad_bridge.check_calphad_available",
         lambda: True,
     )
+    # `_delegate` bound the same name at import; patch that binding too, or a
+    # pycalphad-less interpreter answers "sidecar not provisioned" instead.
+    monkeypatch.setattr("app.tools.calphad.check_calphad_available", lambda: True)
 
     result = _calphad_compute(
         action="equilibrium",
@@ -277,6 +280,102 @@ def test_platform_request_cannot_assert_remote_entitlement(tmp_path):
     assert "project_id" not in client.body
     assert [source.source_id for source in response.sources] == ["server-entitled"]
     assert any("did not confirm entitlement" in error for error in response.errors)
+
+
+def test_overdeclared_elements_are_excluded_not_trusted(tmp_path):
+    """A declaration is held to the file it names, not taken at its word."""
+    open_tdb = tmp_path / "open-ni-co-cr.tdb"
+    open_tdb.write_text(
+        "$ synthetic test TDB; no licensed data\n"
+        "ELEMENT /- ELECTRON_GAS 0.0000E+00 0.0000E+00 0.0000E+00 !\n"
+        "ELEMENT VA VACUUM 0.0000E+00 0.0000E+00 0.0000E+00 !\n"
+        "ELEMENT NI FCC_A1 5.8690E+01 4.7870E+03 2.9796E+01 !\n"
+        "ELEMENT CO HCP_A3 5.8933E+01 4.7656E+03 3.0040E+01 !\n"
+        "ELEMENT CR BCC_A2 5.1996E+01 4.0500E+03 2.3560E+01 !\n"
+    )
+    config = tmp_path / "licensed_sources.json"
+    _write_local_config(
+        config,
+        open_tdb,
+        source_id="claims-to-be-tchea",
+        elements=["Ni", "Co", "Cr", "Ta", "Re"],
+        systems=[["Ni", "Co", "Cr", "Ta", "Re"]],
+        evidence_class="reference_validated",
+    )
+
+    response = LocalFileSourceProvider(config).find(
+        SourceRequest.thermodynamic_database(["Ni", "Ta"])
+    )
+
+    assert response.sources == ()
+    assert len(response.errors) == 1
+    assert "Ta" in response.errors[0]
+    assert "Re" in response.errors[0]
+
+
+def test_unverifiable_stub_is_capped_at_screening(tmp_path):
+    stub_tdb = tmp_path / "stub.tdb"
+    stub_tdb.write_text("$ synthetic\n")
+    config = tmp_path / "licensed_sources.json"
+    _write_local_config(config, stub_tdb, evidence_class="reference_validated")
+
+    response = LocalFileSourceProvider(config).find(
+        SourceRequest.thermodynamic_database(["Al", "Ni"])
+    )
+
+    assert response.errors == ()
+    (source,) = response.sources
+    assert source.evidence_class == EvidenceClass.SCREENING
+    assert source.verification == "unverifiable"
+    assert source.provenance()["verification"] == "unverifiable"
+
+
+def test_matching_declaration_is_marked_elements_match(tmp_path):
+    al_ni_tdb = tmp_path / "al-ni.tdb"
+    al_ni_tdb.write_text(
+        "ELEMENT AL FCC_A1 2.6982E+01 4.5773E+03 2.8322E+01 !\n"
+        "ELEMENT NI FCC_A1 5.8690E+01 4.7870E+03 2.9796E+01 !\n"
+    )
+    config = tmp_path / "licensed_sources.json"
+    _write_local_config(config, al_ni_tdb, evidence_class="reference_validated")
+
+    response = LocalFileSourceProvider(config).find(
+        SourceRequest.thermodynamic_database(["Al", "Ni"])
+    )
+
+    (source,) = response.sources
+    assert source.verification == "elements_match"
+    assert source.evidence_class == EvidenceClass.REFERENCE_VALIDATED
+
+
+def test_platform_path_gets_the_same_suffix_check_as_local():
+    class FakePlatformClient:
+        def post(self, path, *, json, timeout):
+            return {
+                "sources": [
+                    {
+                        "id": "server-entitled",
+                        "type": "thermodynamic_database",
+                        "name": "Server-entitled source",
+                        "version": "test-version",
+                        "licence": "Synthetic test licence",
+                        "evidence_class": "screening",
+                        "entitled": True,
+                        "coverage": {
+                            "elements": ["Al", "Ni"],
+                            "systems": [["Al", "Ni"]],
+                        },
+                        "access": {"kind": "file", "path": "/etc/passwd"},
+                    }
+                ]
+            }
+
+    response = PlatformSourceProvider(FakePlatformClient()).find(
+        SourceRequest.thermodynamic_database(["Al", "Ni"])
+    )
+
+    assert response.sources == ()
+    assert any("/etc/passwd" in error for error in response.errors)
 
 
 def test_licensed_source_provenance_and_evidence_flow_without_promotion(tmp_path):
