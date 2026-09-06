@@ -4,6 +4,7 @@ from __future__ import annotations
 from app.tools.evidence import EvidenceSource, stamp_evidence
 
 import math
+import re
 
 from app.tools._extras import missing_extra_error
 from app.tools.base import Tool, ToolRegistry
@@ -45,6 +46,35 @@ _THERMOPHYSICAL_PROPERTIES = (
     "absorptivity",
 )
 
+# A placeholder label is not a citation. Live on 2026-09-02 the agent passed
+# "IN625-class nominal value (UNVERIFIED)" for every property and the map
+# came back orange. A source counts only when it carries none of these words
+# and does carry something a reader could look up: a DOI, URL, ISBN,
+# standard number, a vendor document number (SMC-045), a year, a volume, or
+# an explicit measured:/datasheet: prefix. "Inconel 718" alone is an alloy,
+# not a source. This is not a citation parser.
+_PLACEHOLDER_WORDS = re.compile(
+    r"nominal|assumed|placeholder|typical|estimate|unverified|unknown|n/a|tbd"
+    r"|memory|stand-in|class value|-class",
+    re.IGNORECASE,
+)
+_CITATION_FORMS = re.compile(
+    r"10\.\d{4,}/\S+"  # DOI
+    r"|https?://"  # URL
+    r"|ISBN[- ]?\d"  # ISBN
+    r"|\b(?:ASTM|ISO|NIST|ASM|AMS|SAE|MIL|DIN|EN|IEC)\s?-?[A-Z]?\d"  # standard
+    r"|\b[A-Z]{2,}-\d{2,}\b"  # vendor document number, e.g. SMC-045
+    r"|\b(?:19|20)\d{2}\b"  # a year
+    r"|\bvol(?:ume)?\.?\s?\d"  # a volume
+    r"|^(?:measured|datasheet):",  # explicit prefix
+    re.IGNORECASE,
+)
+
+
+def looks_like_citation(value) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and not _PLACEHOLDER_WORDS.search(text) and bool(_CITATION_FORMS.search(text))
+
 
 def _run_printability_map(**kwargs) -> dict:
     if not check_lpbf_available():
@@ -58,22 +88,27 @@ def _run_printability_map(**kwargs) -> dict:
     if not isinstance(out, dict) or "error" in out:
         return out
     unsourced = [
-        name
-        for name in _THERMOPHYSICAL_PROPERTIES
-        if not str(sources.get(name, "")).strip()
+        name for name in _THERMOPHYSICAL_PROPERTIES if not looks_like_citation(sources.get(name))
     ]
     stamp_evidence(
         out,
         EvidenceSource.MODEL_ASSERTION if unsourced else EvidenceSource.LITERATURE_EXTRACTION,
     )
-    out["property_sources"] = {k: v for k, v in sources.items() if str(v).strip()}
+    out["property_sources"] = {k: v for k, v in sources.items() if looks_like_citation(v)}
+    # Present but rejected, so the agent sees why a label it supplied did not count.
+    out["placeholder_sources"] = {
+        k: v for k, v in sources.items() if str(v).strip() and not looks_like_citation(v)
+    }
     out["unsourced_properties"] = unsourced
     if unsourced:
         out["evidence_note"] = (
             "screening over unsourced inputs: "
             + ", ".join(unsourced)
             + " arrived without a source. Pass property_sources={name: citation} "
-            "for datasheet or measured values; the class rises to research."
+            "for datasheet or measured values; the class rises to research. "
+            "Placeholder labels (nominal, assumed, typical, unverified, ...) do not "
+            "count; a DOI, URL, standard or document number, year, volume, or a "
+            "measured:/datasheet: prefix does."
         )
     return out
 
