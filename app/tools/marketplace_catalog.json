@@ -65,7 +65,7 @@
       "author": "Mirdyne (PRISM)",
       "version": "1.0.0",
       "requires_extras": [],
-      "optional_extras": ["ml", "calphad", "precipitation", "polymer", "lpbf", "qe", "simulation", "mace", "data", "reports"],
+      "optional_extras": ["ml", "calphad", "precipitation", "polymer", "lpbf", "qe", "simulation", "mace", "data", "reports", "cluster-expansion"],
       "tools": [],
       "modules": ["app.mcp_server"],
       "metadata": {
@@ -73,7 +73,7 @@
         "kind": "mcp_server",
         "tools": [],
         "requires_extras": [],
-        "optional_extras": ["ml", "calphad", "precipitation", "polymer", "lpbf", "qe", "simulation", "mace", "data", "reports"],
+        "optional_extras": ["ml", "calphad", "precipitation", "polymer", "lpbf", "qe", "simulation", "mace", "data", "reports", "cluster-expansion"],
         "transport": "stdio",
         "command": ["python3", "-m", "app.mcp_server"],
         "install": {
@@ -412,6 +412,47 @@
       }
     },
     {
+      "slug": "prism-cluster-expansion",
+      "name": "PRISM Cluster Expansion and Monte Carlo",
+      "resource_type": "cli_tool",
+      "description": "Does an alloy stay a random solid solution at temperature? cluster_expansion_fit fits an icet cluster expansion to single-point energies on an fcc or bcc parent lattice and reports the k-fold CV error against a 15 meV/atom gate; monte_carlo_sro samples it with canonical Monte Carlo (mchammer) and returns first-shell Warren-Cowley short-range-order parameters. Exists because two research campaigns fitted on a parent lattice of a_eff*sqrt(2) (aluminium's 4.0 A, not nickel's 3.6) and then sampled on a third lattice: here the lattice constant is derived once from volume, checked against the constituents' reference states (>10% off is refused), carried inside one ClusterExpansion object, re-derived from the sampling cell and compared, and printed. Training energies default to the [mace] extra's calculator; any ASE calculator works.",
+      "tags": ["cluster-expansion", "monte-carlo", "short-range-order", "icet", "mchammer", "materials", "prism-tool"],
+      "license": "MIT",
+      "author": "Mirdyne (PRISM)",
+      "version": "1.0.0",
+      "requires_extras": ["cluster-expansion"],
+      "optional_extras": ["mace"],
+      "tools": [
+        {"name": "cluster_expansion_fit", "requires_extras": ["cluster-expansion"]},
+        {"name": "monte_carlo_sro", "requires_extras": ["cluster-expansion"]}
+      ],
+      "modules": ["app.tools.cluster_expansion"],
+      "metadata": {
+        "provider": "prism",
+        "kind": "agent_tools",
+        "tools": ["cluster_expansion_fit", "monte_carlo_sro"],
+        "requires_extras": ["cluster-expansion"],
+        "optional_extras": ["mace"],
+        "install": {
+          "method": "python_extra",
+          "package": "prism-platform",
+          "extra": "cluster-expansion",
+          "command": "pip install icet trainstation",
+          "extra_command": "pip install 'prism-platform[cluster-expansion]'",
+          "note": "prism-platform is NOT on PyPI — `command` is the form that works inside an existing PRISM venv. icet ships mchammer; trainstation is its fitting and cross-validation package. Energies come from the [mace] extra's calculator by default."
+        },
+        "dependency_licenses": {
+          "icet": "MPL-2.0",
+          "trainstation": "MIT License"
+        },
+        "verification": {
+          "level": "end_to_end",
+          "date": "2026-09-06",
+          "note": "Five tests run the real icet/trainstation/mchammer stack on a Ni-Cu fcc system with ASE's EMT calculator: lattice derived from a relaxed cell's volume (3.56 A, not a_eff*sqrt(2)); a 4.02 A lattice for a nickel alloy refused with the cube-root hint; CV error and gate reported; Monte Carlo lattice equal to the fitted lattice exactly. The MACE calculator path was NOT exercised."
+        }
+      }
+    },
+    {
       "slug": "prism-quantum-espresso-io",
       "name": "PRISM Quantum ESPRESSO I/O",
       "resource_type": "cli_tool",
@@ -424,13 +465,15 @@
       "tools": [
         {"name": "qe_resolve_pseudopotentials", "requires_extras": ["qe"]},
         {"name": "qe_write_input", "requires_extras": ["qe"]},
-        {"name": "qe_parse_output", "requires_extras": ["qe"]}
+        {"name": "qe_parse_output", "requires_extras": ["qe"]},
+        {"name": "qe_run", "requires_extras": ["qe"]},
+        {"name": "qe_status", "requires_extras": ["qe"]}
       ],
       "modules": ["app.tools.simulation.qe"],
       "metadata": {
         "provider": "prism",
         "kind": "agent_tools",
-        "tools": ["qe_resolve_pseudopotentials", "qe_write_input", "qe_parse_output"],
+        "tools": ["qe_resolve_pseudopotentials", "qe_write_input", "qe_parse_output", "qe_run", "qe_status"],
         "requires_extras": ["qe"],
         "install": {
           "method": "python_extra",

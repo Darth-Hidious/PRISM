@@ -78,6 +78,7 @@ pub const SHIPPED_TOOLS: &[&str] = &[
     "billing_usage",
     "calphad",
     "calphad_compute",
+    "cluster_expansion_fit",
     "cancel_background_research",
     "check_background_research",
     "check_hpc_queue",
@@ -157,6 +158,7 @@ pub const SHIPPED_TOOLS: &[&str] = &[
     "mace_list_jobs",
     "mace_md_equilibrate",
     "mace_phonon_harmonic",
+    "monte_carlo_sro",
     "mace_relax_structure",
     "marketplace",
     "marketplace_find",
@@ -462,6 +464,10 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         m.insert("mace_compute_elastic", FullAccess);
         m.insert("mace_md_equilibrate", FullAccess);
         m.insert("mace_phonon_harmonic", FullAccess);
+        // Loads the MACE model for single-point energies, like the tools above.
+        m.insert("cluster_expansion_fit", FullAccess);
+        // Samples a fitted expansion on the CPU and writes under ~/.prism.
+        m.insert("monte_carlo_sro", WorkspaceWrite);
         m.insert("mcp_services_invoke", FullAccess);
         m.insert("mesh", FullAccess);
         m.insert("mesh_publish", FullAccess);

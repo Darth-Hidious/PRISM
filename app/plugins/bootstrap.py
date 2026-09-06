@@ -194,6 +194,15 @@ def build_full_registry(
     except Exception:
         logger.debug("mace tools not registered", exc_info=True)
 
+    # Cluster expansion + Monte Carlo SRO. Exists because two campaigns fitted
+    # the CE on a_eff*sqrt(2) (4.02 A, wrong) and sampled on a third lattice.
+    try:
+        from app.tools.cluster_expansion import create_cluster_expansion_tools
+
+        create_cluster_expansion_tools(registry)
+    except Exception:
+        logger.debug("cluster expansion tools not registered", exc_info=True)
+
     # Quantum ESPRESSO input/output tools (pyiron-free path): pw.x .in
     # writing via ASE's espresso-in format and .out parsing via ASE's
     # espresso-out reader, with pymatgen structure handling. Registered

@@ -114,6 +114,13 @@ calphad = [
     # scheil_solidification tool for non-equilibrium solidification paths.
     "scheil>=0.2.0; python_version<'3.15'",
 ]
+cluster-expansion = [
+    # icet (cluster expansion; ships mchammer for Monte Carlo) and trainstation
+    # (its fitting/CV package). Used by cluster_expansion_fit / monte_carlo_sro;
+    # training energies come from the [mace] extra's calculator.
+    "icet>=3.0",
+    "trainstation>=1.0",
+]
 polymer = [
     # RDKit validates polymer identity (repeat unit / monomer / SMILES) for
     # app/tools/materials/polymer. Registration is already gated on

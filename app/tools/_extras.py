@@ -35,6 +35,7 @@ EXTRA_MODULES: dict[str, tuple[str, ...]] = {
     "qe": ("ase", "pymatgen"),
     "lpbf": ("numpy", "scipy"),
     "calphad": ("pycalphad", "scheil"),
+    "cluster-expansion": ("icet", "mchammer", "trainstation"),
     "precipitation": ("kawin",),
     "polymer": ("rdkit",),
     "mace": ("mace", "torch", "ase", "numpy", "huggingface_hub", "phonopy"),
@@ -57,6 +58,7 @@ EXTRA_DISTRIBUTIONS: dict[str, tuple[str, ...]] = {
     "qe": ("ase", "pymatgen"),
     "lpbf": ("numpy", "scipy"),
     "calphad": ("pycalphad", "scheil"),
+    "cluster-expansion": ("icet", "trainstation"),
     "precipitation": ("kawin",),
     "polymer": ("rdkit",),
     "mace": ("mace-torch", "torch", "ase", "numpy", "huggingface-hub", "phonopy"),
@@ -76,6 +78,7 @@ GATE_IMPORTS: dict[str, tuple[str, ...]] = {
     # Scheil is needed only by scheil_solidification; the core CALPHAD tools
     # remain usable when pycalphad is installed without that optional helper.
     "calphad": ("pycalphad",),
+    "cluster-expansion": ("icet",),
     "precipitation": ("kawin",),
     "polymer": ("rdkit",),
     "mace": ("mace", "ase"),
