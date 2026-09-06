@@ -1988,16 +1988,18 @@ fn invalid_session_change_cancels_a_scheduled_artifact_refresh() {
     ));
 }
 
+// The link picker lives on the shifted letter: plain `o` opens the first
+// reference on the cursor line, the same "open" it means on a structure row.
 #[test]
-fn o_in_chat_focus_opens_link_picker_newest_first() {
+fn shift_o_in_chat_focus_opens_link_picker_newest_first() {
     let mut app = test_app();
     app.push_user("see https://old.example.org");
     app.apply_agent_msg(AgentMsg::TextDelta(
         "source: [paper](https://new.example.org/x)".into(),
     ));
     app.focus = Focus::Chat;
-    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE));
-    assert!(app.link_picker.open, "o must open the link picker");
+    app.handle_key(key(KeyCode::Char('O'), KeyModifiers::SHIFT));
+    assert!(app.link_picker.open, "O must open the link picker");
     assert!(
         !app.link_picker.confirm,
         "multiple links must show the list first"
@@ -2013,7 +2015,7 @@ fn single_link_still_shows_confirm_dialog() {
         "source: https://example.org/paper".into(),
     ));
     app.focus = Focus::Chat;
-    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Char('O'), KeyModifiers::SHIFT));
     assert!(app.link_picker.open);
     assert!(
         app.link_picker.confirm,
@@ -2034,7 +2036,7 @@ fn link_picker_digit_selects_and_asks_confirmation() {
         "see https://a.example.org and https://b.example.org".into(),
     ));
     app.focus = Focus::Chat;
-    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Char('O'), KeyModifiers::SHIFT));
     assert!(!app.link_picker.confirm);
     app.handle_key(key(KeyCode::Char('2'), KeyModifiers::NONE));
     assert_eq!(app.link_picker.selected, 1);
@@ -2049,11 +2051,11 @@ fn link_picker_digit_selects_and_asks_confirmation() {
 }
 
 #[test]
-fn o_with_no_links_shows_toast_only() {
+fn shift_o_with_no_links_shows_toast_only() {
     let mut app = test_app();
     app.push_user("no links here");
     app.focus = Focus::Chat;
-    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Char('O'), KeyModifiers::SHIFT));
     assert!(!app.link_picker.open, "no URLs → no picker");
     assert!(!app.toasts.is_empty(), "user must get feedback via a toast");
 }

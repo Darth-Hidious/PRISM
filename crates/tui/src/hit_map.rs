@@ -28,7 +28,14 @@ pub enum HitTarget {
     /// transforms the message before it reaches the screen, so a rendered row
     /// is often not a substring of `ChatLine::text`. What the reader pointed
     /// at is what they saw, so that is what gets quoted back.
-    TranscriptLine { message: usize, text: String },
+    ///
+    /// `line` is the row's position in the list the renderer publishes as
+    /// `App::drawn_lines`, so a click and a j/k step select the same thing.
+    TranscriptLine {
+        line: usize,
+        message: usize,
+        text: String,
+    },
     /// A message in the transcript, by its index in `App::messages`.
     TranscriptMessage { index: usize },
     /// The close control on the reference panel.

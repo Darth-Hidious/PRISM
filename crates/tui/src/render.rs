@@ -5,8 +5,8 @@
 //! when the theme changes.
 
 use crate::app::{
-    App, Focus, LineKind, Modal, ObjectKind, ObjectStatus, Role, WorkspaceTab, evidence_token,
-    first_line,
+    App, DrawnLine, Focus, LineKind, Modal, ObjectKind, ObjectStatus, Role, WorkspaceTab,
+    evidence_token, first_line,
 };
 use crate::artifact::{ArtifactPromotion, ArtifactStoreState, format_bytes};
 use crate::command;
@@ -1146,16 +1146,51 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // Style only: no span is added or removed, because the reference marks and
     // the hit map are both computed from column positions on these same lines,
     // and a one-cell shift would send every hover to the wrong word.
-    if let Some((selected_message, selected_text)) = &app.selected_line
-        && let Some((line_index, _, _)) = line_rows
-            .iter()
-            .find(|(_, message, text)| message == selected_message && text == selected_text)
+    //
+    // Found by position first, by content when the list has shifted under the
+    // cursor (Ctrl-T inserting reasoning lines above it, for one): the row the
+    // reader chose keeps its highlight either way.
+    if let Some(selected) = &app.selected_line
+        && let Some((line_index, _, _)) = {
+            let same = |(_, message, text): &&(usize, usize, String)| {
+                *message == selected.message && *text == selected.text
+            };
+            line_rows
+                .get(selected.line)
+                .filter(|row| same(row))
+                .or_else(|| line_rows.iter().find(same))
+        }
         && let Some(line) = lines.get_mut(*line_index)
     {
         for span in &mut line.spans {
             span.style = span.style.bg(t.panel).add_modifier(Modifier::BOLD);
         }
     }
+
+    // The line list the keyboard walks: every non-blank row with the wrapped
+    // row it starts on and the references marked on it. Marks arrive grouped
+    // by line in ascending order, so one pass pairs them up.
+    let drawn: Vec<DrawnLine> = {
+        let mut marks = reference_marks.iter().peekable();
+        line_rows
+            .into_iter()
+            .map(|(line, message, text)| {
+                while marks.next_if(|(at, ..)| *at < line).is_some() {}
+                let mut refs: Vec<String> = Vec::new();
+                while let Some((_, _, _, id)) = marks.next_if(|(at, ..)| *at == line) {
+                    if !refs.contains(id) {
+                        refs.push(id.clone());
+                    }
+                }
+                DrawnLine {
+                    row: rows_for(line),
+                    message,
+                    text,
+                    refs,
+                }
+            })
+            .collect()
+    };
 
     let paragraph = Paragraph::new(lines)
         .style(Style::default().bg(t.overlay_bg))
@@ -1187,6 +1222,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // What was actually drawn, so a key handler taking over from auto-follow or
     // the anchor resumes from the row the reader is looking at.
     app.view_scroll.set(effective_scroll);
+    app.view_height.set(viewport);
 
     // Which message occupies which rows on screen. A message owns every row
     // from its own first line down to the next message's, so pointing anywhere
@@ -1220,16 +1256,17 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         // reference marks. Order matters: `HitMap::at` searches newest-first,
         // so a reference still wins over the line it sits on, and a line wins
         // over the message that contains it.
-        for (line, msg_idx, text) in &line_rows {
-            let row = rows_for(*line);
+        for (line, drawn_line) in drawn.iter().enumerate() {
+            let row = drawn_line.row;
             if row < effective_scroll || row >= effective_scroll.saturating_add(area.height) {
                 continue;
             }
             map.push(
                 Rect::new(area.x, area.y + (row - effective_scroll), area.width, 1),
                 HitTarget::TranscriptLine {
-                    message: *msg_idx,
-                    text: text.clone(),
+                    line,
+                    message: drawn_line.message,
+                    text: drawn_line.text.clone(),
                 },
             );
         }
@@ -1302,6 +1339,10 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
+
+    // Published whole, visible or not, so the cursor can step onto a line
+    // that is off screen and the key handler can scroll it into view.
+    *app.drawn_lines.borrow_mut() = drawn;
 
     f.render_widget(paragraph.scroll((effective_scroll, 0)), area);
 
@@ -1524,10 +1565,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // only half of pointing: without this the mark appears and the reader is
     // left to guess what it bought them.
     if app.selected_line.is_some() {
-        spans.push(Span::styled(
-            "   e ask about this line · Esc clear",
-            Style::default().fg(t.reference),
-        ));
+        // Says what the line opens, so the reader knows before pressing Enter
+        // whether there is anything behind it. Drawn after the transcript, so
+        // the count is this frame's.
+        let hint = match app.cursor_refs().len() {
+            0 => "   e ask about this line · Esc clear".to_string(),
+            1 => "   1 ref · ↵ open · m mark · e ask · Esc clear".to_string(),
+            n => format!("   {n} refs · ↵ open · Tab next · m mark · e ask · Esc clear"),
+        };
+        spans.push(Span::styled(hint, Style::default().fg(t.reference)));
     }
     spans.push(Span::styled("   Ctrl-C quit", Style::default().fg(t.muted)));
 

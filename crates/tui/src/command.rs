@@ -795,7 +795,7 @@ pub static CATALOG: &[Command] = &[
         title: "Open link",
         description: "Show a URL from the transcript for manual opening",
         category: "Session",
-        keybind: "o",
+        keybind: "O",
         suggested: false,
     },
     Command {

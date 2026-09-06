@@ -65,7 +65,7 @@ pub static KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "Esc",
-        description: "Leave a panel / cancel",
+        description: "Leave a panel; clear the line cursor",
         category: "Navigation",
     },
     KeyBinding {
@@ -75,7 +75,12 @@ pub static KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "↑↓ / k j",
-        description: "Scroll transcript one line",
+        description: "Move the line cursor; the view follows",
+        category: "Navigation",
+    },
+    KeyBinding {
+        keys: "Ctrl-J / Ctrl-K",
+        description: "Scroll the transcript one line",
         category: "Navigation",
     },
     KeyBinding {
@@ -84,8 +89,28 @@ pub static KEYMAP: &[KeyBinding] = &[
         category: "Navigation",
     },
     KeyBinding {
-        keys: "o",
-        description: "Open a link from the transcript (chat focus)",
+        keys: "Enter / o",
+        description: "Open the cursor line's first reference",
+        category: "Navigation",
+    },
+    KeyBinding {
+        keys: "Tab",
+        description: "Next reference on the cursor line",
+        category: "Navigation",
+    },
+    KeyBinding {
+        keys: "e",
+        description: "Ask about the cursor line, as drawn",
+        category: "Navigation",
+    },
+    KeyBinding {
+        keys: "m",
+        description: "Mark the open reference for the agent",
+        category: "Navigation",
+    },
+    KeyBinding {
+        keys: "O",
+        description: "Open a link from the transcript",
         category: "Navigation",
     },
     KeyBinding {

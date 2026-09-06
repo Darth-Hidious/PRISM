@@ -1036,13 +1036,21 @@ pub struct App {
     /// words that stand for them, never payloads: what a reference points at
     /// is fetched when the pointer lands on it.
     pub references: crate::refs::ReferenceRegistry,
-    /// The transcript line the reader clicked, and which message it came from.
+    /// The transcript line under the cursor: clicked, or reached with j/k.
     ///
     /// Held verbatim as it was DRAWN. Markdown transforms a message before it
     /// reaches the screen, so a rendered row is often not a slice of the
     /// source — what the reader pointed at is what they saw, so that is what
     /// gets quoted back to the model.
-    pub selected_line: Option<(usize, String)>,
+    pub selected_line: Option<SelectedLine>,
+    /// Every non-blank transcript line as the renderer drew it last frame,
+    /// whole transcript, not only the visible rows. The line cursor walks
+    /// this list: it is how a key can land on a line that is off screen and
+    /// pull it into view, and how Enter knows what the cursor line opens.
+    pub drawn_lines: std::cell::RefCell<Vec<DrawnLine>>,
+    /// Rows the transcript had last frame. With `view_scroll` this is the
+    /// window the cursor must stay inside.
+    pub view_height: std::cell::Cell<u16>,
     /// The panel shown for the reference under the pointer, or `None`.
     ///
     /// Opened by `pointer_moved`, never by the renderer — resolution is a
@@ -1274,6 +1282,8 @@ impl App {
             sidebar_visible: std::cell::Cell::new(true),
             references: crate::refs::ReferenceRegistry::default(),
             selected_line: None,
+            drawn_lines: std::cell::RefCell::new(Vec::new()),
+            view_height: std::cell::Cell::new(0),
             ref_panel: None,
             structure_views: std::collections::HashMap::new(),
             source_records: std::collections::HashMap::new(),
@@ -1586,6 +1596,13 @@ impl App {
         }
         if key.code == KeyCode::PageDown {
             self.scroll_down(10);
+            return;
+        }
+
+        // Tab on a cursor line whose reference panel is open moves the panel
+        // to the line's next reference — "next" is what Tab means everywhere
+        // else here. Focus cycling resumes once Esc has closed the panel.
+        if key.code == KeyCode::Tab && self.focus == Focus::Chat && self.cycle_cursor_reference() {
             return;
         }
 
@@ -2153,11 +2170,19 @@ impl App {
                 self.hovered = Some(crate::hit_map::HitTarget::Reference { id });
                 return;
             }
-            Some(crate::hit_map::HitTarget::TranscriptLine { message, text }) => {
+            Some(crate::hit_map::HitTarget::TranscriptLine {
+                line,
+                message,
+                text,
+            }) => {
                 // Selecting is not asking. The reader picks the line, sees it
                 // marked, and then decides — pressing `e` is the ask. Firing a
                 // turn on a stray click would spend a model call on a misclick.
-                self.selected_line = Some((message, text.clone()));
+                self.selected_line = Some(SelectedLine {
+                    line,
+                    message,
+                    text: text.clone(),
+                });
                 self.focus = Focus::Chat;
                 return;
             }
@@ -2460,9 +2485,18 @@ impl App {
     }
 
     fn handle_chat_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.scroll_up(1),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll_down(1),
+            // Raw scroll: move the view without choosing a line.
+            KeyCode::Char('k') if ctrl => self.scroll_up(1),
+            KeyCode::Char('j') if ctrl => self.scroll_down(1),
+            // j/k walk the line cursor and the view follows it. Before this
+            // they only scrolled, and the only way onto a line was a click —
+            // so over SSH, in tmux with the mouse off, or in macOS Terminal
+            // (which reports no pointer motion) nothing in the transcript
+            // could be opened, asked about or marked.
+            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             // Home / End are the reader taking over just as much as j/k are,
             // so they release the user-turn anchor too. Without this, `G`
             // silently did NOTHING: the anchor outranks `auto_scroll` in
@@ -2484,16 +2518,28 @@ impl App {
             KeyCode::Char('e') if self.selected_line.is_some() => {
                 self.explain_selected_line();
             }
-            KeyCode::Char('i') | KeyCode::Enter => {
-                self.focus = Focus::Input;
+            // Enter opens what the cursor line points at. With nothing to
+            // open it is the way back to the prompt, as it always was.
+            KeyCode::Enter => {
+                if !self.open_cursor_reference() {
+                    self.focus = Focus::Input;
+                }
             }
-            KeyCode::Char('o') => self.open_link_picker(),
+            KeyCode::Char('i') => self.focus = Focus::Input,
+            KeyCode::Char('o') => {
+                self.open_cursor_reference();
+            }
+            // The link picker moved to the shifted letter so that `o` could
+            // mean "open" for the cursor line, the same as it does on a
+            // structure row.
+            KeyCode::Char('O') => self.open_link_picker(),
+            KeyCode::Esc => self.selected_line = None,
             KeyCode::Char('?') => self.open_which_key(),
             KeyCode::Backspace => self.new_session(),
             // Same rule as the home screen: an unbound printable character
             // means "I am writing", so focus the prompt and keep it rather
             // than dropping it on the floor. The vim-style bindings above
-            // (j/k/g/G/i/o/?) are matched first and keep working.
+            // (j/k/g/G/i/o/O/?) are matched first and keep working.
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
@@ -2520,6 +2566,51 @@ impl App {
         }
         self.anchor_user_turn.set(false);
         self.auto_scroll = false;
+    }
+
+    /// Step the line cursor by one line and keep it on screen.
+    ///
+    /// With no cursor yet, the first step starts at the edge of the view the
+    /// reader is stepping away from: `k` from the tail lands on the last
+    /// visible line, `j` from the top on the first. Stepping past either edge
+    /// scrolls one row — the view follows the cursor, the cursor never leaves
+    /// the view. Moving the view without choosing a line stays on Ctrl-J /
+    /// Ctrl-K and PgUp / PgDn.
+    fn move_cursor(&mut self, step: i32) {
+        // Stepping is the reader taking over from auto-follow and the
+        // user-turn anchor, whether or not there is a line to land on yet.
+        self.take_scroll_control();
+        let lines = self.drawn_lines.borrow();
+        if lines.is_empty() {
+            return;
+        }
+        let top = self.view_scroll.get();
+        let height = self.view_height.get();
+        let bottom = top.saturating_add(height);
+        let last = lines.len() - 1;
+        let next = match self.cursor_index(&lines) {
+            Some(at) if step < 0 => at.saturating_sub(1),
+            Some(at) => (at + 1).min(last),
+            None if step < 0 => lines
+                .iter()
+                .rposition(|line| line.row < bottom)
+                .unwrap_or(last),
+            None => lines.iter().position(|line| line.row >= top).unwrap_or(0),
+        };
+        let line = lines[next].clone();
+        drop(lines);
+        if height > 0 {
+            if line.row < self.scroll_offset {
+                self.scroll_offset = line.row;
+            } else if line.row >= self.scroll_offset.saturating_add(height) {
+                self.scroll_offset = line.row - height + 1;
+            }
+        }
+        self.selected_line = Some(SelectedLine {
+            line: next,
+            message: line.message,
+            text: line.text,
+        });
     }
 
     /// Scroll the transcript up by `n` lines (toward older messages).
@@ -2584,10 +2675,15 @@ impl App {
             .cache_ref
             .clone()
             .unwrap_or_else(|| format!("cache://{}/structure.cif", structure.cache_key));
-        // Anchored at the top of the transcript column: the panel has no
-        // pointer cell to sit beside, and the top-left is where a reader's
-        // eye goes when a key opens something.
-        self.open_reference_panel(&id, 2, 2);
+        self.open_pinned_reference(&id);
+    }
+
+    /// Open a reference by key rather than by pointer: pinned, so it stays
+    /// until dismissed, and anchored at the top of the transcript column —
+    /// the panel has no pointer cell to sit beside, and the top-left is where
+    /// a reader's eye goes when a key opens something.
+    fn open_pinned_reference(&mut self, id: &str) {
+        self.open_reference_panel(id, 2, 2);
         if let Some(panel) = &mut self.ref_panel {
             panel.pinned = true;
         }
@@ -6108,6 +6204,69 @@ impl App {
         true
     }
 
+    /// Where the cursor sits in the renderer's line list.
+    ///
+    /// By position when the list still agrees with what was selected; by
+    /// content when it has shifted underneath (Ctrl-T inserting reasoning
+    /// lines above the cursor, for one). Either way the next step starts from
+    /// the line the reader is looking at.
+    fn cursor_index(&self, lines: &[DrawnLine]) -> Option<usize> {
+        let selected = self.selected_line.as_ref()?;
+        let same =
+            |line: &DrawnLine| line.message == selected.message && line.text == selected.text;
+        if lines.get(selected.line).is_some_and(same) {
+            return Some(selected.line);
+        }
+        lines.iter().position(same)
+    }
+
+    /// The references marked on the cursor line, left to right — what Enter
+    /// opens and Tab cycles. Empty with no cursor or a line with none.
+    #[must_use]
+    pub fn cursor_refs(&self) -> Vec<String> {
+        let lines = self.drawn_lines.borrow();
+        self.cursor_index(&lines)
+            .map(|index| lines[index].refs.clone())
+            .unwrap_or_default()
+    }
+
+    /// Enter or `o` on the cursor line: open its first reference, pinned, the
+    /// way `o` on a structure row does. False when the line has nothing to
+    /// open, so the caller can fall back to what the key meant before.
+    fn open_cursor_reference(&mut self) -> bool {
+        let refs = self.cursor_refs();
+        let Some(first) = refs.first() else {
+            return false;
+        };
+        // A panel already open on one of this line's references stays put:
+        // Enter again is not a reset, and Tab is the way to the next one.
+        if !self
+            .ref_panel
+            .as_ref()
+            .is_some_and(|p| refs.contains(&p.id))
+        {
+            self.open_pinned_reference(first);
+        }
+        true
+    }
+
+    /// Tab with a panel open on the cursor line: show the line's next
+    /// reference, wrapping. False when no such panel is open, so Tab keeps
+    /// cycling focus.
+    fn cycle_cursor_reference(&mut self) -> bool {
+        let refs = self.cursor_refs();
+        let Some(open) = self
+            .ref_panel
+            .as_ref()
+            .and_then(|p| refs.iter().position(|id| *id == p.id))
+        else {
+            return false;
+        };
+        let next = refs[(open + 1) % refs.len()].clone();
+        self.open_pinned_reference(&next);
+        true
+    }
+
     /// Ask the model what it meant by the line the reader picked.
     ///
     /// The quote is passed through VERBATIM — byte-identical to what was on
@@ -6116,10 +6275,10 @@ impl App {
     /// other text. `explain_request` is separated out so the composition can
     /// be tested without a backend.
     fn explain_selected_line(&mut self) {
-        let Some((index, text)) = self.selected_line.take() else {
+        let Some(line) = self.selected_line.take() else {
             return;
         };
-        let request = explain_request(index, &text);
+        let request = explain_request(line.message, &line.text);
         self.push_user(&request);
         self.send_message(&request);
     }
@@ -12431,6 +12590,38 @@ mod tests {
 pub struct RefProvenance {
     pub sources: Vec<String>,
     pub placement: String,
+}
+
+/// The transcript line under the cursor.
+///
+/// A click sets it from the hit map; j/k set it from `App::drawn_lines`. Both
+/// record the same three things, so pointing and stepping cannot disagree
+/// about what is selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedLine {
+    /// Position in the renderer's line list. Kept so a step lands on the
+    /// NEIGHBOUR even when two lines read the same — a table's rules, a
+    /// repeated bullet — which matching by text alone could not tell apart.
+    pub line: usize,
+    /// Which message it came from, by index in `App::messages`.
+    pub message: usize,
+    /// The text as DRAWN, byte for byte. This is what `e` quotes.
+    pub text: String,
+}
+
+/// One non-blank transcript line as the renderer drew it last frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawnLine {
+    /// The wrapped screen row the line starts on, counted from the top of
+    /// the transcript — the unit `scroll_offset` is in.
+    pub row: u16,
+    /// Which message it came from.
+    pub message: usize,
+    /// The text on it, as drawn.
+    pub text: String,
+    /// The references marked on it, left to right, each once. What Enter
+    /// opens and Tab cycles.
+    pub refs: Vec<String>,
 }
 
 /// The panel shown for the reference under the pointer.

@@ -1,6 +1,5 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1042
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
@@ -15,17 +14,17 @@ expression: rendered
 │ Navigation                                                     │ │
 │   Tab                   Cycle focus: input → workspace → chat  │ │
 │   i                     Focus the message input                │ │
-│   Esc                   Leave a panel / cancel                 │ │
+│   Esc                   Leave a panel; clear the line cursor   │ │
 │   PgUp / PgDn           Scroll transcript by a page            │ │
-│   ↑↓ / k j              Scroll transcript one line             │ │
+│   ↑↓ / k j              Move the line cursor; the view follows │ │
+│   Ctrl-J / Ctrl-K       Scroll the transcript one line         │ │
 │   g / G                 Jump to top / bottom                   │ │
-│   o                     Open a link from the transcript (chat f│ │
+│   Enter / o             Open the cursor line's first reference │ │
+│   Tab                   Next reference on the cursor line      │ │
+│   e                     Ask about the cursor line, as drawn    │ │
+│   m                     Mark the open reference for the agent  │ │
+│   O                     Open a link from the transcript        │ │
 │   mouse wheel           Scroll transcript                      │ │
-│                                                                │ │
-│ Display                                                        │ │
-│   Ctrl-T                Toggle thinking tokens                 │ │
-│   Ctrl-M                Toggle tok/s metrics                   │ │
-│   Ctrl-$                Toggle cost in the status bar          │ │
 └────────────────────────────────────────────────────────────────┘ │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
 │ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │

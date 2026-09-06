@@ -2493,14 +2493,36 @@ fn the_first_scroll_after_a_turn_resumes_from_what_is_on_screen() {
     );
 
     app.focus = prism_tui::app::Focus::Chat;
+    // Plain `k` now places the line cursor rather than scrolling: with no
+    // cursor yet it lands on the last line in view, and the view stays put.
     app.handle_key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Char('k'),
         crossterm::event::KeyModifiers::NONE,
     ));
     assert_eq!(
+        app.scroll_offset, drawn,
+        "the first `k` takes over from what was drawn ({drawn}) without moving it"
+    );
+    let cursor = app.selected_line.clone().expect("`k` places the cursor");
+    let row = app.drawn_lines.borrow()[cursor.line].row;
+    assert!(
+        drawn <= row && row < drawn + app.view_height.get(),
+        "the cursor starts on a line inside the view (row {row}, view from {drawn})"
+    );
+    let next_row = app.drawn_lines.borrow().get(cursor.line + 1).map(|l| l.row);
+    assert!(
+        next_row.is_none_or(|r| r >= drawn + app.view_height.get()),
+        "and it is the LAST line in view (the next line starts at row {next_row:?})"
+    );
+    // The raw scroll keeps the old contract: one row up from what was drawn.
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('k'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    assert_eq!(
         app.scroll_offset,
         drawn.saturating_sub(1),
-        "one press of `k` must move ONE row up from what was drawn ({drawn}), \
+        "one press of Ctrl-K must move ONE row up from what was drawn ({drawn}), \
          not jump to the bottom ({bottom})"
     );
 }
@@ -3612,10 +3634,11 @@ fn clicking_a_line_then_e_asks_about_that_exact_line() {
     };
 
     app.pointer_pressed(cell.0, cell.1);
-    let (idx, picked) = app
+    let selected = app
         .selected_line
         .clone()
         .expect("clicking a line must select it");
+    let (idx, picked) = (selected.message, selected.text);
     assert_eq!(
         picked, on_screen,
         "the selection must hold the line as DRAWN, byte for byte"
@@ -4266,4 +4289,228 @@ fn narrow_frames_read_the_same_in_mono_80x24() {
     assert_eq!(render_app_to_string(&app, 80, 24), chat);
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(render_app_to_string(&app, 80, 24), overlay);
+}
+
+/// The keyboard reaches what the pointer reaches.
+///
+/// Over SSH, in tmux with the mouse off, and in macOS Terminal (which reports
+/// no pointer motion) the transcript's references did not exist: the only way
+/// to `selected_line` was a click, and `e` and `m` hung off it. Now j/k walk a
+/// line cursor, Enter opens the line's first reference pinned, Tab moves to
+/// the next one, `m` marks what the panel shows, `e` asks about the line as it
+/// was drawn, and Esc clears — with no pointer call anywhere in this test.
+///
+/// `copy_mode` turns terminal mouse capture off; every key below must work
+/// the same with it on, which is the case the mouse cannot cover at all.
+fn keyboard_cursor_reaches_every_reference(copy_mode: bool) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use prism_tui::app::explain_request;
+    use prism_tui::hit_map::HitTarget;
+    use prism_tui::refs::{RefKind, ReferenceEntry};
+
+    let mut app = fake_app();
+    app.copy_mode = copy_mode;
+    app.references.insert(ReferenceEntry {
+        id: "provenance://materials_search/0".into(),
+        kind: RefKind::Provenance,
+        tokens: vec!["OQMD".into()],
+    });
+    app.references.insert(ReferenceEntry {
+        id: "tool://materials_search".into(),
+        kind: RefKind::Tool,
+        tokens: vec!["materials_search".into()],
+    });
+    app.apply_agent_msg(AgentMsg::TextDelta(
+        "OQMD via materials_search returned 12 rows.\nThe solidus sits near 1878 K.\n".into(),
+    ));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let rendered = render_app_to_string(&app, 120, 30);
+    assert!(rendered.contains("OQMD via materials_search"), "{rendered}");
+
+    // The reference row as it was DRAWN, read from the hit map — the same
+    // record a click would have read.
+    let drawn = {
+        let map = app.hit_map.borrow();
+        let mut found = None;
+        'outer: for row in 0..30u16 {
+            for col in 0..120u16 {
+                if let Some(HitTarget::TranscriptLine { text, .. }) = map.at(col, row)
+                    && text.contains("OQMD")
+                {
+                    found = Some(text.clone());
+                    break 'outer;
+                }
+            }
+        }
+        found.expect("the reference row claims its own cells")
+    };
+
+    let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+    app.focus = Focus::Chat;
+
+    // Line 1 is the `◆ PRISM` header; line 2 is the reference row.
+    app.handle_key(key(KeyCode::Char('j')));
+    app.handle_key(key(KeyCode::Char('j')));
+    let selected = app
+        .selected_line
+        .clone()
+        .expect("j twice must put the cursor on line 2");
+    assert_eq!(
+        selected.text, drawn,
+        "the cursor holds the line as DRAWN, byte for byte"
+    );
+    // Wide enough for the footer to hold the hint beside the copy-mode banner;
+    // what the row drops when it is short is the trim ladder's business.
+    let rendered = render_app_to_string(&app, 170, 30);
+    assert!(
+        rendered.contains("2 refs · ↵ open · Tab next"),
+        "the footer says what the line opens and which keys do it:\n{rendered}"
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    let panel = app
+        .ref_panel
+        .as_ref()
+        .expect("Enter opens the line's first reference");
+    assert_eq!(panel.id, "provenance://materials_search/0");
+    assert!(
+        panel.pinned,
+        "opened by a key, the panel stays until dismissed"
+    );
+    assert_eq!(
+        app.focus,
+        Focus::Chat,
+        "Enter on a line with references does not hand focus to the prompt"
+    );
+
+    app.handle_key(key(KeyCode::Tab));
+    let panel = app.ref_panel.as_ref().expect("Tab keeps a panel open");
+    assert_eq!(
+        panel.id, "tool://materials_search",
+        "Tab moves to the next reference on the line"
+    );
+    assert!(panel.pinned);
+    assert_eq!(
+        app.focus,
+        Focus::Chat,
+        "Tab between a line's references does not cycle focus"
+    );
+
+    app.handle_key(key(KeyCode::Char('m')));
+    let wire = app.marks.wire().to_string();
+    assert!(
+        wire.contains("tool://materials_search"),
+        "m marks the reference the panel shows, and the mark travels on the wire: {wire}"
+    );
+
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.ref_panel.is_none(), "Esc closes the panel first");
+    assert!(
+        app.selected_line.is_some(),
+        "and leaves the cursor where it was"
+    );
+    app.handle_key(key(KeyCode::Esc));
+    assert!(
+        app.selected_line.is_none(),
+        "a second Esc clears the cursor"
+    );
+
+    // Back onto the line, then ask about it.
+    app.handle_key(key(KeyCode::Char('j')));
+    app.handle_key(key(KeyCode::Char('j')));
+    let selected = app.selected_line.clone().expect("the cursor comes back");
+    assert_eq!(selected.text, drawn);
+    app.handle_key(key(KeyCode::Char('e')));
+    let asked = app.messages.last().expect("e sends a request").text.clone();
+    assert_eq!(
+        asked,
+        explain_request(selected.message, &drawn),
+        "e quotes the cursor line exactly as it was on screen"
+    );
+    assert!(
+        app.selected_line.is_none(),
+        "asking consumes the selection, as a click-then-e always did"
+    );
+}
+
+#[test]
+fn keyboard_cursor_reaches_every_reference_with_the_mouse_captured() {
+    keyboard_cursor_reaches_every_reference(false);
+}
+
+#[test]
+fn keyboard_cursor_reaches_every_reference_in_copy_mode() {
+    keyboard_cursor_reaches_every_reference(true);
+}
+
+/// The view follows the cursor, one row at a time.
+///
+/// Stepping onto a line below the viewport scrolls just far enough to show it;
+/// Ctrl-J / Ctrl-K keep the raw scroll for a reader who wants to move the view
+/// without choosing a line.
+#[test]
+fn the_line_cursor_pulls_the_view_along() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = app_with_welcome();
+    for i in 0..40 {
+        app.push_user(&format!("question {i}"));
+        app.apply_agent_msg(AgentMsg::TextDelta(format!("answer {i}\n")));
+        app.apply_agent_msg(AgentMsg::TextFlush);
+    }
+    app.auto_scroll = false;
+    app.anchor_user_turn.set(false);
+    app.scroll_offset = 0;
+    let _ = render_app_to_string(&app, 120, 30);
+    assert_eq!(app.view_scroll.get(), 0, "the view starts at the top");
+    let height = app.view_height.get();
+    assert!(height > 0 && height < 30, "the transcript has a viewport");
+
+    let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+    app.focus = Focus::Chat;
+    app.handle_key(key(KeyCode::Char('j')));
+    let first = app.selected_line.clone().expect("j places the cursor");
+    assert_eq!(
+        first.line, 0,
+        "with no cursor, j starts on the first visible line"
+    );
+    assert_eq!(
+        app.scroll_offset, 0,
+        "a cursor inside the view does not move it"
+    );
+
+    // Step past the bottom edge: each press keeps the cursor on screen.
+    for _ in 0..usize::from(height) + 5 {
+        app.handle_key(key(KeyCode::Char('j')));
+    }
+    let selected = app.selected_line.clone().expect("the cursor is still set");
+    let row = app.drawn_lines.borrow()[selected.line].row;
+    assert!(
+        app.scroll_offset > 0,
+        "the view scrolled to follow the cursor"
+    );
+    assert!(
+        app.scroll_offset <= row && row < app.scroll_offset + height,
+        "the cursor row {row} lies inside the view [{}, {})",
+        app.scroll_offset,
+        app.scroll_offset + height
+    );
+    let _ = render_app_to_string(&app, 120, 30);
+    assert_eq!(
+        app.view_scroll.get(),
+        app.scroll_offset,
+        "the renderer draws the view the cursor asked for"
+    );
+
+    // Raw scroll leaves the cursor alone and moves the view by one row.
+    let before = app.scroll_offset;
+    app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    assert_eq!(app.scroll_offset, before - 1, "Ctrl-K scrolls one row up");
+    assert_eq!(
+        app.selected_line.as_ref().map(|s| s.line),
+        Some(selected.line),
+        "Ctrl-K does not move the cursor"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+    assert_eq!(app.scroll_offset, before, "Ctrl-J scrolls one row down");
 }
