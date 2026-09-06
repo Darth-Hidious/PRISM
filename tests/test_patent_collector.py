@@ -683,7 +683,9 @@ class TestThePatentPathNamesNoOperator:
     ALLOWED_TABLES = {PUBLIC_TABLE}
 
     #: Public, keyless-or-operator-keyed endpoints. Nobody's private service.
-    ALLOWED_HOSTS = {"api.lens.org", "patents.google.com"}
+    #: www.lens.org is the vendor's own subscription page — where the human
+    #: is sent to buy access when the tool cannot — not an API endpoint.
+    ALLOWED_HOSTS = {"api.lens.org", "www.lens.org", "patents.google.com"}
 
     def _acquisition_sources(self):
         files = sorted((self.ROOT / "app" / "tools" / "data_collectors").glob("*.py"))

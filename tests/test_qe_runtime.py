@@ -54,7 +54,11 @@ def test_pw_resolution_order_env_then_config_then_home_then_path(tmp_path, monke
 
 def test_defaults_are_stated_and_overridable():
     s = runtime.settings(config={})
-    assert s["ecutwfc_ry"] == 60.0
+    # None is the honest default: the cutoff is derived per species from the
+    # pseudopotential set's own hints. 60 Ry is only a fallback, and one that
+    # cutoff_for labels "convergence unverified" — never a silent number.
+    assert s["ecutwfc_ry"] is None
+    assert runtime.FALLBACK_ECUTWFC_RY == 60.0
     assert s["ecutrho_ratio"] == 4.0
     assert s["kspacing_inv_angstrom"] == pytest.approx(0.15)
     assert s["smearing"] == "mv"
