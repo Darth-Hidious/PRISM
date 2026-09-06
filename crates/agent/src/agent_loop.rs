@@ -880,6 +880,73 @@ fn raw_for_card(content: &str, raw: &str) -> Option<String> {
 /// turn ends with whatever text it has written.
 const MAX_BUDGET_REFUSALS: usize = 2;
 
+/// How many consecutive near-identical calls to the same tool before the loop
+/// is broken. Measured 2026-09-06: a run called `write_skill` sixty-five times
+/// with names differing only by a counter and identical bodies, every call
+/// returning ok, and lost its whole ninety-minute budget. The existing guards
+/// only fire when calls FAIL or return nothing, so a degenerate but successful
+/// repetition ran unchecked.
+pub const REPETITION_LIMIT: usize = 6;
+
+/// Watches for the same tool being called over and over with arguments that
+/// differ only trivially. Arguments are compared with their digits stripped,
+/// so `placeholder-skill-1` and `placeholder-skill-2` count as the same call.
+///
+/// A run of calls that differ only by a number is therefore treated as stuck
+/// once it reaches [`REPETITION_LIMIT`]. That is deliberate: real work varies
+/// by more than a counter (a different alloy, a different file, a different
+/// query), and a short numeric sweep — three temperatures, say — is well
+/// under the limit.
+#[derive(Default)]
+pub struct RepetitionGuard {
+    last: Option<(String, String)>,
+    run: usize,
+}
+
+impl RepetitionGuard {
+    /// Record a call. Returns true when this call completes a run of
+    /// [`REPETITION_LIMIT`] near-identical calls and must be refused.
+    pub fn note(&mut self, tool: &str, args: &Value) -> bool {
+        let shape: String = serde_json::to_string(args)
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| !c.is_ascii_digit())
+            .collect();
+        let key = (tool.to_string(), shape);
+        match &self.last {
+            Some(prev) if *prev == key => self.run += 1,
+            _ => {
+                self.last = Some(key);
+                self.run = 1;
+            }
+        }
+        self.run >= REPETITION_LIMIT
+    }
+
+    /// A call that did real work resets the run.
+    pub fn reset(&mut self) {
+        self.last = None;
+        self.run = 0;
+    }
+}
+
+/// What the model is told when a repetition is broken: named, in the slot it
+/// is reading, with the way out.
+fn repetition_refusal(tool: &str, call_id: &str) -> ChatMessage {
+    ChatMessage {
+        role: "tool".to_string(),
+        content: Some(format!(
+            "refused: `{tool}` has been called {REPETITION_LIMIT} times in a row with the same \
+             arguments, so it is looping and no further identical call will run. Do something \
+             different: use a different tool, change the arguments materially, or write the \
+             answer with what you already have."
+        )),
+        tool_calls: None,
+        tool_call_id: Some(call_id.to_string()),
+        reasoning_content: None,
+    }
+}
+
 const BUDGET_CUTOFF_NOTE: &str = "[Time budget spent and the model kept asking for tools; the \
 turn ends with what is written above. What was not searched is the open list.]";
 
@@ -3788,6 +3855,8 @@ pub(crate) async fn run_turn_inner(
     let turn_started = Instant::now();
     let mut deadline_announced = false;
     let mut budget_refusals = 0usize;
+    // Breaks a run of near-identical calls that all succeed (see RepetitionGuard).
+    let mut repetition = RepetitionGuard::default();
     for iteration in 0..iteration_cap {
         // ── h0. The clock ──────────────────────────────────────
         // A research turn that keeps finding tools to call never reaches the
@@ -4675,6 +4744,41 @@ pub(crate) async fn run_turn_inner(
             }
             if tool_calls.is_empty() {
                 continue;
+            }
+        }
+
+        // ── 2h'. A tool looping on itself is stopped ──────────────
+        // Every call in the run below succeeded, so no failure guard fired;
+        // the run still did nothing but burn the budget.
+        {
+            let mut looping = Vec::new();
+            for (i, tool_call) in tool_calls.iter().enumerate() {
+                let args: Value =
+                    serde_json::from_str(&tool_call.function.arguments).unwrap_or(Value::Null);
+                if repetition.note(&tool_call.function.name, &args) {
+                    looping.push(i);
+                }
+            }
+            if !looping.is_empty() {
+                for i in &looping {
+                    let call = &tool_calls[*i];
+                    emit(AgentEvent::Activity {
+                        id: "tool.loop".to_string(),
+                        text: format!("{} is repeating — stopped", call.function.name),
+                        done: true,
+                    });
+                    history.push(repetition_refusal(&call.function.name, &call.id));
+                }
+                let kept: Vec<_> = tool_calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !looping.contains(i))
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                tool_calls = kept;
+                if tool_calls.is_empty() {
+                    continue;
+                }
             }
         }
 
@@ -6380,6 +6484,83 @@ mod tests {
 
     /// Three runs reached the deadline with their section drafted and lost it,
     /// because the deadline removed the file writer too. Saving survives.
+    /// 2026-09-06: a run called `write_skill` sixty-five times in a row —
+    /// names "placeholder-skill-1..65", bodies "# placeholder", EVERY call
+    /// returning ok — and burned its whole ninety-minute budget. The existing
+    /// guard only breaks a loop when calls FAIL, so a degenerate but
+    /// successful repetition ran until the clock stopped it.
+    #[test]
+    fn a_tool_repeated_with_near_identical_arguments_is_stopped() {
+        let mut d = RepetitionGuard::default();
+        // The real trace: same tool, name differing only by a counter.
+        let mut fired = None;
+        for i in 1..=REPETITION_LIMIT + 2 {
+            let args = serde_json::json!({"name": format!("placeholder-skill-{i}"), "code": "# placeholder"});
+            if d.note("write_skill", &args) && fired.is_none() {
+                fired = Some(i);
+            }
+        }
+        assert_eq!(
+            fired,
+            Some(REPETITION_LIMIT),
+            "the guard must fire on the {REPETITION_LIMIT}th near-identical call, not later"
+        );
+
+        // Real work is not a loop. These are the actual cells of the
+        // cluster-expansion run: they name a different alloy each time, so
+        // they differ by more than a counter.
+        let mut d = RepetitionGuard::default();
+        for alloy in [
+            "O2-TF-Fe0",
+            "H6",
+            "H4",
+            "H1",
+            "N1",
+            "N2",
+            "O1-Fe0",
+            "H3",
+            "O3-Fe0",
+            "H2",
+        ] {
+            let args = serde_json::json!({"code": format!("pick_fit3('{alloy}'); run_mc('{alloy}', 1273)")});
+            assert!(
+                !d.note("notebook_exec", &args),
+                "distinct cells are not a loop ({alloy})"
+            );
+        }
+        // A short run that differs only by a number is ordinary work, not a
+        // loop: three temperatures for one alloy must pass.
+        let mut d = RepetitionGuard::default();
+        for t in [773, 1000, 1273] {
+            let args = serde_json::json!({"code": format!("run_mc('H1', {t})")});
+            assert!(
+                !d.note("notebook_exec", &args),
+                "three temperatures are not a loop ({t})"
+            );
+        }
+        let mut d = RepetitionGuard::default();
+        for i in 0..20 {
+            let t = if i % 2 == 0 { "notebook_exec" } else { "file" };
+            assert!(
+                !d.note(t, &serde_json::json!({"x": "same"})),
+                "alternating tools are not a loop"
+            );
+        }
+
+        // A stopped loop is reported to the model in the slot it is reading.
+        let msg = repetition_refusal("write_skill", "call-9");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call-9"));
+        let text = msg.content.clone().unwrap_or_default();
+        assert!(
+            text.contains("write_skill") && text.to_lowercase().contains("same"),
+            "{text}"
+        );
+        assert!(
+            text.to_lowercase().contains("different"),
+            "say what to do instead: {text}"
+        );
+    }
+
     #[test]
     fn the_deadline_keeps_the_file_tools_and_refuses_the_rest() {
         assert!(survives_deadline("file"));
