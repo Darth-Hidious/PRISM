@@ -216,6 +216,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     // theme picker > which-key panel > modal.
     if app.approval_pending.is_some() {
         draw_approval_popup(f, app);
+    } else if app.confirm_new_session {
+        draw_confirm_new_session(f, app);
     } else if app.settings_hub.open {
         draw_settings_hub(f, app);
     } else if app.palette.open {
@@ -292,8 +294,17 @@ pub fn draw(f: &mut Frame, app: &App) {
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let model = clean_model_name(&app.model);
+    // The back affordance is clickable: record its cells so a click reaches
+    // the new-session wall (`pointer_pressed`). Width from the label so the
+    // region never drifts from what is drawn.
+    const BACK_LABEL: &str = " ‹ back ";
+    let back_w = unicode_width::UnicodeWidthStr::width(BACK_LABEL) as u16;
+    app.hit_map.borrow_mut().push(
+        Rect::new(area.x, area.y, back_w.min(area.width), 1),
+        crate::hit_map::HitTarget::NewSession,
+    );
     let mut spans = vec![
-        Span::styled(" ‹ back ", Style::default().fg(t.muted).bg(t.status_bg)),
+        Span::styled(BACK_LABEL, Style::default().fg(t.muted).bg(t.status_bg)),
         Span::styled(" ", Style::default().bg(t.status_bg)),
         Span::styled(
             clip(&app.session_title, 38),
@@ -5833,6 +5844,73 @@ fn draw_notebook_pane(f: &mut Frame, app: &App) {
 
 /// A licence or key wall, as a modal with its three actions. The agent
 /// cannot pass it; the human can, and this says how without a hunt.
+/// The new-session confirmation wall. Names the session it will close and
+/// exactly what is lost — transcript lines, marks, goal — and that the TUI
+/// cannot undo it, so the reader consents to a named consequence rather than a
+/// bare "New session?". `y` starts, `n`/Esc keep; the legend reads without
+/// colour (finding 7).
+fn draw_confirm_new_session(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let area = overlay_area(f, 60, 40);
+    f.render_widget(Clear, area);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.approval));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+    let goal = if app.goal.is_some() {
+        "goal set"
+    } else {
+        "no goal"
+    };
+    let clears = format!(
+        "{} transcript line(s) · {} mark(s) · {goal}",
+        app.messages.len(),
+        app.marks.len(),
+    );
+    let lines = vec![
+        Line::from(Span::styled(
+            "  START A NEW SESSION?  ",
+            Style::default()
+                .fg(t.overlay_bg)
+                .bg(t.approval)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("session  ", Style::default().fg(t.muted)),
+            Span::styled(
+                app.session_title.clone(),
+                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("clears   ", Style::default().fg(t.muted)),
+            Span::styled(clears, Style::default().fg(t.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("undo     ", Style::default().fg(t.muted)),
+            Span::styled(
+                "not from the TUI — resume via Ctrl-P → Sessions",
+                Style::default().fg(t.dim),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  [y] "),
+            Span::styled("start", Style::default().fg(t.ok)),
+            Span::raw("   [n/Esc] "),
+            Span::styled("keep", Style::default().fg(t.err)),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(t.overlay_bg))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
 fn draw_needs_human_modal(f: &mut Frame, app: &App) {
     let t = app.theme();
     let Some(blocker) = app.needs_human_modal.and_then(|i| app.blockers.get(i)) else {

@@ -892,6 +892,11 @@ pub struct App {
     /// The footer pill reads "stopping" while set.
     pub(crate) stop_requested: bool,
     pub approval_pending: Option<(String, String)>,
+    /// A new-session confirmation wall is up. Starting a fresh session clears
+    /// the transcript, marks and goal and the TUI cannot undo it, so it is
+    /// gated behind a question rather than a bare key (finding 7). Reached from
+    /// the header's " ‹ back ", the palette `session.new` row and `/clear`.
+    pub confirm_new_session: bool,
     /// Open tasks for a human — licences, accounts, subscriptions the agent
     /// hit and cannot obtain. One per source; the palette entry "Needs a
     /// human" lists them with their links.
@@ -1229,6 +1234,7 @@ impl App {
             queued_messages: Vec::new(),
             stop_requested: false,
             approval_pending: None,
+            confirm_new_session: false,
             blockers: Vec::new(),
             needs_human_modal: None,
             approval_reason: None,
@@ -1370,6 +1376,18 @@ impl App {
                 self.should_quit = true;
             } else {
                 self.handle_approval_key(key);
+            }
+            return;
+        }
+
+        // The new-session wall: starting a fresh session clears the transcript,
+        // marks and goal and the TUI cannot undo it, so it intercepts every key
+        // until answered. `y` starts, `n`/Esc keep; Ctrl-C still quits.
+        if self.confirm_new_session {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+            } else {
+                self.handle_confirm_new_session_key(key);
             }
             return;
         }
@@ -2203,6 +2221,11 @@ impl App {
             // A click inside the panel is a click on what the reader is
             // reading, not on the screen behind it.
             Some(crate::hit_map::HitTarget::RefPanelBody) => return,
+            // The header's " ‹ back " affordance: ask before wiping the session.
+            Some(crate::hit_map::HitTarget::NewSession) => {
+                self.open_new_session_confirm();
+                return;
+            }
             Some(crate::hit_map::HitTarget::WorkspaceRow { tab, index }) => {
                 self.workspace_tab = tab;
                 self.workspace_selected = index;
@@ -2222,6 +2245,7 @@ impl App {
     #[must_use]
     pub fn overlay_open(&self) -> bool {
         self.approval_pending.is_some()
+            || self.confirm_new_session
             || self.needs_human_modal.is_some()
             || self.palette.open
             || self.form.is_some()
@@ -2539,7 +2563,6 @@ impl App {
             KeyCode::Char('O') => self.open_link_picker(),
             KeyCode::Esc => self.selected_line = None,
             KeyCode::Char('?') => self.open_which_key(),
-            KeyCode::Backspace => self.new_session(),
             // Same rule as the home screen: an unbound printable character
             // means "I am writing", so focus the prompt and keep it rather
             // than dropping it on the floor. The vim-style bindings above
@@ -4548,8 +4571,45 @@ impl App {
 
     // ── Toasts ───────────────────────────────────────────────────────
 
+    /// Raise the new-session confirmation wall (finding 7).
+    ///
+    /// Starting a fresh session clears the transcript, marks and goal, and the
+    /// TUI cannot undo it — the backend session resumes via `/sessions`, but
+    /// the TUI-local marks and goal do not. So the three ways in (the header's
+    /// " ‹ back ", the palette `session.new` row, and `/clear`) ask first
+    /// rather than act; only `y` in the wall calls [`Self::new_session`]. A
+    /// turn in flight is refused here, matching `new_session`'s own guard.
+    pub fn open_new_session_confirm(&mut self) {
+        if self.turn_in_progress || self.is_waiting {
+            self.toast(
+                "wait for the current turn before starting a new session",
+                ToastKind::Info,
+            );
+            return;
+        }
+        self.confirm_new_session = true;
+    }
+
+    /// The new-session wall: `y` starts a fresh session (the only path that now
+    /// clears the transcript, marks and goal), `n` or Esc keep everything. No
+    /// other key answers — Enter is not a yes here, as it never is — so the
+    /// session cannot be destroyed by reflex.
+    fn handle_confirm_new_session_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.confirm_new_session = false;
+                self.new_session();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.confirm_new_session = false;
+            }
+            _ => {}
+        }
+    }
+
     /// Start a fresh backend session, then clear session-scoped local state.
-    /// (PRISM has no Home route yet, so "back" maps to this.)
+    /// Reached only through the confirmation wall ([`Self::open_new_session_confirm`])
+    /// once the reader has answered `y`.
     pub fn new_session(&mut self) {
         if self.turn_in_progress || self.is_waiting {
             self.toast(
@@ -6070,7 +6130,7 @@ impl App {
                     .position(|(name, _)| *name == "Semantic Scholar")
                     .unwrap_or(0);
             }
-            "session.new" => self.new_session(),
+            "session.new" => self.open_new_session_confirm(),
             "links.open" => self.open_link_picker(),
             "cost.show" => self.modal = Some(Modal::Cost),
             "model.show" => self.open_model_picker(),
@@ -6310,6 +6370,13 @@ impl App {
             }
             "/copy" => {
                 self.toggle_copy_mode();
+                return;
+            }
+            // `/clear` starts a new session, which wipes the transcript, marks
+            // and goal — so it asks first, the same wall the header's " ‹ back "
+            // and the palette raise, rather than clearing on the keystroke.
+            "/clear" => {
+                self.open_new_session_confirm();
                 return;
             }
             _ => {}
@@ -10296,6 +10363,89 @@ mod tests {
         app.new_session();
         assert!(app.marks.is_empty(), "marks must not outlive their session");
         assert!(app.goal.is_none(), "the existing contract, unchanged");
+    }
+
+    /// Finding 7 / change 5. One unmodified key must not wipe the session.
+    /// Backspace does nothing; a new session goes through a confirmation that
+    /// names what it clears, and only `y` there sends `/clear`. The wall is
+    /// reachable without a pointer (the palette `session.new` row).
+    #[test]
+    fn a_new_session_asks_before_it_destroys_the_old_one() {
+        let mut app = fresh();
+        app.focus = Focus::Chat;
+        app.push_user("keep me");
+        app.marks.toggle(crate::marks::Mark {
+            id: "cache://aaa/structure.cif".to_string(),
+            kind: crate::refs::RefKind::Structure,
+            label: "TiAl".to_string(),
+        });
+        app.goal = Some("find a seal".to_string());
+        let msgs = app.messages.len();
+
+        // Backspace no longer starts a new session, nor even opens the wall.
+        app.handle_key(key(KeyCode::Backspace));
+        assert!(!app.confirm_new_session, "Backspace must not open the wall");
+        assert_eq!(
+            app.messages.len(),
+            msgs,
+            "Backspace must not clear the transcript"
+        );
+        assert_eq!(app.marks.len(), 1, "Backspace must not clear marks");
+        assert_eq!(
+            app.goal.as_deref(),
+            Some("find a seal"),
+            "Backspace must not clear the goal"
+        );
+
+        // The palette row opens the confirmation instead — keyboard-reachable,
+        // and opening it changes nothing.
+        app.dispatch_command("session.new");
+        assert!(
+            app.confirm_new_session,
+            "session.new must open the confirmation"
+        );
+        assert_eq!(app.messages.len(), msgs);
+        assert_eq!(app.marks.len(), 1);
+        assert_eq!(app.goal.as_deref(), Some("find a seal"));
+
+        // Esc keeps everything.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.confirm_new_session, "Esc closes the confirmation");
+        assert_eq!(app.messages.len(), msgs, "Esc keeps the transcript");
+        assert_eq!(app.marks.len(), 1, "Esc keeps the marks");
+        assert_eq!(
+            app.goal.as_deref(),
+            Some("find a seal"),
+            "Esc keeps the goal"
+        );
+
+        // Reopen and confirm with `y`: exactly one `/clear` goes out and the
+        // session is reset.
+        let commands_before = app
+            .backend
+            .fake_requests()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "input.command")
+            .count();
+        app.dispatch_command("session.new");
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(!app.confirm_new_session, "y closes the confirmation");
+        let commands_after = app
+            .backend
+            .fake_requests()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "input.command")
+            .count();
+        assert_eq!(
+            commands_after - commands_before,
+            1,
+            "y sends /clear exactly once"
+        );
+        assert_eq!(app.session_title, "New session", "y starts a fresh session");
+        assert!(app.marks.is_empty(), "y clears the marks");
+        assert!(app.goal.is_none(), "y clears the goal");
     }
 
     /// A label is data, and it reaches the model's context and the terminal.

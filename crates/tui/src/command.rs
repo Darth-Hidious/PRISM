@@ -536,9 +536,9 @@ pub static CATALOG: &[Command] = &[
     Command {
         id: "session.new",
         title: "New session",
-        description: "Back — clear and start fresh",
+        description: "Clear and start fresh (asks first)",
         category: "Session",
-        keybind: "Backspace",
+        keybind: "palette",
         suggested: true,
     },
     Command {
@@ -1071,7 +1071,7 @@ pub fn effect(id: &str) -> String {
         "workflow.list" => "runs /workflow list",
         "skills.list" => "runs /skills list",
         "use.show" => "runs /use show",
-        "session.new" => "starts a session",
+        "session.new" => "asks, then starts fresh",
         "chat.clear" => "clears the transcript",
         "app.exit" => "quits",
         "thinking.toggle" | "metrics.toggle" | "cost.toggle" | "copy.toggle" => "toggles",

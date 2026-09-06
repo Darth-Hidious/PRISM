@@ -52,6 +52,10 @@ pub enum HitTarget {
     /// Holds only the reference, never the payload: what it points at is
     /// fetched when the pointer arrives, not when the text was written.
     Reference { id: String },
+    /// The header's " ‹ back " affordance — clicking it asks to start a new
+    /// session. It was drawn but pointed at nothing, so "back" was keyboard-
+    /// and Backspace-only; now the drawn control does what it looks like.
+    NewSession,
 }
 
 /// Regions of the last drawn frame, newest last.

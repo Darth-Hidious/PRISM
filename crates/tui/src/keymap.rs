@@ -202,6 +202,19 @@ pub static KEYMAP: &[KeyBinding] = &[
         description: "Scroll the arguments block",
         category: "Approvals",
     },
+    // ── Session ─────────────────────────────────────────────────────
+    // A new session clears the transcript, marks and goal and cannot be undone
+    // from the TUI, so it always asks first — no bare key destroys it.
+    KeyBinding {
+        keys: "‹ back / Ctrl-P → New session / /clear",
+        description: "Start a fresh session — asks before it clears transcript, marks and goal",
+        category: "Session",
+    },
+    KeyBinding {
+        keys: "y",
+        description: "Confirm the new session (n / Esc keep the current one)",
+        category: "Session",
+    },
     // ── Input editing ───────────────────────────────────────────────
     KeyBinding {
         keys: "Enter",
