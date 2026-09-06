@@ -8,6 +8,8 @@ DuckDuckGo: free search fallback via duckduckgo-search library
 """
 import logging
 import os
+import shutil
+import subprocess
 
 from app.tools.base import Tool, ToolRegistry
 
@@ -107,6 +109,82 @@ def _window(text: str, offset: int, max_chars: int) -> dict:
         "truncated": truncated,
         "next_offset": end if truncated else None,
     }
+
+
+# ── Obscura headless-browser escalation ─────────────────────────────────────
+#
+# A plain HTTP fetch returns the HTML the server sent, not the DOM a browser
+# would build after running the page's JavaScript. Single-page apps and many
+# publisher pages arrive as an almost-empty shell. Owner decision 2026-09-06:
+# escalate such a page to Obscura (a headless browser, github h4ckf0r0day/
+# obscura) automatically — no separate tool call — say in the result that
+# Obscura rendered it, and let the model force it with render='obscura'.
+#
+# PRISM does not invent Obscura's CLI: the render command is
+# `PRISM_OBSCURA_CMD` (a shell command with a `{url}` placeholder). If that is
+# unset but an `obscura` or `agent-browser` binary is on PATH, PRISM runs
+# `<bin> {url}` and reports the exact command it ran, so a wrong guess is
+# visible in provenance rather than silent.
+
+_UNDER_RENDER_MARKERS = (
+    'id="__next"', "id='__next'", 'id="root"', "id='root'",
+    "window.__nuxt__", "window.__initial_state__", 'ng-app', 'data-reactroot',
+    "enable javascript", "please enable js", "requires javascript",
+)
+
+
+def _looks_under_rendered(html: str, text: str) -> bool:
+    """Whether a fetched page is a JavaScript shell the DOM has not been built
+    from yet: little visible text under a much larger HTML body, or a known
+    single-page-app / "enable JavaScript" marker."""
+    html = html or ""
+    text = text or ""
+    low = html.lower()
+    if any(m in low for m in _UNDER_RENDER_MARKERS) and len(text.strip()) < 600:
+        return True
+    # A large HTML body that renders to almost nothing is a shell.
+    return len(html) > 1500 and len(text.strip()) < 200
+
+
+def _obscura_command(url: str) -> list[str] | None:
+    """The command that renders `url` with Obscura, or None when Obscura is not
+    configured. Never guesses flags for an unknown binary — an explicit
+    `PRISM_OBSCURA_CMD` wins; a discovered binary is run with the bare URL."""
+    tmpl = os.environ.get("PRISM_OBSCURA_CMD")
+    if tmpl:
+        import shlex
+        return [tok.replace("{url}", url) for tok in shlex.split(tmpl)] or None
+    for name in ("obscura", "agent-browser"):
+        found = shutil.which(name)
+        if found:
+            return [found, url]
+    return None
+
+
+def _render_with_obscura(url: str, timeout: int = 45) -> tuple[str, list[str]]:
+    """Run Obscura on `url` and return (rendered_html_or_text, command). Raises
+    with the reason when it is not configured or the render fails."""
+    cmd = _obscura_command(url)
+    if not cmd:
+        raise RuntimeError("not configured")
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"exited {proc.returncode}: {proc.stderr.strip()[:200] or 'no stderr'}")
+    if not proc.stdout.strip():
+        raise RuntimeError("rendered nothing")
+    return proc.stdout, cmd
+
+
+_OBSCURA_HOW = (
+    "install Obscura (github.com/h4ckf0r0day/obscura, docs.obscura.sh) and set "
+    "PRISM_OBSCURA_CMD to the render command with a {url} placeholder, e.g. "
+    "PRISM_OBSCURA_CMD='obscura render {url}', or put an `obscura`/`agent-browser` "
+    "binary on PATH. Then this page will render as a real browser sees it."
+)
+
+
+def _obscura_unavailable(reason: str) -> dict:
+    return {"available": False, "reason": reason, "how": _OBSCURA_HOW}
 
 
 def _web_read(**kwargs) -> dict:
@@ -227,10 +305,41 @@ def _web_read(**kwargs) -> dict:
 
         title, text = _html_to_text(r.text)
 
+        render = (kwargs.get("render") or "auto").lower()
+        want_obscura = render == "obscura" or (
+            render == "auto" and _looks_under_rendered(r.text, text)
+        )
+        if render != "plain" and want_obscura:
+            try:
+                rendered, cmd = _render_with_obscura(url)
+                r_title, r_text = _html_to_text(rendered) if "<" in rendered[:200] else (title, rendered)
+                return {
+                    "url": url,
+                    "title": r_title or title,
+                    "source": "obscura",
+                    "rendered_with": "obscura",
+                    "escalated": render == "auto",
+                    "obscura": {"available": True, "command": cmd},
+                    **_window(r_text, offset, max_chars),
+                }
+            except Exception as e:  # keep the plain page; say Obscura was wanted
+                obscura = _obscura_unavailable(str(e))
+                if render == "obscura":
+                    obscura["note"] = "render='obscura' was requested; the plain fetch is returned instead"
+                return {
+                    "url": url,
+                    "title": title,
+                    "source": "basic_fetch",
+                    "rendered_with": "plain",
+                    "obscura": obscura,
+                    **_window(text, offset, max_chars),
+                }
+
         return {
             "url": url,
             "title": title,
             "source": "basic_fetch",
+            "rendered_with": "plain",
             **_window(text, offset, max_chars),
         }
     except Exception as e:
@@ -471,8 +580,17 @@ def _web(**kwargs) -> dict:
 _WEB_DESCRIPTION = (
     "Open-web access. ONE tool, two actions:\n"
     "  • action='read' — fetch a single URL and return clean text content. "
-    "Handles JavaScript-heavy sites, strips HTML, returns markdown. Requires "
-    "`url`. Use to read papers, docs, Wikipedia articles, blog posts.\n"
+    "Strips HTML, returns readable text. Requires `url`. Use to read papers, "
+    "docs, Wikipedia articles, blog posts.\n"
+    "    JavaScript-heavy pages: a plain fetch returns the server's HTML, not "
+    "the DOM a browser builds after running the page's scripts. When a page "
+    "arrives as an unrendered shell, action='read' escalates automatically to "
+    "the Obscura headless browser and the result says so (source='obscura', "
+    "escalated=true, and the command in `obscura`). You do not call Obscura "
+    "separately. Force it with render='obscura' (e.g. a page you know is a "
+    "single-page app), or skip it with render='plain'. If Obscura is not "
+    "installed, the result keeps the plain text and its `obscura` block says "
+    "how to enable it.\n"
     "  • action='search' — query the open web; returns titles, URLs, snippets. "
     "Requires `query`. Optional `limit` (default 5). Searches via Firecrawl "
     "(if configured) or DuckDuckGo.\n"
@@ -514,6 +632,17 @@ def create_web_tools(registry: ToolRegistry) -> None:
                     "type": "integer",
                     "description": "Max results for action='search' (default 5).",
                     "default": 5,
+                },
+                "render": {
+                    "type": "string",
+                    "enum": ["auto", "obscura", "plain"],
+                    "description": (
+                        "action='read' only. 'auto' (default): escalate to the "
+                        "Obscura headless browser when the page looks like an "
+                        "unrendered JavaScript shell. 'obscura': always render "
+                        "with Obscura. 'plain': never — return the raw fetch. "
+                        "The result names which was used."
+                    ),
                 },
                 "offset": {
                     "type": "integer",
