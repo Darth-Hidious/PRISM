@@ -9350,7 +9350,7 @@ async fn run_server_core(
         subagent_lanes,
         command_tool_runtime,
         tools,
-        config,
+        mut config,
         hooks,
         permissions,
     } = build_agent_seed(&tool_server_config, &llm_config).await?;
@@ -9556,6 +9556,16 @@ async fn run_server_core(
                 if let Some(auto) = params.get("auto_approve").and_then(|v| v.as_bool()) {
                     auto_approve_flag.store(auto, std::sync::atomic::Ordering::Relaxed);
                 }
+                // One truth for every reader. The status snapshots, the slash
+                // commands and the turn all read `config`, so the effective
+                // value — the request flag OR the env var — lives there too.
+                // Audit 2026-09-07: the snapshots reported the seed's default
+                // (`false`) while the gate bypassed every approval.
+                let mut effective = config.as_ref().clone();
+                effective.auto_approve = crate::agent_loop::auto_approve_enabled(
+                    auto_approve_flag.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                config = Arc::new(effective);
 
                 let mut welcome = serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
