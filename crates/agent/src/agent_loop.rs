@@ -4956,6 +4956,36 @@ pub(crate) async fn run_turn_inner(
             }
 
             // ── h3. Check permissions ─────────────────────────────
+            // ── h1b. Switched off in config ───────────────────────
+            // `[tools.<name>] enabled = false` removed the schema from the
+            // catalog; a call by name (a stale plan, a guess) is refused the
+            // same way, before anyone is asked to approve it.
+            if crate::tool_catalog::is_disabled(tool_name) {
+                let error_msg = format!(
+                    "Tool '{tool_name}' is switched off in this PRISM's config \
+                     ([tools.{tool_name}] enabled = false) and does not run."
+                );
+                emit(AgentEvent::ToolCallResult {
+                    raw_result: None,
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    content: error_msg.clone(),
+                    tool_args: args.clone(),
+                    summary: Some(format!("{tool_name}: switched off in config")),
+                    preview: preview.clone(),
+                    elapsed_ms: 0,
+                    is_error: true,
+                });
+                history.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(error_msg),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id.clone()),
+                    reasoning_content: None,
+                });
+                continue;
+            }
+
             let permission_decision = if let Some(overrides) = live_permission_overrides.as_ref() {
                 // Session-level allow/block edits can arrive while the turn is
                 // still running, so each tool checks the latest shared view.

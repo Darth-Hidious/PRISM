@@ -1,5 +1,6 @@
 use prism_ingest::llm::{FunctionDef, ToolDefinition};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::permissions::{PermissionMode, get_tool_permission};
@@ -191,6 +192,18 @@ static BASE: std::sync::OnceLock<ToolCatalog> = std::sync::OnceLock::new();
 /// Base + whichever MCP tools are currently connected. Replaced by
 /// [`rebuild_live`]; read by each turn as it starts.
 static LIVE: std::sync::RwLock<Option<Arc<ToolCatalog>>> = std::sync::RwLock::new(None);
+/// Names switched off in `[tools]`; applied on every rebuild, so a reload
+/// cannot bring one back.
+static DISABLED: std::sync::RwLock<BTreeSet<String>> = std::sync::RwLock::new(BTreeSet::new());
+
+/// Whether `[tools.<name>] enabled = false` switched this tool off.
+#[must_use]
+pub fn is_disabled(tool_name: &str) -> bool {
+    DISABLED
+        .read()
+        .expect("disabled set poisoned")
+        .contains(tool_name)
+}
 
 /// Publish the startup catalog and fold in the MCP tools connected so far.
 ///
@@ -200,7 +213,9 @@ static LIVE: std::sync::RwLock<Option<Arc<ToolCatalog>>> = std::sync::RwLock::ne
 pub fn install_live(
     base: ToolCatalog,
     mcp_tools: Vec<LoadedTool>,
+    disabled: BTreeSet<String>,
 ) -> (Arc<ToolCatalog>, Vec<String>) {
+    *DISABLED.write().expect("disabled set poisoned") = disabled;
     let _ = BASE.set(base);
     let rejected = rebuild_live(mcp_tools)
         .expect("the base was just installed, so a rebuild cannot be a no-op");
@@ -225,6 +240,7 @@ pub fn rebuild_live(mcp_tools: Vec<LoadedTool>) -> Option<Vec<String>> {
     let base = BASE.get()?;
     let mut catalog = base.clone();
     let rejected = catalog.extend_untrusted(mcp_tools);
+    catalog.retain_enabled(&DISABLED.read().expect("disabled set poisoned"));
     *LIVE.write().expect("live catalog poisoned") = Some(Arc::new(catalog));
     Some(rejected)
 }
@@ -445,6 +461,15 @@ impl ToolCatalog {
             .collect();
         scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         scored.into_iter().take(limit).map(|(_, t)| t).collect()
+    }
+
+    /// Drop every tool named in `disabled` (`[tools.<name>] enabled = false`).
+    pub fn retain_enabled(&mut self, disabled: &BTreeSet<String>) {
+        if disabled.is_empty() {
+            return;
+        }
+        self.tools.retain(|tool| !disabled.contains(&tool.name));
+        self.definitions = self.tools.iter().map(LoadedTool::to_definition).collect();
     }
 
     pub fn extend(&mut self, extra_tools: Vec<LoadedTool>) {
@@ -1164,10 +1189,60 @@ mod live_catalog_tests {
     /// clearing the catalog while another asserted on it — which is a real
     /// property of the design (a single live catalog per process), not
     /// something to paper over with retries.
+    /// The live catalog is process-global; these tests take turns.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Owner 2026-09-06: "I can remove them." A name switched off in
+    /// `[tools]` is absent from the live catalog — after a reload too — and
+    /// answers `is_disabled`, which the loop refuses on.
+    #[test]
+    fn a_tool_switched_off_in_config_is_gone_from_the_live_catalog() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let base = ToolCatalog::from_tool_server_json(&json!({"tools": []}));
+        let off: BTreeSet<String> = ["mcp__weather__forecast".to_string()].into();
+        let (installed, rejected) = install_live(
+            base,
+            vec![
+                mcp_tool("mcp__weather__forecast"),
+                mcp_tool("mcp__tickets__search"),
+            ],
+            off,
+        );
+        assert!(rejected.is_empty(), "{rejected:?}");
+        let names = installed.tool_names();
+        assert!(
+            !names.contains(&"mcp__weather__forecast".to_string()),
+            "switched off, so not offered: {names:?}"
+        );
+        assert!(names.contains(&"mcp__tickets__search".to_string()));
+        assert!(is_disabled("mcp__weather__forecast"));
+        assert!(!is_disabled("mcp__tickets__search"));
+
+        rebuild_live(vec![mcp_tool("mcp__weather__forecast")]).expect("a base is installed");
+        assert!(
+            !live()
+                .expect("published")
+                .tool_names()
+                .contains(&"mcp__weather__forecast".to_string()),
+            "a reload cannot bring a switched-off tool back"
+        );
+        // Leave the process as the other test expects it.
+        install_live(
+            ToolCatalog::from_tool_server_json(&json!({"tools": []})),
+            Vec::new(),
+            BTreeSet::new(),
+        );
+    }
+
     #[test]
     fn reloading_adds_removes_and_still_refuses_collisions() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let base = ToolCatalog::from_tool_server_json(&json!({"tools": []}));
-        let (installed, rejected) = install_live(base, vec![mcp_tool("mcp__weather__forecast")]);
+        let (installed, rejected) = install_live(
+            base,
+            vec![mcp_tool("mcp__weather__forecast")],
+            BTreeSet::new(),
+        );
         assert!(
             rejected.is_empty(),
             "a free name is not refused: {rejected:?}"

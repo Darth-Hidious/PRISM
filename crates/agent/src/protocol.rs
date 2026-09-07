@@ -9227,7 +9227,14 @@ pub async fn build_agent_seed(
     // later `mcp::reload_global()` can rebuild from it. Rebuilding beats
     // extending in place: a server DELETED from the config then actually
     // disappears, instead of lingering because nothing removed it.
-    let (tools, rejected) = crate::tool_catalog::install_live(tool_catalog, mcp_tools);
+    // `[tools.<name>] enabled = false`, from the global or project config:
+    // the schema leaves the catalog here and the loop refuses the name.
+    let disabled = prism_core::config::NodeConfig::load(Some(&tool_server_config.project_root))
+        .disabled_tools();
+    if !disabled.is_empty() {
+        tracing::info!(tools = ?disabled, "tools switched off in [tools] config");
+    }
+    let (tools, rejected) = crate::tool_catalog::install_live(tool_catalog, mcp_tools, disabled);
     for name in rejected {
         tracing::warn!(
             tool = %name,

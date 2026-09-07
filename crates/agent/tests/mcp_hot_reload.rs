@@ -67,6 +67,7 @@ async fn a_server_added_to_the_config_becomes_callable_without_a_restart() {
     install_live(
         ToolCatalog::from_tool_server_json(&json!({ "tools": [] })),
         Vec::new(),
+        std::collections::BTreeSet::new(),
     );
     assert!(
         mcp_tool_names().is_empty(),

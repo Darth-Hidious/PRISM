@@ -6,6 +6,7 @@
 //! 3. `.prism/prism.toml` (project)
 //! 4. CLI flags / environment variables
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -35,6 +36,19 @@ pub struct NodeConfig {
     pub searcher: ModelServiceSection,
     #[serde(default)]
     pub calphad: CalphadSection,
+    /// Per-tool switches: `[tools.<name>] enabled = false` removes the tool
+    /// from every catalog and refuses it by name. The first removable thing
+    /// the owner asked for: "all tools should be in the plugin format, I can
+    /// remove them".
+    #[serde(default)]
+    pub tools: BTreeMap<String, ToolSection>,
+}
+
+/// One `[tools.<name>]` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSection {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -633,6 +647,15 @@ impl NodeConfig {
     /// `[ontology]` and `[platform]` from the global file. Merging
     /// at the TOML table's top level gives exactly what the search order
     /// promised — a key a file states wins; a key it omits is inherited.
+    /// Tool names switched off in `[tools]`, for the catalog and the loop.
+    pub fn disabled_tools(&self) -> BTreeSet<String> {
+        self.tools
+            .iter()
+            .filter(|(_, tool)| !tool.enabled)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     pub fn load_from_paths(global: Option<&Path>, project: Option<&Path>) -> (Self, Vec<String>) {
         let mut table = toml::Table::new();
         let mut diagnostics = Vec::new();
@@ -702,6 +725,27 @@ impl NodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Owner 2026-09-06: "all tools should be in the plugin format, I can
+    /// remove them." The first removable thing: a `[tools.<name>]` table with
+    /// `enabled = false`, in the global or the project config.
+    #[test]
+    fn a_tool_can_be_switched_off_in_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prism.toml");
+        std::fs::write(
+            &path,
+            "[tools.web_browse]\nenabled = false\n\n[tools.papers]\nenabled = true\n",
+        )
+        .unwrap();
+        let (config, diagnostics) = NodeConfig::load_from_paths(None, Some(&path));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            config.disabled_tools().into_iter().collect::<Vec<_>>(),
+            vec!["web_browse".to_string()]
+        );
+        assert!(NodeConfig::default().disabled_tools().is_empty());
+    }
 
     /// `[auth]` shipped as a section with `require_platform_auth = true` by
     /// default, in the sample config, and no code ever read it — a security

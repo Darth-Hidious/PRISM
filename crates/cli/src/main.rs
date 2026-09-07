@@ -3198,6 +3198,9 @@ async fn main() -> Result<()> {
             let resp = handle.list_tools().await?;
             let mut tools = prism_agent::tool_catalog::ToolCatalog::from_tool_server_json(&resp);
             tools.extend(prism_agent::command_tools::command_tools());
+            let disabled =
+                prism_core::config::NodeConfig::load(Some(&project_root)).disabled_tools();
+            tools.retain_enabled(&disabled);
 
             let mut rows = tools
                 .iter()
@@ -3224,6 +3227,13 @@ async fn main() -> Result<()> {
                 );
             }
             println!("\n{} tools available", rows.len());
+            if !disabled.is_empty() {
+                println!(
+                    "{} switched off in [tools] config: {}",
+                    disabled.len(),
+                    disabled.iter().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
             handle.shutdown().await?;
         }
         Commands::McpServerNative => {
