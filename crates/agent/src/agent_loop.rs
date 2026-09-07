@@ -1034,17 +1034,31 @@ fn now_epoch_ms() -> u64 {
 /// The instruction the model receives once the deadline has passed: answer
 /// now from what was found, say what was not searched, no more tool calls.
 fn synthesis_now_message(minutes_used: u64) -> ChatMessage {
+    harness_note(format!(
+        "TIME BUDGET REACHED after {minutes_used} min. Synthesise the answer NOW from what \
+         has been found: state the findings with their citations (DOI, database id, \
+         source), then list what was not searched or is still unanswered as open items. \
+         No more search or compute calls this turn — only the file tools (`file`, \
+         `apply_patch`) are still offered, so write the section into the document NOW. \
+         An honest partial answer saved to the file beats a finished one that was never \
+         written."
+    ))
+}
+
+/// A note from the harness to the model, mid-conversation.
+///
+/// NOT a system message. `iteration_messages` puts the one leading system
+/// message first and history after it, so a system role pushed here lands in
+/// the MIDDLE of the array — which providers reject outright: GLM answers
+/// `1214 messages 参数非法` and mlx-lm `System message must be at the
+/// beginning`. Audit 2026-09-07 found five such pushes on the live paths.
+/// `user` is the role every provider accepts at any position; every note
+/// opens with its own recognisable line (the strips that remove notes again
+/// match on that content), so none reads as something the human said.
+fn harness_note(text: String) -> ChatMessage {
     ChatMessage {
-        role: "system".to_string(),
-        content: Some(format!(
-            "TIME BUDGET REACHED after {minutes_used} min. Synthesise the answer NOW from what \
-             has been found: state the findings with their citations (DOI, database id, \
-             source), then list what was not searched or is still unanswered as open items. \
-             No more search or compute calls this turn — only the file tools (`file`, \
-             `apply_patch`) are still offered, so write the section into the document NOW. \
-             An honest partial answer saved to the file beats a finished one that was never \
-             written."
-        )),
+        role: "user".to_string(),
+        content: Some(text),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
@@ -2698,13 +2712,9 @@ pub(crate) fn compact_history(history: &mut Vec<ChatMessage>, summary: &str, kee
     // `user` is the role every provider accepts at any position. The marker
     // keeps it unmistakably harness-generated rather than something the human
     // said.
-    history.push(ChatMessage {
-        role: "user".to_string(),
-        content: Some(format!("[Conversation context compacted]\n{summary}")),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    });
+    history.push(harness_note(format!(
+        "[Conversation context compacted]\n{summary}"
+    )));
     history.extend(recent);
 }
 
@@ -3752,13 +3762,7 @@ pub(crate) async fn run_turn_inner(
             // the capability that serves it (and, for an intent PRISM cannot
             // serve, the plain statement that it cannot) so the turn is routed
             // rather than guessed.
-            history.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(hint),
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            });
+            history.push(harness_note(hint));
         }
         crate::reprompt::Preflight::Ask { question, key } => {
             // ONE consolidated question, and the turn ends. No agent loop runs,
@@ -4492,15 +4496,9 @@ pub(crate) async fn run_turn_inner(
                             "\n\n[unverified claim \"{claim}…\" — no matching tool ran this turn; re-checking]\n\n"
                         ),
                     });
-                    history.push(ChatMessage {
-                        role: "system".to_string(),
-                        content: Some(
-                            crate::execution_contract::UNSUPPORTED_CLAIM_REMINDER.to_string(),
-                        ),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                    });
+                    history.push(harness_note(
+                        crate::execution_contract::UNSUPPORTED_CLAIM_REMINDER.to_string(),
+                    ));
                     continue;
                 }
 
@@ -4654,20 +4652,14 @@ pub(crate) async fn run_turn_inner(
                             ),
                             None => demand.to_string(),
                         };
-                        history.push(ChatMessage {
-                            role: "system".to_string(),
-                            content: Some(format!(
-                                "{demand}\n\n\
-                                 When the work is genuinely complete — not merely reported on — \
-                                 end your message with `{RESEARCH_COMPLETE_MARKER}`. If you are \
-                                 blocked and no tool can move you forward, say what blocks you \
-                                 and end with `{RESEARCH_COMPLETE_MARKER}` as well; continuing \
-                                 to restate a blocker is not progress."
-                            )),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: None,
-                        });
+                        history.push(harness_note(format!(
+                            "{demand}\n\n\
+                             When the work is genuinely complete — not merely reported on — \
+                             end your message with `{RESEARCH_COMPLETE_MARKER}`. If you are \
+                             blocked and no tool can move you forward, say what blocks you \
+                             and end with `{RESEARCH_COMPLETE_MARKER}` as well; continuing \
+                             to restate a blocker is not progress."
+                        )));
                         continue;
                     }
                 }
@@ -4713,13 +4705,7 @@ pub(crate) async fn run_turn_inner(
                         emit(AgentEvent::TextDelta {
                             text: format!("\n\n[retrieved for \"{gap}\": {names}]\n\n"),
                         });
-                        history.push(ChatMessage {
-                            role: "system".to_string(),
-                            content: Some(format!("{CAPABILITY_GAP_NOTE}{names}")),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: None,
-                        });
+                        history.push(harness_note(format!("{CAPABILITY_GAP_NOTE}{names}")));
                         continue;
                     }
                 }
@@ -6553,7 +6539,10 @@ mod tests {
         assert!(deadline_reached(Some(2_000), 2_000));
         assert!(deadline_reached(Some(2_000), 5_000));
         let msg = synthesis_now_message(17);
-        assert_eq!(msg.role, "system");
+        assert_eq!(
+            msg.role, "user",
+            "a mid-array system message is rejected by GLM and mlx-lm; harness notes travel as user messages"
+        );
         let text = msg.content.clone().unwrap_or_default();
         assert!(text.contains("17 min"), "{text}");
         assert!(text.to_lowercase().contains("synthesise"), "{text}");

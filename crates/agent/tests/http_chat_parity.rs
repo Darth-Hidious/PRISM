@@ -155,8 +155,10 @@ fn sse_tool_call_with_args(tool: &str, arguments: &str) -> String {
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
 }
 
-/// Every system message the stub LLM was actually sent, in arrival order.
-type SystemMessageLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+/// The system messages the stub LLM was actually sent: one inner list per
+/// request, in arrival order — so a test can see both WHAT was sent and
+/// HOW MANY system messages one request carried.
+type SystemMessageLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
 
 /// Serve `/v1/chat/completions` on an ephemeral port; returns the base_url
 /// (`http://127.0.0.1:<port>/v1`) for `LlmConfig`.
@@ -179,13 +181,15 @@ async fn start_stub_llm_recording(mode: StubMode) -> (String, SystemMessageLog) 
             async move {
                 if let Some(msgs) = body["messages"].as_array() {
                     let mut log = sink.lock().expect("system log");
+                    let mut this_request = Vec::new();
                     for m in msgs {
                         if m["role"] == "system"
                             && let Some(c) = m["content"].as_str()
                         {
-                            log.push(c.to_string());
+                            this_request.push(c.to_string());
                         }
                     }
+                    log.push(this_request);
                 }
                 let last_is_tool = body["messages"]
                     .as_array()
@@ -867,11 +871,22 @@ async fn unsupported_execution_claim_cannot_finalize_a_turn() {
     // model was actually sent, not merely in a constant or a re-derived string.
     let systems = system_messages.lock().expect("system log");
     assert!(
-        systems.iter().any(|s| {
+        systems.iter().flatten().any(|s| {
             s.contains("execution agent, not an advice-only assistant")
                 && s.contains("unless a tool result for it exists in THIS run")
         }),
         "the Execution Contract must be in a system message the model received"
+    );
+
+    // Audit 2026-09-07: the retraction reminder was pushed into history as a
+    // `system` message, so the retry carried TWO system messages — the exact
+    // shape GLM (`1214 messages 参数非法`) and mlx-lm (`System message must be
+    // at the beginning`) reject. One leading system message per request; a
+    // harness note travels as a marked `user` message, as compaction's does.
+    let counts: Vec<usize> = systems.iter().map(Vec::len).collect();
+    assert!(
+        counts.iter().all(|&n| n == 1),
+        "every request carries exactly one system message; got {counts:?}"
     );
 }
 
