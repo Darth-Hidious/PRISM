@@ -6430,7 +6430,7 @@ pub(crate) async fn terminal_browser_render(url: &str) -> Result<VisibleRender, 
         TokioCommand::new(TERMINAL_BROWSER_BIN),
         TokioCommand::new(TERMINAL_BROWSER_BIN),
         TokioCommand::new(TERMINAL_BROWSER_BIN),
-        TokioCommand::new(TERMINAL_BROWSER_BIN),
+        TokioCommand::new(AGENT_BROWSER_BIN),
         url,
         AGENT_BROWSER_READ_TIMEOUT,
     )
@@ -6444,12 +6444,14 @@ pub(crate) async fn terminal_browser_render(url: &str) -> Result<VisibleRender, 
 /// The sequence is `open` (which is what splits the pane — `action` can only
 /// target a tab that already exists), then the same User-Agent correction the
 /// headless path makes ([`RENDER_USER_AGENT`]), then a re-navigation so that
-/// correction applies to the page whose text is read, then `read`.
+/// correction applies to the page the human sees, then `agent-browser read
+/// <url>` for the text — `read_cmd` is the agent-browser binary, the other
+/// three are the viewer.
 async fn terminal_browser_render_cmds(
     mut open_cmd: TokioCommand,
     mut headers_cmd: TokioCommand,
     mut nav_cmd: TokioCommand,
-    mut read_cmd: TokioCommand,
+    read_cmd: TokioCommand,
     url: &str,
     window: Duration,
 ) -> Result<VisibleRender, String> {
@@ -6506,9 +6508,12 @@ async fn terminal_browser_render_cmds(
         other => return Ok(VisibleRender::Ran(other.clone())),
     }
 
-    read_cmd.args(["action", "--", "read"]);
+    // The text comes from `agent-browser read <url>` — the same HTTP fetch the
+    // headless path makes, of the page the human is now looking at — never
+    // from scraping the pane. Audit 2026-09-07: this ran `action -- read`,
+    // the glyph-flooding path the preview and the envelope said it did not.
     Ok(VisibleRender::Ran(
-        run_agent_browser_child(read_cmd, window).await?,
+        agent_browser_read_cmd(read_cmd, url, window).await?,
     ))
 }
 
@@ -12548,6 +12553,38 @@ mod artifact_view_tests {
             !preview.contains("action -- read"),
             "the result must not come from scraping the rendered pane: {preview}"
         );
+    }
+
+    /// Audit 2026-09-07: with `render=true` the page text came from
+    /// `terminal-browser action -- read` — the pane scraper the comment above
+    /// the preview blames for 2.3 MB glyph floods — while the preview, the
+    /// envelope and this test file all promised `agent-browser read <url>`.
+    /// The read child's argv is the only thing that settles which is true.
+    #[tokio::test]
+    async fn a_visible_render_reads_the_page_through_agent_browser_not_the_pane() {
+        let mut read_cmd = TokioCommand::new("sh");
+        read_cmd.args(["-c", "printf '%s\\n' \"$@\"", "argv0"]);
+        let render = terminal_browser_render_cmds(
+            TokioCommand::new("true"),
+            TokioCommand::new("true"),
+            TokioCommand::new("true"),
+            read_cmd,
+            "http://127.0.0.1:9/",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a read is an outcome");
+        match render {
+            VisibleRender::Ran(AgentBrowserOutcome::Completed { stdout, .. }) => {
+                let argv: Vec<&str> = stdout.lines().collect();
+                assert_eq!(
+                    argv,
+                    ["read", "http://127.0.0.1:9/"],
+                    "the read child must be `agent-browser read <url>`"
+                );
+            }
+            other => panic!("expected a completed read, got {other:?}"),
+        }
     }
 
     /// With no viewer installed nothing is shown and nothing is read through
