@@ -1659,7 +1659,13 @@ async fn execute_manual_tool_call(
             elapsed_ms: 0,
             is_error: true,
         });
-        session_store.append_message("tool", &message, tool_name, &call_id, None);
+        session_store.append_message(
+            "tool",
+            &message,
+            tool_name,
+            &call_id,
+            Some(serde_json::json!({ "args": args, "is_error": true, "elapsed_ms": 0 })),
+        );
         transcript.append(TranscriptEntry::new("tool", &message).with_tool_name(tool_name));
         emit_notification("ui.turn.complete", serde_json::json!({}));
     };
@@ -1717,7 +1723,13 @@ async fn execute_manual_tool_call(
             elapsed_ms: 0,
             is_error: true,
         });
-        session_store.append_message("tool", &message, tool_name, &call_id, None);
+        session_store.append_message(
+            "tool",
+            &message,
+            tool_name,
+            &call_id,
+            Some(serde_json::json!({ "args": args, "is_error": true, "elapsed_ms": 0 })),
+        );
         transcript.append(TranscriptEntry::new("tool", &message).with_tool_name(tool_name));
         emit_notification("ui.turn.complete", serde_json::json!({}));
         return Ok(());
@@ -1774,7 +1786,13 @@ async fn execute_manual_tool_call(
                 elapsed_ms: 0,
                 is_error: true,
             });
-            session_store.append_message("tool", &message, tool_name, &call_id, None);
+            session_store.append_message(
+                "tool",
+                &message,
+                tool_name,
+                &call_id,
+                Some(serde_json::json!({ "args": args, "is_error": true, "elapsed_ms": 0 })),
+            );
             transcript.append(TranscriptEntry::new("tool", &message).with_tool_name(tool_name));
             emit_notification("ui.turn.complete", serde_json::json!({}));
             return Ok(());
@@ -1856,7 +1874,13 @@ async fn execute_manual_tool_call(
         is_error,
     });
 
-    session_store.append_message("tool", &display_content, tool_name, &call_id, None);
+    session_store.append_message(
+        "tool",
+        &display_content,
+        tool_name,
+        &call_id,
+        Some(serde_json::json!({ "args": args, "is_error": is_error, "elapsed_ms": elapsed_ms })),
+    );
     transcript.append(TranscriptEntry::new("tool", &display_content).with_tool_name(tool_name));
     emit_notification("ui.turn.complete", serde_json::json!({}));
     Ok(())
@@ -5979,6 +6003,12 @@ fn emit_agent_event(event: AgentEvent) {
         // than `unreachable!()` because panicking in the UI emitter would take
         // a session down over a rendering detail.
         AgentEvent::AgentActivity { .. } => {}
+        // Trajectory facts are written by persist_trajectory_event before this
+        // runs; the screen has nothing to show for them.
+        AgentEvent::TurnStart
+        | AgentEvent::StepStart { .. }
+        | AgentEvent::ToolApproval { .. }
+        | AgentEvent::Decision { .. } => {}
         AgentEvent::TextDelta { text } => {
             emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
         }
@@ -7327,6 +7357,8 @@ fn spawn_agent_turn(
                             tool_name,
                             content,
                             tool_args,
+                            is_error,
+                            elapsed_ms,
                             ..
                         } => {
                             // Record WHAT THE TOOL WAS CALLED WITH, not only
@@ -7340,11 +7372,13 @@ fn spawn_agent_turn(
                                 content,
                                 tool_name,
                                 call_id,
-                                Some(serde_json::json!({ "args": tool_args })),
+                                Some(serde_json::json!({ "args": tool_args,
+                                    "is_error": is_error, "elapsed_ms": elapsed_ms })),
                             );
                         }
                         _ => {}
                     }
+                    persist_trajectory_event(&mut runtime.session_store, &event);
                     emit_agent_event(event);
                 },
                 Some(approval_rx),
@@ -12628,5 +12662,120 @@ mod workspace_planes_tests {
         let params = only(&emissions, "ui.object.update");
         assert_eq!(params["id"], "cache://aaaa1111/structure.cif");
         assert_eq!(params["kind"], "structure");
+    }
+}
+
+/// Durable trajectory facts go to the session store; everything else the
+/// bridge already writes as messages. One place, so a new fact is one arm.
+pub(crate) fn persist_trajectory_event(
+    store: &mut crate::session::SessionStore,
+    event: &AgentEvent,
+) {
+    match event {
+        AgentEvent::TurnStart => store.append_event("turn", serde_json::json!({ "event": "start" })),
+        AgentEvent::StepStart { step, prompt_sections, tool_schema_names } => {
+            // The section text is interned once under its hash; the log
+            // carries the reference, so the exact prompt is reconstructable
+            // without storing it a thousand times.
+            let sections: Vec<serde_json::Value> = prompt_sections
+                .iter()
+                .map(|s| {
+                    store.intern_section(
+                        s["id"].as_str().unwrap_or("section"),
+                        s["text"].as_str().unwrap_or(""),
+                    )
+                })
+                .collect();
+            store.append_event(
+                "step",
+                serde_json::json!({ "event": "start", "step": step,
+                    "prompt_sections": sections, "tool_schema_names": tool_schema_names }),
+            );
+        }
+        AgentEvent::ToolApproval { call_id, decision } => store.append_event(
+            "approval",
+            serde_json::json!({ "call_id": call_id, "decision": decision }),
+        ),
+        AgentEvent::Decision { kind, tool, count } => store.append_event(
+            "decision",
+            serde_json::json!({ "kind": kind, "tool": tool, "count": count }),
+        ),
+        AgentEvent::TurnComplete { has_more, .. } => store.append_event(
+            "turn",
+            serde_json::json!({ "event": "end", "reason": if *has_more { "has_more" } else { "complete" } }),
+        ),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod trajectory_tests {
+    use super::*;
+    use crate::session::SessionStore;
+
+    /// Owner 2026-09-06: sessions must be usable as training trajectories.
+    /// The five durable facts a trainer needs, driven through the bridge
+    /// exactly as the loop emits them, must land in the log in order.
+    #[test]
+    fn trajectory_events_reach_the_session_log_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SessionStore::new(Some(dir.path().to_path_buf()));
+        let sid = store.new_session("m");
+        let events = vec![
+            AgentEvent::TurnStart,
+            AgentEvent::StepStart {
+                step: 1,
+                prompt_sections: vec![
+                    serde_json::json!({ "id": "system", "text": "You are PRISM." }),
+                ],
+                tool_schema_names: vec!["file".into()],
+            },
+            AgentEvent::ToolApproval {
+                call_id: "call-1".into(),
+                decision: "allowed_session".into(),
+            },
+            AgentEvent::Decision {
+                kind: "failure_cap".into(),
+                tool: Some("file".into()),
+                count: 4,
+            },
+            AgentEvent::TurnComplete {
+                text: None,
+                has_more: false,
+                usage: None,
+                total_usage: None,
+                estimated_cost: None,
+            },
+        ];
+        for event in &events {
+            persist_trajectory_event(&mut store, event);
+        }
+        let log = std::fs::read_to_string(dir.path().join(format!("{sid}.jsonl"))).unwrap();
+        let entries: Vec<serde_json::Value> = log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let order: Vec<&str> = entries
+            .iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .filter(|t| !matches!(*t, "meta" | "session_context"))
+            .collect();
+        assert_eq!(
+            order,
+            ["turn", "step", "approval", "decision", "turn"],
+            "{order:?}"
+        );
+        let step = entries.iter().find(|e| e["type"] == "step").unwrap();
+        // The bridge interned the section: a 64-hex reference, no raw text in the log.
+        assert_eq!(
+            step["data"]["prompt_sections"][0]["sha256"]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
+        assert!(step["data"]["prompt_sections"][0].get("text").is_none());
+        assert_eq!(step["data"]["tool_schema_names"][0], "file");
+        let end = entries.iter().rev().find(|e| e["type"] == "turn").unwrap();
+        assert_eq!(end["data"]["event"], "end");
     }
 }

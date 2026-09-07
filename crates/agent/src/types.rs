@@ -175,6 +175,28 @@ pub enum AgentEvent {
         /// allowed for the session (the destructive tripwire's finding).
         reason: Option<String>,
     },
+    /// Durable trajectory facts. A session file that carries these is a
+    /// training trajectory, not a chat log: turn and step boundaries, the
+    /// prompt the model actually saw, every approval decision, and the
+    /// loop's own interventions. The TUI ignores them; the session store
+    /// writes them. Rule adopted: model-visible means logged.
+    TurnStart,
+    StepStart {
+        step: u64,
+        /// `{id, text}` per section; the store content-addresses the text.
+        prompt_sections: Vec<serde_json::Value>,
+        tool_schema_names: Vec<String>,
+    },
+    ToolApproval {
+        call_id: String,
+        /// `auto` (no channel wired), `allowed`, `allowed_session`, `denied`.
+        decision: String,
+    },
+    Decision {
+        kind: String,
+        tool: Option<String>,
+        count: u64,
+    },
     TurnComplete {
         text: Option<String>,
         has_more: bool,

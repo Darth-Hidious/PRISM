@@ -68,7 +68,17 @@ async fn approval_gate_outcome(
     // A forced prompt (destructive tripwire) ignores every shortcut: not the
     // global auto-approve, not the session's "always allow", not the tool's
     // own "needs no approval". The human sees the reason and decides.
+    // Every exit records who decided, keyed by call id: a policy, the tool's
+    // own declaration, an unwired channel, or a human. A trainer must be able
+    // to tell an approval nobody was asked for from one a person gave.
+    let approved = |decision: &str, emit: &mut (dyn FnMut(AgentEvent) + Send)| {
+        emit(AgentEvent::ToolApproval {
+            call_id: call_id.to_string(),
+            decision: decision.to_string(),
+        });
+    };
     if forced_reason.is_none() && (config.auto_approve || permission_decision.auto_approved) {
+        approved("policy", emit);
         return ApprovalGateOutcome::Proceed;
     }
 
@@ -89,6 +99,7 @@ async fn approval_gate_outcome(
             .find(tool_name)
             .is_some_and(|tool| tool.declared_free)
     {
+        approved("declared_free", emit);
         return ApprovalGateOutcome::Proceed;
     }
 
@@ -112,6 +123,7 @@ async fn approval_gate_outcome(
     // If no approval channel is wired, auto-approve for backward
     // compatibility. A closed wired channel is a denial.
     let Some(rx) = approval_rx else {
+        approved("unwired", emit);
         return ApprovalGateOutcome::Proceed;
     };
 
@@ -119,16 +131,21 @@ async fn approval_gate_outcome(
     // must be shared across the spawned turn.
     let mut rx = rx.lock().await;
     match rx.recv().await {
-        Some(ApprovalResponse::Allow) => ApprovalGateOutcome::Proceed,
+        Some(ApprovalResponse::Allow) => {
+            approved("allowed", emit);
+            ApprovalGateOutcome::Proceed
+        }
         Some(ApprovalResponse::AllowAll) => {
             // Approve this call AND auto-approve every later one for the rest
             // of the session. Explicit denials remain intact.
             if let Some(overrides) = live_permission_overrides {
                 overrides.write().await.allow_all();
             }
+            approved("allowed_session", emit);
             ApprovalGateOutcome::Proceed
         }
         Some(ApprovalResponse::Deny) | None => {
+            approved("denied", emit);
             let denied_msg = format!("Tool '{tool_name}' denied by user.");
             emit(AgentEvent::ToolCallResult {
                 raw_result: None,
@@ -3538,6 +3555,7 @@ pub async fn run_turn_until(
     let run_ledger = RunLedger::start(&run, "agent-run").await;
     let run_heartbeat = AgentRunHeartbeat::start(run_ledger.clone(), run.id.clone());
     let mut run_metrics = AgentRunMetrics::default();
+    emit(AgentEvent::TurnStart);
     let surface_policy = crate::skills::SkillSurfacePolicy::default();
     let turn_skill_context = crate::skills::prepare_turn_skill_context(
         user_message,
@@ -3890,6 +3908,11 @@ pub(crate) async fn run_turn_inner(
                 ),
                 done: false,
             });
+            emit(AgentEvent::Decision {
+                kind: "deadline_synthesis".to_string(),
+                tool: None,
+                count: minutes,
+            });
             history.push(synthesis_now_message(minutes));
         }
         // ── 2a. Budget check ──────────────────────────────────────
@@ -3899,6 +3922,11 @@ pub(crate) async fn run_turn_inner(
             });
         }
         if transcript.budget_exhausted() {
+            emit(AgentEvent::Decision {
+                kind: "budget_exhausted".to_string(),
+                tool: None,
+                count: 0,
+            });
             emit(AgentEvent::TextDelta {
                 text: "Budget exhausted.".to_string(),
             });
@@ -4118,6 +4146,21 @@ pub(crate) async fn run_turn_inner(
         // streaming callback and emit them after the call completes.
         // Reasoning tokens (is_reasoning=true) are emitted as a separate
         // event so the TUI can render them dimmed/collapsed.
+        // Model-visible means logged: the system message exactly as sent
+        // and the tool schemas offered. History is already in the log.
+        // ponytail: the text rides the in-process event each step (KBs); if
+        // the TUI channel ever pays for it, send a hash after the first time.
+        emit(AgentEvent::StepStart {
+            step: iteration as u64 + 1,
+            prompt_sections: vec![serde_json::json!({
+                "id": "system",
+                "text": messages.first().and_then(|m| m.content.clone()).unwrap_or_default(),
+            })],
+            tool_schema_names: relevant_tools
+                .iter()
+                .map(|t| t.function.name.clone())
+                .collect(),
+        });
         let mut streamed_deltas: Vec<(String, bool)> = Vec::new();
         let first_attempt = llm
             .chat_with_tools_streaming(
@@ -4781,6 +4824,11 @@ pub(crate) async fn run_turn_inner(
                         id: "tool.loop".to_string(),
                         text: format!("{} is repeating — stopped", call.function.name),
                         done: true,
+                    });
+                    emit(AgentEvent::Decision {
+                        kind: "repetition_refused".to_string(),
+                        tool: Some(call.function.name.clone()),
+                        count: REPETITION_LIMIT as u64,
                     });
                     history.push(repetition_refusal(&call.function.name, &call.id));
                 }
@@ -5452,6 +5500,11 @@ pub(crate) async fn run_turn_inner(
                         .or_insert(0);
                     *streak += 1;
                     if let Some(directive) = code_repair_directive(canonical_tool, *streak) {
+                        emit(AgentEvent::Decision {
+                            kind: "failure_cap".to_string(),
+                            tool: Some(canonical_tool.to_string()),
+                            count: *streak as u64,
+                        });
                         // h8/h12 haven't run yet (we're before them), so push
                         // the real filtered error ourselves first — never swallow it.
                         let real_content = process_large_result(&content_after_hooks);
@@ -9190,6 +9243,50 @@ mod tests {
             )
             .is_none(),
             "an empty search has nothing to digest and keeps its own message"
+        );
+    }
+}
+
+#[cfg(test)]
+mod trajectory_tests {
+    use super::*;
+
+    /// Every approval decision must be a durable event keyed by call id —
+    /// the one place it is decided is the one place it is emitted.
+    #[tokio::test]
+    async fn a_policy_auto_approval_is_recorded_with_its_reason() {
+        let config = AgentConfig::default();
+        let permission_decision = crate::permissions::ToolPermissionDecision {
+            blocked: false,
+            auto_approved: true,
+        };
+        let catalog = ToolCatalog::from_tool_server_json(&serde_json::json!({ "tools": [] }));
+        let mut history = Vec::new();
+        let mut events = Vec::new();
+        {
+            let mut emit = |event| events.push(event);
+            approval_gate_outcome(
+                &config,
+                &permission_decision,
+                &catalog,
+                "file",
+                &serde_json::json!({ "action": "read" }),
+                "call-9",
+                &None,
+                None,
+                None,
+                None,
+                &mut history,
+                &mut emit,
+            )
+            .await;
+        }
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolApproval { call_id, decision } if call_id == "call-9" && decision == "policy"
+            )),
+            "{events:?}"
         );
     }
 }

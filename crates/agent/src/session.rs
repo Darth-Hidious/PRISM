@@ -62,12 +62,23 @@ fn default_sessions_dir() -> PathBuf {
 
 // ── Data types ───────────────────────────────────────────────────────
 
+pub const SESSION_SCHEMA_VERSION: u32 = 2;
+
+fn legacy_schema_version() -> u32 {
+    1
+}
+
 /// Session metadata — written as the first JSONL line, and re-appended as a
 /// fresh `meta` line whenever it changes (model switch, title, periodic
 /// counter flush). Readers take the LAST `meta` line as current.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub session_id: String,
+    /// Log generation. 1: messages only (files written before 2026-09-07,
+    /// which carry no field and read as 1). 2: turn/step/approval/decision
+    /// entries and content-addressed prompt sections — a trajectory.
+    #[serde(default = "legacy_schema_version")]
+    pub schema_version: u32,
     pub created_at: f64,
     pub updated_at: f64,
     pub model: String,
@@ -350,6 +361,7 @@ impl SessionStore {
         let now = unix_now();
         self.meta = Some(SessionMeta {
             session_id: sid.clone(),
+            schema_version: SESSION_SCHEMA_VERSION,
             created_at: now,
             updated_at: now,
             model: model.to_string(),
@@ -964,6 +976,46 @@ impl SessionStore {
         self.sessions_dir.to_string_lossy().into_owned()
     }
 
+    /// A durable fact that is not a message: a turn or step boundary, an
+    /// approval decision, one of the loop's own interventions. Same file,
+    /// same line shape, a new `type`; readers that only know `message` skip it.
+    /// This is what makes a session a trajectory rather than a chat log.
+    pub fn append_event(&mut self, entry_type: &str, data: serde_json::Value) {
+        if self.current_path.is_none() {
+            return;
+        }
+        let entry = SessionEntry {
+            entry_type: entry_type.to_string(),
+            role: String::new(),
+            content: String::new(),
+            tool_name: String::new(),
+            call_id: String::new(),
+            timestamp: unix_now(),
+            data: Some(data),
+        };
+        self.write_entry(&entry);
+    }
+
+    /// Content-address one prompt section: its bytes land once under
+    /// `blobs/<sha256>` and the step entry carries only the reference, so
+    /// the same system prompt across a thousand steps is stored a single
+    /// time and every request the model saw is reconstructable from the log.
+    pub fn intern_section(&self, id: &str, text: &str) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let sha: String = Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let blobs = self.sessions_dir.join("blobs");
+        let path = blobs.join(&sha);
+        if !path.exists() {
+            // Best effort, like write_entry: a blob that fails to land is a
+            // missing reconstruction, not a broken session.
+            let _ = std::fs::create_dir_all(&blobs).and_then(|_| std::fs::write(&path, text));
+        }
+        serde_json::json!({ "id": id, "sha256": sha, "chars": text.chars().count() })
+    }
+
     fn write_entry(&self, entry: &SessionEntry) -> bool {
         let Some(path) = &self.current_path else {
             return false;
@@ -1514,6 +1566,89 @@ fn rand_u32() -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Owner 2026-09-06: "trajectories need to be saved so we can train
+    /// models later." The log held role/content/tool_name/call_id and none
+    /// of what a trainer needs: no turn or step boundary, no error flag, no
+    /// approval decision, no record of the prompt the model saw. The rule
+    /// adopted here is the harness's: model-visible means logged.
+    #[test]
+    fn a_turn_is_reconstructable_as_a_trajectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SessionStore::new(Some(dir.path().to_path_buf()));
+        let sid = store.new_session("m");
+        store.append_event("turn", serde_json::json!({ "event": "start", "turn": 1 }));
+        let section = store.intern_section("system", "You are PRISM.");
+        assert_eq!(
+            section["sha256"].as_str().map(str::len),
+            Some(64),
+            "{section}"
+        );
+        store.append_event(
+            "step",
+            serde_json::json!({ "event": "start", "step": 1, "model": "m",
+                "prompt_sections": [section.clone()], "tool_schema_names": ["file"] }),
+        );
+        store.append_message("user", "make Monel on steroids", "", "", None);
+        store.append_message("assistant", "reading the file first", "", "", None);
+        store.append_message(
+            "tool",
+            "error: no such file",
+            "file",
+            "call-1",
+            Some(serde_json::json!({ "args": { "action": "read" }, "is_error": true, "elapsed_ms": 12 })),
+        );
+        store.append_event(
+            "approval",
+            serde_json::json!({ "call_id": "call-1", "decision": "allowed_session" }),
+        );
+        store.append_event(
+            "decision",
+            serde_json::json!({ "kind": "failure_cap", "tool": "file", "count": 4 }),
+        );
+        store.append_event(
+            "turn",
+            serde_json::json!({ "event": "end", "turn": 1, "reason": "natural_stop" }),
+        );
+
+        let log = std::fs::read_to_string(dir.path().join(format!("{sid}.jsonl"))).unwrap();
+        let entries: Vec<serde_json::Value> = log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let order: Vec<&str> = entries
+            .iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .filter(|t| !matches!(*t, "meta" | "session_context"))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "turn", "step", "message", "message", "message", "approval", "decision", "turn"
+            ],
+            "{order:?}"
+        );
+        let step = entries.iter().find(|e| e["type"] == "step").unwrap();
+        assert_eq!(step["data"]["prompt_sections"][0]["id"], "system");
+        assert_eq!(step["data"]["tool_schema_names"][0], "file");
+        let tool = entries.iter().find(|e| e["role"] == "tool").unwrap();
+        assert_eq!(tool["data"]["is_error"], true);
+        // The section's bytes are on disk once, under their hash — the same
+        // system prompt across a thousand steps is stored a single time.
+        let sha = section["sha256"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("blobs").join(sha)).unwrap(),
+            "You are PRISM."
+        );
+        store.intern_section("system", "You are PRISM.");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("blobs")).unwrap().count(),
+            1
+        );
+        // A reader can tell this log's generation from its meta line.
+        let meta = entries.iter().find(|e| e["type"] == "meta").unwrap();
+        assert_eq!(meta["data"]["schema_version"], 2);
+    }
     /// The measured failure: a turn that streams reasoning, runs tools, and
     /// ends with no final content. Five searches, a paragraph on screen, zero
     /// assistant records in the store.
@@ -1833,6 +1968,7 @@ mod tests {
         let sid = "20260101_000000_backfill";
         let meta = SessionMeta {
             session_id: sid.to_string(),
+            schema_version: SESSION_SCHEMA_VERSION,
             created_at: 100.0,
             updated_at: 200.0,
             model: "legacy-model".to_string(),
@@ -1870,6 +2006,7 @@ mod tests {
         let sid = "20260101_000000_orphaned";
         let meta = SessionMeta {
             session_id: sid.to_string(),
+            schema_version: SESSION_SCHEMA_VERSION,
             created_at: 100.0,
             updated_at: 200.0,
             model: "legacy-model".to_string(),
@@ -2022,6 +2159,7 @@ mod tests {
     fn meta_with(turn_count: usize, title: Option<&str>, title_turn: usize) -> SessionMeta {
         SessionMeta {
             session_id: "s".to_string(),
+            schema_version: SESSION_SCHEMA_VERSION,
             created_at: 0.0,
             updated_at: 0.0,
             model: "m".to_string(),

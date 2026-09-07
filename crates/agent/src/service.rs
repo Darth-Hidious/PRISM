@@ -725,6 +725,10 @@ impl ChatService {
             // agent's activity is not reported on it. Widening that wire is an
             // API decision; inventing a field here would not be one.
             AgentEvent::AgentActivity { .. } => {}
+            AgentEvent::TurnStart
+            | AgentEvent::StepStart { .. }
+            | AgentEvent::ToolApproval { .. }
+            | AgentEvent::Decision { .. } => {}
             AgentEvent::ThinkingDelta { text } => {
                 let _ = events.send(ChatEvent::Thinking { text });
             }

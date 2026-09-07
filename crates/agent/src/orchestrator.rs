@@ -1458,6 +1458,13 @@ impl ItemAgent for OrchestratedAgent {
                         // A child lane's licence wall is folded like its activity; the
                         // parent's own tool calls announce theirs.
                         AgentEvent::NeedsHuman { .. } => {}
+                        // ponytail: a subagent's trajectory is not logged into the
+                        // parent's session; add a lane field when training on
+                        // delegated turns.
+                        AgentEvent::TurnStart
+                        | AgentEvent::StepStart { .. }
+                        | AgentEvent::ToolApproval { .. }
+                        | AgentEvent::Decision { .. } => {}
                         AgentEvent::TextDelta { text } => {
                             streamed_text.push_str(text);
                             return;
