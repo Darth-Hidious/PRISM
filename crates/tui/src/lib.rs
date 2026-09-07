@@ -390,6 +390,13 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
 
     // Tracks the terminal's mouse-capture state so copy mode can toggle it.
     let mut mouse_captured = true;
+    // Draw when something could have changed: after every event and backend
+    // message, and on a tick only when the screen changes by itself (see
+    // `App::tick_redraws`) or once a second as a net for what the pollers
+    // above the draw may have changed. The loop used to draw on every 100 ms
+    // tick regardless — ten full frames a second on an idle transcript.
+    let mut redraw = true;
+    let mut ticks: u32 = 0;
     loop {
         // Coalesced artifact requests only enqueue JSON messages; the backend
         // performs all store I/O off the render thread.
@@ -399,7 +406,10 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         app.poll_structure_requests();
 
         // Render every frame
-        terminal.draw(|f| render::draw(f, &app))?;
+        if redraw {
+            terminal.draw(|f| render::draw(f, &app))?;
+        }
+        redraw = true;
 
         // Credits: (re)fetch at startup and after each completed turn, then
         // publish the latest known balance into the app for the status bar.
@@ -456,10 +466,18 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         {
             tokio::select! {
                 _ = tick.tick() => {
+                    ticks = ticks.wrapping_add(1);
+                    let toasts_before = app.toasts.len();
                     app.prune_toasts();
+                    let mut flushed = false;
                     for ev in reassembler.flush(std::time::Instant::now()) {
                         dispatch(&mut app, ev);
+                        flushed = true;
                     }
+                    redraw = flushed
+                        || app.toasts.len() != toasts_before
+                        || app.tick_redraws()
+                        || ticks.is_multiple_of(10);
                 }
                 Some(Ok(ev)) = events.next() => {
                     for ev in reassembler.feed(ev, std::time::Instant::now()) {
@@ -480,10 +498,18 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
             tokio::select! {
                 // Render tick — fires every 100ms for animations + toast expiry.
                 _ = tick.tick() => {
+                    ticks = ticks.wrapping_add(1);
+                    let toasts_before = app.toasts.len();
                     app.prune_toasts();
+                    let mut flushed = false;
                     for ev in reassembler.flush(std::time::Instant::now()) {
                         dispatch(&mut app, ev);
+                        flushed = true;
                     }
+                    redraw = flushed
+                        || app.toasts.len() != toasts_before
+                        || app.tick_redraws()
+                        || ticks.is_multiple_of(10);
                 }
                 // Terminal events (keyboard, resize, etc.)
                 Some(Ok(ev)) = events.next() => {

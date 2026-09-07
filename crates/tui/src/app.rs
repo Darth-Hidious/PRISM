@@ -4713,6 +4713,13 @@ impl App {
     }
 
     /// Drop toasts whose TTL has elapsed. Called from the render tick.
+    /// Whether a timer tick alone warrants a redraw: only when something on
+    /// screen changes by itself — a spinner, a running tool's age, a toast
+    /// that will expire. An idle transcript is drawn again only by an event.
+    pub fn tick_redraws(&self) -> bool {
+        self.is_waiting || !self.running_tools.is_empty() || !self.toasts.is_empty()
+    }
+
     pub fn prune_toasts(&mut self) {
         self.toasts.retain(|t| !t.is_expired());
     }
@@ -11863,6 +11870,26 @@ mod tests {
         // covered by `home_opens_on_launch_and_intercepts_keys`.
         app.home.open = false;
         app
+    }
+
+    /// Live complaint 2026-09-06: "too slow to scroll after a while". The
+    /// event loop redrew on every 100 ms tick whatever the screen showed, so
+    /// an idle session paid ten full frames a second. A tick redraws only
+    /// when something on screen changes by itself.
+    #[test]
+    fn an_idle_transcript_is_not_redrawn_on_a_tick() {
+        let mut app = fresh();
+        assert!(!app.tick_redraws(), "nothing on screen changes by itself");
+        app.is_waiting = true;
+        assert!(app.tick_redraws(), "the waiting spinner animates");
+        app.is_waiting = false;
+        app.running_tools
+            .insert("call-1".to_string(), std::time::Instant::now());
+        assert!(app.tick_redraws(), "a running tool's age counts up");
+        app.running_tools.clear();
+        app.toasts
+            .push(toast::Toast::new("saved", toast::ToastKind::Info));
+        assert!(app.tick_redraws(), "a toast expires on its own");
     }
 
     #[test]
