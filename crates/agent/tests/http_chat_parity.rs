@@ -64,11 +64,19 @@ for line in sys.stdin:
                 "input_schema": {"type": "object", "properties": {}},
                 "requires_approval": False,
             },
+            {
+                "name": "empty_search",
+                "description": "A search that finds nothing, honestly (test only).",
+                "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+                "requires_approval": False,
+            },
         ]}
     elif method == "call_tool":
         with open(LOG, "a") as f:
             f.write(json.dumps(req) + "\n")
-        if req.get("tool") == "local_env_probe":
+        if req.get("tool") == "empty_search":
+            resp = {"result": {"count": 0, "results": [], "source_status": {"stub": "ok"}}}
+        elif req.get("tool") == "local_env_probe":
             resp = {"result": {
                 "offline": os.environ.get("PRISM_OFFLINE"),
                 "home": os.environ.get("HOME"),
@@ -121,6 +129,8 @@ enum StubMode {
     /// the test suite…") until the execution-contract reminder shows up in the
     /// history, then answers honestly. Drives the finalization-gate test.
     ClaimsWithoutTools,
+    /// Asks `empty_search` two DIFFERENT questions, then completes the turn.
+    TwoEmptyQueries,
     /// Calls the environment probe once, then completes the turn.
     EnvironmentProbe,
     /// Round 7: calls `write_skill` (its code writes `write_marker` when
@@ -220,6 +230,15 @@ async fn start_stub_llm_recording(mode: StubMode) -> (String, SystemMessageLog) 
                     StubMode::ClaimsWithoutTools => {
                         sse_text("I ran the test suite and everything passes.")
                     }
+                    StubMode::TwoEmptyQueries => match tool_msgs {
+                        0 => {
+                            sse_tool_call_with_args("empty_search", "{\"query\": \"monel creep\"}")
+                        }
+                        1 => {
+                            sse_tool_call_with_args("empty_search", "{\"query\": \"monel oxygen\"}")
+                        }
+                        _ => sse_text("EMPTY_DONE"),
+                    },
                     StubMode::EnvironmentProbe if last_is_tool => sse_text("ENV_DONE"),
                     StubMode::EnvironmentProbe => sse_tool_call("local_env_probe"),
                     StubMode::SkillWriteThenRun { write_marker } => match tool_msgs {
@@ -888,6 +907,96 @@ async fn unsupported_execution_claim_cannot_finalize_a_turn() {
         counts.iter().all(|&n| n == 1),
         "every request carries exactly one system message; got {counts:?}"
     );
+}
+
+/// Audit 2026-09-07: the empty-result streak was keyed by tool name alone,
+/// so two DIFFERENT questions that legitimately found nothing had the second
+/// REPLACED by a harness-made error (`is_error: true`) — the model never saw
+/// the tool's own `source_status`, and provenance counted a failure nothing
+/// had failed. Both answers must reach the model as the tool wrote them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_empty_answer_to_a_new_question_reaches_the_model_untouched() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let base_url = start_stub_llm(StubMode::TwoEmptyQueries).await;
+    let seed = build_agent_seed(
+        &tool_server_config(project.path(), &python),
+        &llm_config(base_url.clone()),
+    )
+    .await
+    .expect("seed");
+    let AgentSeed {
+        mut tool_server,
+        subagent_lanes: _,
+        command_tool_runtime,
+        tools,
+        config,
+        hooks,
+        permissions,
+    } = seed;
+    let llm = LlmClient::new(llm_config(base_url));
+    // The loop refuses every tool call fail-closed without a policy engine;
+    // the built-in policies are what a real session runs under.
+    let mut policy = prism_policy::PolicyEngine::new().expect("built-in policies load");
+    let mut history = Vec::new();
+    let mut transcript = prism_agent::transcript::TranscriptStore::new(None);
+    let mut scratchpad = prism_agent::scratchpad::Scratchpad::new();
+    let mut answer = String::new();
+    agent_loop::run_turn(
+        &llm,
+        &mut tool_server,
+        &command_tool_runtime,
+        &mut history,
+        tools.as_ref(),
+        config.as_ref(),
+        "find anything on monel",
+        None,
+        &mut transcript,
+        hooks.as_ref(),
+        &permissions,
+        None,
+        &mut scratchpad,
+        &mut |event| {
+            if let AgentEvent::TurnComplete {
+                text: Some(text), ..
+            } = event
+                && !text.is_empty()
+            {
+                answer = text;
+            }
+        },
+        None,
+        Some(&mut policy),
+        None,
+    )
+    .await
+    .expect("turn");
+    assert_eq!(answer, "EMPTY_DONE");
+
+    let tool_answers: Vec<&str> = history
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.content.as_deref())
+        .collect();
+    assert_eq!(
+        tool_answers.len(),
+        2,
+        "two searches, two answers: {tool_answers:?}"
+    );
+    for (n, content) in tool_answers.iter().enumerate() {
+        assert!(
+            content.contains("source_status"),
+            "answer {n} must be the tool's own: {content}"
+        );
+        assert!(
+            !content.contains("[harness]") && !content.contains("empty results"),
+            "answer {n} to a NEW question carries no streak advisory: {content}"
+        );
+    }
 }
 
 // ── Round 7: meta-tools are not homogeneous ──────────────────────────

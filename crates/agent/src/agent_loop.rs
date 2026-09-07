@@ -2316,6 +2316,30 @@ pub(crate) fn hook_result_value(raw_content: &str, is_error: bool) -> Value {
 }
 
 /// Returns true if a tool result looks like 0/empty results.
+/// The advisory to append beside an empty result, once the SAME question has
+/// come back empty `EMPTY_RESULT_MAX` times in a row; `None` otherwise. A
+/// non-empty answer to that question clears its streak.
+fn empty_result_advisory(
+    streaks: &mut HashMap<String, usize>,
+    signature: &str,
+    content: &str,
+) -> Option<String> {
+    if !is_empty_result(content) {
+        streaks.remove(signature);
+        return None;
+    }
+    let streak = streaks.entry(signature.to_string()).or_insert(0);
+    *streak += 1;
+    (*streak >= EMPTY_RESULT_MAX).then(|| {
+        format!(
+            "[harness] This exact query has returned empty results {streak} times in a row. \
+             The result above is the tool's own answer — read its status fields before \
+             deciding what it means. Rephrase, try a different tool, or report plainly that \
+             nothing was found and which attempts you made. Do NOT fill the gap from memory."
+        )
+    })
+}
+
 fn is_empty_result(content: &str) -> bool {
     if let Ok(val) = serde_json::from_str::<Value>(content) {
         // {"count": 0} or {"results": []}
@@ -5448,44 +5472,15 @@ pub(crate) async fn run_turn_inner(
                 continue;
             }
 
-            // ── h7b. Empty-result streak detection ───────────────
-            if is_empty_result(&content_after_hooks) {
-                let streak = empty_result_streak
-                    .entry(tool_name.to_string())
-                    .or_insert(0);
-                *streak += 1;
-                if *streak >= EMPTY_RESULT_MAX {
-                    let abort_msg = format!(
-                        "{tool_name} returned empty results {streak} times in a row. \
-                         This tool isn't finding what you need — try a different tool \
-                         or rephrase the query. If nothing finds it, report that it \
-                         was not found and say which attempts you made. Do NOT fill \
-                         the gap from memory.",
-                    );
-                    emit(AgentEvent::ToolCallResult {
-                        raw_result: None,
-                        call_id: call_id.clone(),
-                        tool_name: tool_name.clone(),
-                        content: abort_msg.clone(),
-                        tool_args: args.clone(),
-                        summary: Some(format!("{tool_name}: empty results, stopping")),
-                        preview: preview.clone(),
-                        elapsed_ms,
-                        is_error: true,
-                    });
-                    history.push(ChatMessage {
-                        role: "tool".to_string(),
-                        content: Some(abort_msg),
-                        tool_calls: None,
-                        tool_call_id: Some(call_id.clone()),
-                        reasoning_content: None,
-                    });
-                    continue;
-                }
-            } else {
-                // Reset streak on successful result
-                empty_result_streak.remove(tool_name.as_str());
-            }
+            // ── h7b. Empty-result streak, per question ───────────
+            // Audit 2026-09-07: keyed by tool name alone, two different
+            // queries that legitimately found nothing had the second replaced
+            // by a harness-made error — the model never saw the tool's own
+            // `source_status`, and provenance counted a failure nothing had
+            // failed. The streak is per (tool, arguments) and the advisory
+            // rides beside the real result (h8 appends it), never instead.
+            let empty_advisory =
+                empty_result_advisory(&mut empty_result_streak, &sig, &content_after_hooks);
 
             // ── h7c. Bounded verify-by-execution (VS2-P1b) ─────────
             // A code-exec tool that fails N>=CODE_REPAIR_MAX times in a row is
@@ -5618,6 +5613,11 @@ pub(crate) async fn run_turn_inner(
                         trimmed
                     }
                 }
+            };
+
+            let content = match empty_advisory {
+                Some(advisory) => format!("{content}\n\n{advisory}"),
+                None => content,
             };
 
             // ── h9. Log to scratchpad ─────────────────────────────
@@ -7955,6 +7955,40 @@ mod tests {
         // …and the input hint is visible.
         assert!(block.contains("input 8"));
         assert!(block.contains("recall(id="));
+    }
+
+    /// Audit 2026-09-07: two DIFFERENT questions that legitimately came back
+    /// `{count: 0}` had the second replaced by a harness-made error, so the
+    /// model never saw the tool's own `source_status` and provenance counted
+    /// a failure nothing had failed. The streak is per (tool, arguments):
+    /// only the same question asked again earns the advisory, and the
+    /// advisory rides beside the real result instead of replacing it.
+    #[test]
+    fn an_empty_result_for_a_new_question_is_not_a_streak() {
+        let mut streaks = HashMap::new();
+        let a = doom_loop_signature("papers", &serde_json::json!({ "query": "monel creep" }));
+        let b = doom_loop_signature("papers", &serde_json::json!({ "query": "monel oxygen" }));
+        assert_eq!(
+            empty_result_advisory(&mut streaks, &a, "{\"count\":0}"),
+            None
+        );
+        assert_eq!(
+            empty_result_advisory(&mut streaks, &b, "{\"count\":0}"),
+            None,
+            "a different question is not a repeat"
+        );
+        let again = empty_result_advisory(&mut streaks, &a, "{\"count\":0}")
+            .expect("the same question twice earns the advisory");
+        assert!(again.contains("2 times"), "{again}");
+        assert_eq!(
+            empty_result_advisory(&mut streaks, &a, "{\"count\":3}"),
+            None,
+            "a non-empty answer clears the streak"
+        );
+        assert_eq!(
+            empty_result_advisory(&mut streaks, &a, "{\"count\":0}"),
+            None
+        );
     }
 
     #[test]
