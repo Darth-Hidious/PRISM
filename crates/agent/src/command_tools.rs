@@ -4172,23 +4172,36 @@ fn format_execution_invocation(execution: &CommandExecution) -> String {
 /// harness kills work the CLI was still legitimately doing.
 const CLI_LONG_WORK_BUDGET_SECS: u64 = 1800;
 
-fn command_timeout_for_root(root: &str) -> Duration {
-    match root {
+/// The wall-clock window for one CLI command, by root. `None` for a root the
+/// table does not name: the executor refuses such a call, and
+/// `every_command_root_declares_its_window` keeps this exhaustive. Audit
+/// 2026-09-07: the previous silent 30 s default SIGKILLed `run_model` before
+/// its auto-stop (a billable deployment left running) and `doctor_fix` after
+/// it had deleted the venv and before it had rebuilt it.
+fn command_timeout_for_root(root: &str) -> Option<Duration> {
+    let secs = match root {
         // Literature + ingest roots do real long work: `papers sweep` is
         // resumable paginated harvesting, `papers claims` runs one LLM call
         // per text block, `ingest --platform` holds a connection the CLI
         // budgets 1800s for, and `ingest-and-wait` polls up to its
         // `poll_timeout_secs` (capped at 1800 by the typed tool). 100s of
         // headroom so the agent-side kill never beats the CLI's own budget.
-        "papers" | "ingest" | "ingest-and-wait" => {
-            Duration::from_secs(CLI_LONG_WORK_BUDGET_SECS + 100)
-        }
-        "workflow" | "query" | "run" | "research" | "deploy" | "publish" | "marketplace" => {
-            Duration::from_secs(300)
-        }
-        "node" | "mesh" => Duration::from_secs(60),
-        _ => Duration::from_secs(30),
-    }
+        "papers" | "ingest" | "ingest-and-wait" => CLI_LONG_WORK_BUDGET_SECS + 100,
+        // The same class of work elsewhere: a deployment created, awaited,
+        // invoked and auto-stopped (`predict`); a venv deleted and rebuilt
+        // (`doctor fix`); a pip install of torch/MACE (`provision`); a
+        // multi-turn workflow (`discourse run`).
+        "predict" | "doctor" | "provision" | "discourse" => CLI_LONG_WORK_BUDGET_SECS + 100,
+        // One local-LLM judgement over an assertion's cited lines.
+        "reverify" => 600,
+        "workflow" | "query" | "run" | "research" | "deploy" | "publish" | "marketplace" => 300,
+        "node" | "mesh" => 60,
+        "agent" | "agent-browser" | "billing" | "campaign" | "compute" | "job-status"
+        | "knowledge" | "models" | "notebook" | "ontology" | "plugins" | "report" | "schedule"
+        | "status" | "tools" => 30,
+        _ => return None,
+    };
+    Some(Duration::from_secs(secs))
 }
 
 /// Strip what is not text from a fetched page, keeping the text whole.
@@ -6222,7 +6235,9 @@ async fn execute_cli_command(
     }
     stamp_action_id(&mut cmd);
 
-    let timeout_window = command_timeout_for_root(root);
+    let Some(timeout_window) = command_timeout_for_root(root) else {
+        anyhow::bail!("`{root}` has no declared timeout window; every command root must name one");
+    };
     let timeout_secs = timeout_window.as_secs();
     let output = match timeout(timeout_window, cmd.output()).await {
         Ok(result) => result.context("failed to run internal PRISM command tool")?,
@@ -11470,12 +11485,51 @@ ValueError: boom\n";
     fn papers_and_ingest_windows_cover_the_clis_long_work_budget() {
         let budget = Duration::from_secs(CLI_LONG_WORK_BUDGET_SECS);
         for root in ["papers", "ingest", "ingest-and-wait"] {
+            let window = command_timeout_for_root(root).expect("declared");
             assert!(
-                command_timeout_for_root(root) > budget,
-                "`{root}` window {:?} must exceed the CLI's own {budget:?} budget",
-                command_timeout_for_root(root)
+                window > budget,
+                "`{root}` window {window:?} must exceed the CLI's own {budget:?} budget"
             );
         }
+    }
+
+    /// Audit 2026-09-07 (blocker): every root the table did not name fell
+    /// to a silent 30 s and was SIGKILLed. `run_model` creates a BILLABLE
+    /// deployment, waits for it, invokes it and auto-stops it — killed at
+    /// 30 s, the auto-stop never runs. `doctor_fix` deletes `~/.prism/venv`
+    /// and reprovisions it — killed mid-install. `provision` pip-installs
+    /// torch/MACE; `reverify_assertion` is a local-LLM judgement;
+    /// `discourse run` is a multi-turn workflow. Each window must cover the
+    /// work it starts.
+    #[test]
+    fn long_running_roots_are_not_killed_before_their_work_can_finish() {
+        let at_least = |root: &str, secs: u64| {
+            let window = command_timeout_for_root(root).expect("declared");
+            assert!(
+                window >= Duration::from_secs(secs),
+                "`{root}` window {window:?} is below the {secs}s its work needs"
+            );
+        };
+        at_least("predict", CLI_LONG_WORK_BUDGET_SECS);
+        at_least("doctor", CLI_LONG_WORK_BUDGET_SECS);
+        at_least("provision", CLI_LONG_WORK_BUDGET_SECS);
+        at_least("discourse", CLI_LONG_WORK_BUDGET_SECS);
+        at_least("reverify", 600);
+    }
+
+    /// Every root in the table names its window; an unlisted root is refused
+    /// by the executor instead of killed at a default nobody chose.
+    #[test]
+    fn every_command_root_declares_its_window() {
+        for spec in COMMAND_TOOLS {
+            assert!(
+                command_timeout_for_root(spec.root).is_some(),
+                "`{}` (root `{}`) declares no timeout window",
+                spec.name,
+                spec.root
+            );
+        }
+        assert!(command_timeout_for_root("no-such-root").is_none());
     }
 
     /// Defect 2a: `--max-blocks` bounds how much LLM work `claims` does —
