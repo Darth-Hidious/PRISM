@@ -1,4 +1,5 @@
-//! Transactional, drift-tolerant application of model-authored source edits.
+//! Transactional, drift-tolerant application of model-authored source edits,
+//! and exclusive creation of new files.
 
 use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
@@ -23,6 +24,7 @@ use serde_json::{Value, json};
 
 const BEGIN_PATCH: &str = "*** Begin Patch";
 const UPDATE_FILE: &str = "*** Update File: ";
+const ADD_FILE: &str = "*** Add File: ";
 const END_PATCH: &str = "*** End Patch";
 const HUNK_MARKER: &str = "@@";
 
@@ -88,7 +90,15 @@ impl MatchPolicy {
 #[derive(Clone, Debug)]
 struct ParsedPatch {
     path: PathBuf,
-    hunks: Vec<Hunk>,
+    body: PatchBody,
+}
+
+/// What the envelope asks for: hunks against an existing file, or the whole
+/// text of a file that does not exist yet.
+#[derive(Clone, Debug)]
+enum PatchBody {
+    Update(Vec<Hunk>),
+    Add(String),
 }
 
 #[derive(Clone, Debug)]
@@ -259,13 +269,15 @@ struct PlannedHunk {
     tier: MatchTier,
 }
 
-/// Execute one update-only patch against an existing file below `project_root`.
+/// Execute one patch below `project_root`: context-block hunks against an
+/// existing file, or `*** Add File:` to create one.
 ///
-/// The envelope intentionally has only one target and context-block hunks. It
-/// is small enough for a model to emit consistently, while still carrying the
-/// unchanged text needed for safe drift-tolerant location. Add/delete/move and
-/// line-number syntax are deliberately absent because they enlarge the parser
-/// and make destructive intent less explicit.
+/// The envelope intentionally has one target. Context-block hunks are small
+/// enough for a model to emit consistently while still carrying the unchanged
+/// text needed for safe drift-tolerant location. `Add File` is accepted because
+/// this tool carries the Codex grammar's name and the live log shows models
+/// emitting it; delete/move and line-number syntax stay absent because they
+/// enlarge the parser and make destructive intent less explicit.
 pub(crate) fn execute(project_root: &Path, args: &Value) -> Result<Value> {
     let args: ApplyPatchArgs =
         serde_json::from_value(args.clone()).context("invalid apply_patch arguments")?;
@@ -282,18 +294,24 @@ pub(crate) fn execute(project_root: &Path, args: &Value) -> Result<Value> {
     }
 
     #[cfg(unix)]
-    execute_confined(project_root, patch, args.match_policy)
+    match patch.body {
+        PatchBody::Update(hunks) => {
+            execute_confined(project_root, &patch.path, &hunks, args.match_policy)
+        }
+        PatchBody::Add(content) => create_confined(project_root, &patch.path, &content),
+    }
 }
 
 #[cfg(unix)]
 fn execute_confined(
     project_root: &Path,
-    patch: ParsedPatch,
+    path: &Path,
+    hunks: &[Hunk],
     match_policy: MatchPolicy,
 ) -> Result<Value> {
-    let (target, original) = ConfinedTarget::open(project_root, &patch.path)?;
+    let (target, original) = ConfinedTarget::open(project_root, path)?;
     let source = SourceFile::parse(&original)?;
-    let plans = plan_hunks(&source, &patch.hunks, &match_policy)?;
+    let plans = plan_hunks(&source, hunks, &match_policy)?;
     let match_tiers: Vec<&str> = plans.iter().map(|plan| plan.tier.as_str()).collect();
     let updated = apply_plans(source, &plans)?.render()?;
 
@@ -304,11 +322,51 @@ fn execute_confined(
 
     Ok(json!({
         "success": true,
-        "path": patch.path.to_string_lossy(),
-        "hunks_applied": patch.hunks.len(),
+        "path": path.to_string_lossy(),
+        "hunks_applied": hunks.len(),
         "bytes_written": updated.len(),
         "size_bytes": updated.len(),
         "match_tiers": match_tiers,
+    }))
+}
+
+/// Create `relative` below `project_root` with `content`, through the same
+/// symlink-refusing directory walk as an update. Exclusive create: an existing
+/// file is never overwritten by an `Add File`.
+#[cfg(unix)]
+fn create_confined(project_root: &Path, relative: &Path, content: &str) -> Result<Value> {
+    let (parent, name) = ConfinedTarget::resolve_parent(project_root, relative)?;
+    let raw_fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o644,
+        )
+    };
+    let fd = match owned_fd(raw_fd) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+            "'{}' already exists; '{ADD_FILE}' only creates a file — use '{UPDATE_FILE}{}' with '@@' hunks to change it",
+            relative.display(),
+            relative.display()
+        ),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create '{}'", relative.display()));
+        }
+    };
+    let mut file = File::from(fd);
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("failed to write '{}'", relative.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync '{}'", relative.display()))?;
+    Ok(json!({
+        "success": true,
+        "path": relative.to_string_lossy(),
+        "created": true,
+        "bytes_written": content.len(),
+        "size_bytes": content.len(),
     }))
 }
 
@@ -323,16 +381,36 @@ fn parse_patch(input: &str) -> Result<ParsedPatch> {
     if lines.last() != Some(&END_PATCH) {
         bail!("invalid patch: last line must be '{END_PATCH}'");
     }
-    if lines.len() < 5 {
-        bail!("invalid patch: expected one update target and at least one hunk");
+    if lines.len() < 3 {
+        bail!(
+            "invalid patch: the patch is empty — between '{BEGIN_PATCH}' and '{END_PATCH}' put \
+             '{UPDATE_FILE}<relative path>' followed by '@@' hunks, or '{ADD_FILE}<relative path>' \
+             followed by '+' lines"
+        );
     }
 
     let target_line = lines[1];
+    if let Some(path_text) = target_line.strip_prefix(ADD_FILE) {
+        let path = target_path(path_text, ADD_FILE)?;
+        let content = parse_added_file(&path, &lines[2..lines.len() - 1])?;
+        return Ok(ParsedPatch {
+            path,
+            body: PatchBody::Add(content),
+        });
+    }
     let path_text = target_line.strip_prefix(UPDATE_FILE).ok_or_else(|| {
-        anyhow::anyhow!("invalid patch: second line must be '{UPDATE_FILE}<relative path>'")
+        anyhow::anyhow!(
+            "invalid patch: second line must be '{UPDATE_FILE}<relative path>' (or \
+             '{ADD_FILE}<relative path>' to create a file)"
+        )
     })?;
-    if path_text.is_empty() || path_text.trim() != path_text {
-        bail!("invalid patch: update path must be non-empty with no surrounding whitespace");
+    let path = target_path(path_text, UPDATE_FILE)?;
+    if lines.len() < 5 {
+        bail!(
+            "invalid patch: '{UPDATE_FILE}{}' has no hunk — a hunk is an '@@' line followed by \
+             lines prefixed with a space (unchanged), '-' (removed) or '+' (added)",
+            path.display()
+        );
     }
 
     let mut hunks = Vec::new();
@@ -381,9 +459,44 @@ fn parse_patch(input: &str) -> Result<ParsedPatch> {
         bail!("invalid patch: at least one hunk is required");
     }
     Ok(ParsedPatch {
-        path: PathBuf::from(path_text),
-        hunks,
+        path,
+        body: PatchBody::Update(hunks),
     })
+}
+
+fn target_path(path_text: &str, verb: &str) -> Result<PathBuf> {
+    if path_text.is_empty() || path_text.trim() != path_text {
+        bail!(
+            "invalid patch: the path after '{}' must be non-empty with no surrounding whitespace",
+            verb.trim()
+        );
+    }
+    Ok(PathBuf::from(path_text))
+}
+
+/// The body of an `Add File`: every line is `+<text>`; the file gets exactly
+/// those lines, each newline-terminated.
+fn parse_added_file(path: &Path, body: &[&str]) -> Result<String> {
+    if body.is_empty() {
+        bail!(
+            "invalid patch: '{ADD_FILE}{}' has no '+' lines — each line of the new file is written as '+<text>'",
+            path.display()
+        );
+    }
+    let mut content = String::new();
+    for (offset, line) in body.iter().enumerate() {
+        let Some(text) = line.strip_prefix('+') else {
+            bail!(
+                "invalid patch at line {}: every line of an added file is written as '+<text>'; \
+                 '{ADD_FILE}' creates a file and cannot modify one — use '{UPDATE_FILE}' with \
+                 '@@' hunks for that",
+                offset + 3
+            );
+        };
+        content.push_str(text);
+        content.push('\n');
+    }
+    Ok(content)
 }
 
 fn validate_hunk(lines: &[PatchLine], hunk_number: usize) -> Result<()> {
@@ -394,7 +507,12 @@ fn validate_hunk(lines: &[PatchLine], hunk_number: usize) -> Result<()> {
         .iter()
         .any(|line| matches!(line, PatchLine::Add(_) | PatchLine::Remove(_)))
     {
-        bail!("invalid patch: hunk {hunk_number} contains no change");
+        bail!(
+            "invalid patch: hunk {hunk_number} has no '+' or '-' line — every line starts with a \
+             space, which marks unchanged context. Prefix each added line with '+' and each \
+             removed line with '-'. To append to a file, quote its last existing line as context \
+             and put the '+' lines after it"
+        );
     }
 
     let source: Vec<&str> = lines.iter().filter_map(PatchLine::source_text).collect();
@@ -406,7 +524,10 @@ fn validate_hunk(lines: &[PatchLine], hunk_number: usize) -> Result<()> {
         bail!("invalid patch: hunk {hunk_number} has no source anchor");
     }
     if source == destination {
-        bail!("invalid patch: hunk {hunk_number} produces no change");
+        bail!(
+            "invalid patch: hunk {hunk_number}'s '+' lines are identical to its '-' lines, so it \
+             changes nothing — put the new text on the '+' lines"
+        );
     }
     Ok(())
 }
@@ -443,6 +564,32 @@ struct ConfinedTarget {
 #[cfg(unix)]
 impl ConfinedTarget {
     fn open(project_root: &Path, relative: &Path) -> Result<(Self, Vec<u8>)> {
+        let (parent, name) = Self::resolve_parent(project_root, relative)?;
+        let (mut file, metadata) = open_regular_file_at(parent.as_raw_fd(), &name, relative)?;
+        let identity = FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let permission_mode = metadata.mode() as libc::mode_t & 0o7777;
+        let mut original = Vec::new();
+        file.read_to_end(&mut original)
+            .with_context(|| format!("failed to read patch target '{}'", relative.display()))?;
+
+        Ok((
+            Self {
+                parent,
+                name,
+                relative: relative.to_owned(),
+                identity,
+                permission_mode,
+            },
+            original,
+        ))
+    }
+
+    /// Walk to the target's directory without following a symlink anywhere on
+    /// the way, and return it with the target's own name.
+    fn resolve_parent(project_root: &Path, relative: &Path) -> Result<(OwnedFd, CString)> {
         let canonical_root = std::fs::canonicalize(project_root).with_context(|| {
             format!(
                 "failed to canonicalize project root '{}'",
@@ -476,26 +623,7 @@ impl ConfinedTarget {
         }
 
         let name = os_str_to_cstring(file_name, "patch target file name")?;
-        let (mut file, metadata) = open_regular_file_at(parent.as_raw_fd(), &name, relative)?;
-        let identity = FileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        };
-        let permission_mode = metadata.mode() as libc::mode_t & 0o7777;
-        let mut original = Vec::new();
-        file.read_to_end(&mut original)
-            .with_context(|| format!("failed to read patch target '{}'", relative.display()))?;
-
-        Ok((
-            Self {
-                parent,
-                name,
-                relative: relative.to_owned(),
-                identity,
-                permission_mode,
-            },
-            original,
-        ))
+        Ok((parent, name))
     }
 }
 
@@ -1142,6 +1270,83 @@ mod tests {
         json!({ "patch": patch })
     }
 
+    // Audit 2026-09-07 + the live log: 18 of the last 30 apply_patch calls
+    // failed, and the tool's own words were the reason they kept failing.
+    // Five were the empty envelope; four were hunks whose every line began
+    // with a space (the model meant to append and had nothing to anchor on);
+    // five had '+' lines identical to their '-' lines; one was the Codex
+    // `*** Add File:` this tool is named after. Each error now says what was
+    // wrong and what to send instead, and a file can be created.
+
+    #[test]
+    fn an_empty_patch_is_named_as_empty() {
+        let root = tempdir().unwrap();
+        let error = execute(
+            root.path(),
+            &default_args(format!("{BEGIN_PATCH}\n{END_PATCH}")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("empty"), "{error}");
+        assert!(error.contains(UPDATE_FILE.trim()), "{error}");
+        assert!(error.contains(ADD_FILE.trim()), "{error}");
+    }
+
+    #[test]
+    fn a_context_only_hunk_is_told_how_to_add_lines() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("notes.md"), "one\n").unwrap();
+        let patch = envelope("notes.md", "@@\n placeholder");
+        let error = execute(root.path(), &default_args(patch))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no '+' or '-' line"), "{error}");
+        assert!(error.contains("append"), "{error}");
+        assert!(error.contains("last existing line"), "{error}");
+    }
+
+    #[test]
+    fn identical_remove_and_add_lines_are_named_as_identical() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("notes.md"), "same\n").unwrap();
+        let patch = envelope("notes.md", "@@\n-same\n+same");
+        let error = execute(root.path(), &default_args(patch))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("'+' lines are identical to its '-' lines"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn add_file_creates_the_file_from_its_plus_lines() {
+        let root = tempdir().unwrap();
+        let patch = format!("{BEGIN_PATCH}\n{ADD_FILE}note.md\n+# Title\n+\n+body\n{END_PATCH}");
+        let result = execute(root.path(), &default_args(patch)).expect("a new file is created");
+        assert_eq!(result["created"], true);
+        assert_eq!(
+            fs::read_to_string(root.path().join("note.md")).unwrap(),
+            "# Title\n\nbody\n"
+        );
+    }
+
+    #[test]
+    fn add_file_refuses_to_overwrite_and_names_update_file() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("note.md"), "already here\n").unwrap();
+        let patch = format!("{BEGIN_PATCH}\n{ADD_FILE}note.md\n+replacement\n{END_PATCH}");
+        let error = execute(root.path(), &default_args(patch))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+        assert!(error.contains(UPDATE_FILE.trim()), "{error}");
+        assert_eq!(
+            fs::read_to_string(root.path().join("note.md")).unwrap(),
+            "already here\n"
+        );
+    }
+
     #[test]
     fn ambiguous_context_is_refused_instead_of_using_first_match() {
         let root = tempdir().unwrap();
@@ -1700,7 +1905,7 @@ mod tests {
             parse_patch(&no_change)
                 .unwrap_err()
                 .to_string()
-                .contains("contains no change")
+                .contains("no '+' or '-' line")
         );
     }
 }

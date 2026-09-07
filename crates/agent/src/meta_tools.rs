@@ -353,7 +353,7 @@ pub fn definitions() -> Vec<LoadedTool> {
     vec![
         LoadedTool {
             name: "apply_patch".to_string(),
-            description: "Patch one UTF-8 file: `*** Begin Patch`, `*** Update File: path`, `@@` hunks of space/`-`/`+` lines, `*** End Patch`; hunks must match uniquely."
+            description: "Patch/create: `*** Begin Patch`, `*** Update File: path` + `@@` hunks (space/`-`/`+` lines) or `*** Add File: path` + `+` lines, `*** End Patch`."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
