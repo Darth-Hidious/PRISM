@@ -27,7 +27,6 @@ use crate::session_index::SessionIndexWorker;
 // ── Constants ────────────────────────────────────────────────────────
 
 const MAX_FILE_SIZE: u64 = 256 * 1024; // 256KB
-const MAX_ROTATIONS: usize = 3;
 const LATEST_FILE: &str = ".latest";
 const SESSION_CONTEXT_ENTRY_TYPE: &str = "session_context";
 const DEFAULT_SESSION_QUERY_LIMIT: usize = 100;
@@ -1095,19 +1094,16 @@ impl SessionStore {
             return false;
         }
 
-        // Delete old .3 before shifting .2 → .3, .1 → .2, current → .1.
-        // Removing it after the shift deleted the newly moved `.3` instead.
-        let base = path.to_string_lossy().to_string();
-        let oldest = format!("{base}.{}", MAX_ROTATIONS);
-        let _ = fs::remove_file(&oldest);
-        for index in (1..MAX_ROTATIONS).rev() {
-            let from = format!("{base}.{index}");
-            let to = format!("{base}.{}", index + 1);
-            if Path::new(&from).exists() {
-                let _ = fs::rename(&from, &to);
-            }
+        // Nothing is ever deleted: every closed segment moves up one place,
+        // oldest first, so `.1` is always the newest closed segment and the
+        // highest number the oldest. Audit 2026-09-07: the previous four-deep
+        // ring had already dropped the opening brief of the owner's PFAS
+        // session — a session is a trajectory, and the store is not the
+        // place that decides which part of it is worth keeping.
+        for index in (1..=highest_rotation(path)).rev() {
+            let _ = fs::rename(rotated_path(path, index), rotated_path(path, index + 1));
         }
-        fs::rename(path, format!("{base}.1")).is_ok()
+        fs::rename(path, rotated_path(path, 1)).is_ok()
     }
 
     fn resolve_ref(&self, reference: &str) -> Option<String> {
@@ -1290,16 +1286,25 @@ fn rotated_path(path: &Path, rotation: usize) -> PathBuf {
     PathBuf::from(value)
 }
 
+/// The number of closed segments behind `path` (`.1` … `.n`, contiguous).
+fn highest_rotation(path: &Path) -> usize {
+    let mut n = 0;
+    while rotated_path(path, n + 1).exists() {
+        n += 1;
+    }
+    n
+}
+
 fn session_base_path(candidate: &Path) -> Option<PathBuf> {
     let file_name = candidate.file_name()?.to_str()?;
     if file_name.ends_with(".jsonl") {
         return Some(candidate.to_path_buf());
     }
-    for rotation in 1..=MAX_ROTATIONS {
-        let suffix = format!(".jsonl.{rotation}");
-        if let Some(stem) = file_name.strip_suffix(&suffix) {
-            return Some(candidate.parent()?.join(format!("{stem}.jsonl")));
-        }
+    if let Some((stem, rotation)) = file_name.rsplit_once(".jsonl.")
+        && !rotation.is_empty()
+        && rotation.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Some(candidate.parent()?.join(format!("{stem}.jsonl")));
     }
     None
 }
@@ -1312,10 +1317,9 @@ fn session_id_from_base_path(path: &Path) -> Option<String> {
 }
 
 fn session_log_paths(path: &Path) -> Vec<PathBuf> {
-    let mut paths = (1..=MAX_ROTATIONS)
+    let mut paths = (1..=highest_rotation(path))
         .rev()
         .map(|rotation| rotated_path(path, rotation))
-        .filter(|candidate| candidate.exists())
         .collect::<Vec<_>>();
     if path.exists() {
         paths.push(path.to_path_buf());
@@ -1354,8 +1358,8 @@ fn session_log_is_complete_for_index(path: &Path) -> bool {
     saw_meta
 }
 
-/// Parse retained segments oldest-to-newest. Seed metadata/context written on
-/// rotation keeps the index fully rebuildable even after early segments expire.
+/// Parse every segment oldest-to-newest. Seed metadata/context written on
+/// rotation keeps the index rebuildable from the newest segment alone.
 fn scan_session_log(path: &Path) -> Option<ParsedSessionLog> {
     let paths = session_log_paths(path);
     if paths.is_empty() {
@@ -1389,7 +1393,7 @@ fn scan_session_log(path: &Path) -> Option<ParsedSessionLog> {
                 first_created_at.get_or_insert(meta.created_at);
                 // Metadata counters are cumulative as of this point in the
                 // log. Taking the maximum here, then counting later events,
-                // preserves post-seed activity after older rotations expire
+                // preserves post-seed activity when a rebuild starts at a seed
                 // without double-counting events covered by a later flush.
                 turn_count = turn_count.max(meta.turn_count);
                 compaction_count = compaction_count.max(meta.compaction_count);
@@ -2394,7 +2398,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_preserves_project_and_preview_after_old_rotations_expire() {
+    fn rebuild_preserves_project_and_preview_across_rotations() {
         let (mut store, tmp) = make_store();
         let project = tmp.path().join("durable-project");
         store.set_project_cwd(Some(&project));
@@ -2402,7 +2406,7 @@ mod tests {
         store.append_message("user", "durable preview", "", "", None);
 
         let large = "x".repeat(300 * 1024);
-        for _ in 0..(MAX_ROTATIONS + 2) {
+        for _ in 0..5 {
             store.append_message("assistant", &large, "", "", None);
         }
         // This message lands after the final rotation seed. A rebuild must
@@ -2417,6 +2421,29 @@ mod tests {
             .expect("rotated session rebuilt");
         assert_eq!(info.project_cwd.as_deref(), project.to_str());
         assert_eq!(info.preview.as_deref(), Some("durable preview"));
-        assert_eq!(info.turn_count, MAX_ROTATIONS + 4);
+        assert_eq!(info.turn_count, 7);
+    }
+
+    /// Audit 2026-09-07 (blocker): rotation kept four 256 KB segments and
+    /// `remove_file`d the oldest — the owner's PFAS session had already lost
+    /// its opening brief and first three turns. A session is a trajectory;
+    /// nothing in it is ever deleted by the store.
+    #[test]
+    fn no_rotation_ever_deletes_the_opening_of_a_session() {
+        let (mut store, _tmp) = make_store();
+        let sid = store.new_session("m1");
+        store.append_message("user", "the opening brief", "", "", None);
+        let large = "x".repeat(300 * 1024);
+        for _ in 0..6 {
+            store.append_message("assistant", &large, "", "", None);
+        }
+        let messages = store.load_messages(&sid).expect("the log loads");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["content"].as_str() == Some("the opening brief")),
+            "the first message must survive six rotations; got {} messages",
+            messages.len()
+        );
     }
 }
