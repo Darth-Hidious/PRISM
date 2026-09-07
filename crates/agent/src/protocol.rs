@@ -7351,31 +7351,6 @@ fn spawn_agent_turn(
                                 );
                             }
                         }
-                        AgentEvent::ToolCallResult {
-                            raw_result: None,
-                            call_id,
-                            tool_name,
-                            content,
-                            tool_args,
-                            is_error,
-                            elapsed_ms,
-                            ..
-                        } => {
-                            // Record WHAT THE TOOL WAS CALLED WITH, not only
-                            // what it answered. Without this the durable
-                            // session held every answer and no question: no
-                            // call was reproducible, and a failed call taught
-                            // nothing downstream because the input that caused
-                            // it was gone.
-                            runtime.session_store.append_message(
-                                "tool",
-                                content,
-                                tool_name,
-                                call_id,
-                                Some(serde_json::json!({ "args": tool_args,
-                                    "is_error": is_error, "elapsed_ms": elapsed_ms })),
-                            );
-                        }
                         _ => {}
                     }
                     persist_trajectory_event(&mut runtime.session_store, &event);
@@ -12700,6 +12675,35 @@ pub(crate) fn persist_trajectory_event(
             "decision",
             serde_json::json!({ "kind": kind, "tool": tool, "count": count }),
         ),
+        AgentEvent::ToolCallResult {
+            call_id,
+            tool_name,
+            content,
+            tool_args,
+            raw_result,
+            is_error,
+            elapsed_ms,
+            ..
+        } => {
+            // The message is WHAT THE MODEL SAW; WHAT THE TOOL WAS CALLED
+            // WITH rides in `data` (without it the log held every answer and
+            // no question). The tool's own output, when a digest replaced it
+            // on the way to the model, is interned once under its hash rather
+            // than copied into the log. Audit 2026-09-07: this arm matched
+            // `raw_result: None` only, so every digested literature search
+            // was logged as a call with no answer.
+            let raw = raw_result
+                .as_deref()
+                .map(|raw| store.intern_section("raw_result", raw));
+            store.append_message(
+                "tool",
+                content,
+                tool_name,
+                call_id,
+                Some(serde_json::json!({ "args": tool_args, "is_error": is_error,
+                    "elapsed_ms": elapsed_ms, "raw": raw })),
+            );
+        }
         AgentEvent::TurnComplete { has_more, .. } => store.append_event(
             "turn",
             serde_json::json!({ "event": "end", "reason": if *has_more { "has_more" } else { "complete" } }),
@@ -12777,5 +12781,62 @@ mod trajectory_tests {
         assert_eq!(step["data"]["tool_schema_names"][0], "file");
         let end = entries.iter().rev().find(|e| e["type"] == "turn").unwrap();
         assert_eq!(end["data"]["event"], "end");
+    }
+
+    /// Audit 2026-09-07 (blocker): the writer matched only
+    /// `ToolCallResult { raw_result: None, .. }`, and the loop sets
+    /// `raw_result: Some` for every digested, trimmed or REPL-offloaded
+    /// result — so every literature search the owner's campaigns ran was
+    /// logged as a call with no answer. The model-visible content must be
+    /// written whatever the raw output was, and the raw output must stay
+    /// reconstructable without being copied into the log.
+    #[test]
+    fn a_digested_tool_result_is_written_with_what_the_model_saw() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SessionStore::new(Some(dir.path().to_path_buf()));
+        let sid = store.new_session("m");
+        let raw = "{\"records\":[{\"title\":\"twenty abstracts the model never saw\"}]}";
+        persist_trajectory_event(
+            &mut store,
+            &AgentEvent::ToolCallResult {
+                call_id: "call-7".into(),
+                tool_name: "papers".into(),
+                content: "3 records: A, B, C".into(),
+                tool_args: serde_json::json!({ "query": "monel creep" }),
+                raw_result: Some(raw.into()),
+                summary: Some("papers: 3".into()),
+                preview: None,
+                elapsed_ms: 12,
+                is_error: false,
+            },
+        );
+        let log = std::fs::read_to_string(dir.path().join(format!("{sid}.jsonl"))).unwrap();
+        let entries: Vec<serde_json::Value> = log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let tool = entries
+            .iter()
+            .find(|e| e["role"] == "tool")
+            .expect("a digested result must still reach the log");
+        assert_eq!(
+            tool["content"], "3 records: A, B, C",
+            "the log holds what the model saw"
+        );
+        assert_eq!(tool["call_id"], "call-7");
+        assert_eq!(tool["tool_name"], "papers");
+        assert_eq!(tool["data"]["args"]["query"], "monel creep");
+        assert_eq!(tool["data"]["is_error"], false);
+        assert_eq!(tool["data"]["elapsed_ms"], 12);
+        let sha = tool["data"]["raw"]["sha256"]
+            .as_str()
+            .expect("the raw output is referenced by hash");
+        assert_eq!(sha.len(), 64);
+        assert_eq!(tool["data"]["raw"]["chars"], raw.chars().count());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("blobs").join(sha)).unwrap(),
+            raw,
+            "the raw output is stored once, content-addressed"
+        );
     }
 }
