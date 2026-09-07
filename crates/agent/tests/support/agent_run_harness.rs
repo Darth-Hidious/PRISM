@@ -1,8 +1,11 @@
+// Each test binary includes this file and uses a subset of it.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use prism_agent::agent_loop;
-use prism_agent::protocol::build_agent_seed;
+use prism_agent::protocol::{AgentSeed, build_agent_seed};
 use prism_agent::types::AgentEvent;
 use prism_ingest::LlmConfig;
 use prism_ingest::llm::LlmClient;
@@ -52,7 +55,7 @@ fn write_stub_project(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn llm_config(base_url: String) -> LlmConfig {
+pub fn llm_config(base_url: String) -> LlmConfig {
     LlmConfig {
         base_url,
         model: TEST_MODEL.to_string(),
@@ -92,23 +95,39 @@ async fn start_stub_llm() -> Result<String> {
     Ok(format!("http://{address}/v1"))
 }
 
+/// A throwaway project whose tool server answers `list_tools` with nothing.
+pub struct StubProject {
+    pub dir: tempfile::TempDir,
+    pub python: PathBuf,
+}
+
+pub fn stub_project() -> Result<StubProject> {
+    let python = require_python()?;
+    let dir = tempfile::tempdir()?;
+    write_stub_project(dir.path())?;
+    Ok(StubProject { dir, python })
+}
+
+/// The same seed builder the backend uses, pointed at the stub project.
+pub async fn stub_seed(project: &StubProject, llm_config: &LlmConfig) -> Result<AgentSeed> {
+    build_agent_seed(
+        &ToolServer {
+            python_bin: project.python.clone(),
+            project_root: project.dir.path().to_path_buf(),
+            env: std::collections::BTreeMap::new(),
+        },
+        llm_config,
+    )
+    .await
+}
+
 /// Drive the public, production `run_turn` entry against local deterministic
 /// stubs and return the completion data emitted by the real loop.
 pub async fn run_stub_turn(session_id: &str) -> Result<StubTurnOutcome> {
-    let python = require_python()?;
-    let project = tempfile::tempdir()?;
-    write_stub_project(project.path())?;
+    let project = stub_project()?;
     let base_url = start_stub_llm().await?;
     let llm_config = llm_config(base_url.clone());
-    let mut seed = build_agent_seed(
-        &ToolServer {
-            python_bin: python,
-            project_root: project.path().to_path_buf(),
-            env: std::collections::BTreeMap::new(),
-        },
-        &llm_config,
-    )
-    .await?;
+    let mut seed = stub_seed(&project, &llm_config).await?;
     prism_agent::hooks::set_provenance_ctx(session_id, TEST_MODEL);
 
     let llm = LlmClient::new(llm_config);

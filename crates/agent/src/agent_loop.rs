@@ -4219,7 +4219,27 @@ pub(crate) async fn run_turn_inner(
                     false,
                 );
                 if let Some(summary) = transcript.compact(6) {
-                    compact_history(&mut messages, &summary, 6);
+                    // Fold HISTORY, then rebuild the request from it — the
+                    // same way every other step is built. Audit 2026-09-07:
+                    // this compacted `messages` itself, whose first element
+                    // is the one leading system message, so the retry went
+                    // out with no system prompt, task block or memory while
+                    // `history` stayed full and overflowed again next step.
+                    // (A context-influence primed request is rebuilt plain
+                    // here; the priming is not worth a second overflow.)
+                    compact_history(history, &summary, 6);
+                    messages = iteration_messages(
+                        &config.system_prompt,
+                        task_block.as_deref(),
+                        capability_menu.as_deref(),
+                        turn_skill_context.discovery_prompt.as_deref(),
+                        marked_block.as_deref(),
+                        session_memory.as_deref(),
+                        saturation_block.as_deref(),
+                        &traj_steps,
+                        history,
+                        turn_skill_context.selected_prompt.as_deref(),
+                    );
                     announce_activity("compact", "", true);
                 }
                 streamed_deltas.clear();
