@@ -5,7 +5,7 @@
 //! when the theme changes.
 
 use crate::app::{
-    App, DrawnLine, Focus, LineKind, Modal, ObjectKind, ObjectStatus, Role, WorkspaceTab,
+    App, ChatLine, DrawnLine, Focus, LineKind, Modal, ObjectKind, ObjectStatus, Role, WorkspaceTab,
     evidence_token, first_line,
 };
 use crate::artifact::{ArtifactPromotion, ArtifactStoreState, format_bytes};
@@ -17,6 +17,7 @@ use crate::markdown;
 use crate::structures::{StructuresStoreState, UNKNOWN};
 use crate::theme::Theme;
 use crate::toast::ToastKind;
+use crate::transcript_cache::Built;
 use prism_provenance::EvidenceClass;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -497,6 +498,549 @@ fn probe_line(line: &Line<'_>, marks: &[(u16, u16)]) -> Line<'static> {
     Line::from(spans)
 }
 
+/// What a message's lines depend on, hashed. A changed key rebuilds the
+/// entry; an equal key reuses it. Sources and descriptors are counted, not
+/// hashed — nothing edits a row after it arrives.
+fn message_key(app: &App, msg: &ChatLine, width: u16, thinking_shown: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(&msg.role).hash(&mut h);
+    msg.text.hash(&mut h);
+    std::mem::discriminant(&msg.kind).hash(&mut h);
+    match &msg.kind {
+        LineKind::Text | LineKind::Thinking => {}
+        LineKind::ToolStart {
+            tool_name,
+            elapsed_ms,
+            agent,
+            call_id,
+        } => {
+            (tool_name, elapsed_ms, agent, call_id).hash(&mut h);
+            let running_secs = call_id.as_ref().and_then(|cid| {
+                app.running_tools.get(cid).map(|start| {
+                    std::time::Instant::now()
+                        .saturating_duration_since(*start)
+                        .as_secs()
+                })
+            });
+            running_secs.hash(&mut h);
+        }
+        LineKind::ToolResult {
+            tool_name,
+            content,
+            elapsed_ms,
+            success,
+            evidence_class,
+            image_paths,
+            agent,
+            sources,
+            descriptors,
+        } => {
+            (
+                tool_name,
+                content.len(),
+                elapsed_ms,
+                success,
+                agent,
+                image_paths,
+            )
+                .hash(&mut h);
+            format!("{evidence_class:?}").hash(&mut h);
+            (sources.len(), descriptors.len()).hash(&mut h);
+        }
+        LineKind::Approval { tool_name, message } => (tool_name, message).hash(&mut h),
+        LineKind::Status(text) => text.hash(&mut h),
+        LineKind::Error(text, detail) => (text, detail).hash(&mut h),
+        LineKind::View { title, body } => (title, body).hash(&mut h),
+    }
+    (
+        width,
+        app.theme_index,
+        app.focus == Focus::Chat,
+        app.thinking_expanded,
+        thinking_shown,
+        app.references.generation(),
+    )
+        .hash(&mut h);
+    h.finish()
+}
+
+/// Build one message's transcript lines and everything the frame needs to
+/// place them, relative to the message's first line. The transcript cache
+/// keeps the result until `message_key` changes.
+fn build_message(
+    app: &App,
+    t: Theme,
+    gutter: Style,
+    width: u16,
+    msg: &ChatLine,
+    thinking_shown: &mut bool,
+) -> Built {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut user_header: Option<usize> = None;
+    let mut figures: Vec<(usize, String)> = Vec::new();
+    let mut marks: Vec<(usize, u16, u16, String)> = Vec::new();
+    let mut volatile: Vec<(usize, String)> = Vec::new();
+    let mut sets_shown = false;
+    // Thinking tokens: show collapsed indicator or full text
+    if matches!(msg.kind, LineKind::Thinking) {
+        if app.thinking_expanded {
+            // Show full thinking text, dimmed
+            for (i, line_text) in msg.text.lines().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled("◇ ", Style::default().fg(t.system)),
+                        Span::styled(line_text.to_string(), Style::default().fg(t.dim)),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(line_text.to_string(), Style::default().fg(t.dim)),
+                    ]));
+                }
+            }
+            if lines.last().is_some() {
+                lines.push(Line::raw(""));
+            }
+        } else if !*thinking_shown {
+            // Show a single collapsed indicator
+            let char_count = msg.text.chars().count();
+            lines.push(Line::from(vec![
+                Span::styled("◇ ", Style::default().fg(t.system)),
+                Span::styled(
+                    format!("[thinking… {} chars — Ctrl-T to expand]", char_count),
+                    Style::default().fg(t.dim),
+                ),
+            ]));
+            *thinking_shown = true;
+            sets_shown = true;
+        }
+        return Built::finish(
+            width,
+            lines,
+            user_header,
+            figures,
+            marks,
+            volatile,
+            true,
+            sets_shown,
+        );
+    }
+
+    match (&msg.role, &msg.kind) {
+        // ── User turn: labeled header + colored gutter bar ──────
+        (Role::User, LineKind::Text) => {
+            // Recorded BEFORE the header is pushed, so the anchor lands on
+            // the header row itself rather than the first body row.
+            user_header = Some(lines.len());
+            lines.push(Line::from(vec![
+                Span::styled("❯", gutter),
+                Span::styled(
+                    " You",
+                    Style::default().fg(t.user).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            for line_text in msg.text.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled("▌ ", Style::default().fg(t.user)),
+                    Span::styled(line_text.to_string(), Style::default().fg(t.text)),
+                ]));
+            }
+        }
+        // ── Assistant turn: labeled header + markdown body ──────
+        (Role::Assistant, LineKind::Text) => {
+            lines.push(Line::from(vec![
+                Span::styled("◆", gutter),
+                Span::styled(
+                    " PRISM",
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            // Mark the words backed by something openable. Coordinates
+            // come back in the coordinates of the ANNOTATED lines, so the
+            // two-space indent below is added to `col_start` rather than
+            // being present while matching — mixing those up would shift
+            // every region two cells left and hover the wrong word.
+            let (annotated, refs) = crate::refs::annotate_references(
+                markdown::markdown_lines(&msg.text, t, width.saturating_sub(2)),
+                &app.references,
+                t,
+            );
+            for (n, md) in annotated.into_iter().enumerate() {
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(md.spans);
+                // `lines.len()` is this line's index BEFORE the push, which
+                // is what the wrapped-row measurement downstream keys on.
+                for r in refs.iter().filter(|r| r.row == n) {
+                    marks.push((lines.len(), r.col_start + 2, r.col_end + 2, r.id.clone()));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        // ── Tool activity: indented + grouped under the turn ────
+        (Role::Tool, kind) => {
+            let (glyph, gcolor, style) = match kind {
+                LineKind::ToolResult { success: false, .. } | LineKind::Error(..) => {
+                    ("✗", t.err, Style::default().fg(t.err))
+                }
+                // Tool RESULTS are content the user reads, not chrome:
+                // they carry the numbers and citations the whole product
+                // exists to produce, so they get `text` like any other
+                // body copy. `dim` made the most substantive thing on
+                // screen the hardest to read.
+                LineKind::ToolResult { .. } => ("✓", t.ok, Style::default().fg(t.text)),
+                // The "⚙ Running x" progress line IS chrome — it stays
+                // secondary so the eye goes to the result, not the noise.
+                _ => ("⚙", t.warn, Style::default().fg(t.dim)),
+            };
+            // Two different absences, so two levels. The OUTER `None`
+            // means "this line is not a tool result at all" and gets no
+            // badge. The INNER `None` means "it is a tool result and the
+            // tool said nothing about its grounding", which does get a
+            // badge — a muted `[unclassified]`, because an unmarked result
+            // reads as a verified one.
+            let evidence_class: Option<Option<EvidenceClass>> = match kind {
+                LineKind::ToolResult { evidence_class, .. } => Some(*evidence_class),
+                LineKind::Error(..) => Some(Some(EvidenceClass::Indeterminate)),
+                _ => None,
+            };
+            // A finished RESULT is prose the reader studies, so its body
+            // goes through the SAME markdown renderer as PRISM's own
+            // replies. It never did: `markdown_lines` was called from
+            // exactly one place — the assistant branch a few lines above —
+            // so a table a tool emitted arrived as raw `|` pipes and `$x^2$`
+            // as literal dollar signs, while identical content written by
+            // PRISM rendered as a bordered, aligned table. Same bytes, two
+            // different qualities of display, decided by who said it.
+            //
+            // Progress and error lines are NOT routed through it: they are
+            // chrome, they carry their own colour (dim / red), and markdown
+            // styling would override the very distinction that keeps the
+            // eye on the result instead of the noise.
+            let render_body_as_markdown =
+                matches!(kind, LineKind::ToolResult { success: true, .. });
+            // A ToolStart whose result has not landed is still running:
+            // its start Instant is held in `running_tools` under its
+            // call_id, so the head line can name how long it has run. The
+            // result arm removes the entry, so a finished tool's start row
+            // shows no stale clock and the result carries the final ms.
+            let running_secs = match kind {
+                LineKind::ToolStart {
+                    call_id: Some(cid), ..
+                } => app.running_tools.get(cid).map(|start| {
+                    std::time::Instant::now()
+                        .saturating_duration_since(*start)
+                        .as_secs()
+                }),
+                _ => None,
+            };
+            let mut body = msg.text.lines();
+            if let Some(line_text) = body.next() {
+                let mut spans = vec![Span::raw("  ")];
+                // WHICH agent did this. Only delegated work carries a
+                // name; the parent's own lines render byte-identical to
+                // before. The reference-mark math below measures the
+                // prefix width from these spans, so marks stay correct.
+                if let Some(agent) = tool_line_agent(kind) {
+                    spans.push(Span::styled(
+                        format!("{agent} "),
+                        Style::default().fg(t.dim),
+                    ));
+                }
+                spans.push(Span::styled(
+                    format!("{glyph} "),
+                    Style::default().fg(gcolor),
+                ));
+                let remainder = if let Some(evidence_class) = evidence_class {
+                    let token = evidence_token(evidence_class);
+                    spans.push(Span::styled(
+                        token.clone(),
+                        Style::default()
+                            .fg(evidence_color(evidence_class, t))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    line_text
+                        .strip_prefix(&token)
+                        .unwrap_or(line_text)
+                        .to_string()
+                } else {
+                    line_text.to_string()
+                };
+                if render_body_as_markdown {
+                    // This line carries the tool's own name — the most
+                    // pointed-at word on screen — so it gets the same
+                    // annotation as assistant prose. The regions come back
+                    // in the coordinates of the remainder alone, and shift
+                    // right by the width of the prefix spans ALREADY
+                    // pushed. That width is measured from those spans, not
+                    // counted from a format string: the glyph is one
+                    // column but three bytes, and the evidence badge
+                    // varies per class — a hand-kept count would drift the
+                    // day either changes and every mark would land on the
+                    // wrong word, silently.
+                    let prefix_cols = u16::try_from(spans.iter().map(Span::width).sum::<usize>())
+                        .unwrap_or(u16::MAX);
+                    let (annotated, refs) = crate::refs::annotate_references(
+                        vec![Line::from(Span::styled(remainder, style))],
+                        &app.references,
+                        t,
+                    );
+                    for r in &refs {
+                        marks.push((
+                            lines.len(),
+                            r.col_start.saturating_add(prefix_cols),
+                            r.col_end.saturating_add(prefix_cols),
+                            r.id.clone(),
+                        ));
+                    }
+                    for annotated_line in annotated {
+                        spans.extend(annotated_line.spans);
+                    }
+                } else {
+                    // A FAILED result stays red and its body stays
+                    // unannotated — the colour is the signal — but the
+                    // tool's NAME on this head line is still marked. The
+                    // name is not part of the error message: it is the
+                    // identity of the thing that failed, and a tool that
+                    // has ONLY ever failed is exactly the one a reader
+                    // most wants to interrogate. Without this, its
+                    // `tool://` entry (registered from every ToolResult,
+                    // failures included) had zero clickable cells
+                    // anywhere on screen.
+                    let failed_tool_mark = match kind {
+                        LineKind::ToolResult {
+                            success: false,
+                            tool_name,
+                            ..
+                        } => {
+                            let id = format!("tool://{tool_name}");
+                            (app.references.get(&id).is_some())
+                                .then(|| remainder.find(tool_name.as_str()))
+                                .flatten()
+                                .map(|at| (at, tool_name.len(), id))
+                        }
+                        _ => None,
+                    };
+                    if let Some((at, len, id)) = failed_tool_mark {
+                        // Same rule as the successful head line above:
+                        // the region shifts by the width of what is
+                        // actually drawn in front of it, measured from
+                        // the spans, never counted from a format string.
+                        let prefix_cols =
+                            u16::try_from(spans.iter().map(Span::width).sum::<usize>())
+                                .unwrap_or(u16::MAX);
+                        let head = remainder[..at].to_string();
+                        let name = remainder[at..at + len].to_string();
+                        let tail = remainder[at + len..].to_string();
+                        let head_w = u16::try_from(head.width()).unwrap_or(u16::MAX);
+                        let name_w = u16::try_from(name.width()).unwrap_or(u16::MAX);
+                        let col = prefix_cols.saturating_add(head_w);
+                        marks.push((lines.len(), col, col.saturating_add(name_w), id));
+                        spans.push(Span::styled(head, style));
+                        spans.push(Span::styled(name, crate::refs::mark_style(t)));
+                        spans.push(Span::styled(tail, style));
+                    } else {
+                        spans.push(Span::styled(remainder, style));
+                    }
+                }
+                // A running tool names its age here, so a stuck call and a
+                // fast one no longer look identical. Chrome, so it takes
+                // the dim of the progress line, not the reference colour.
+                //
+                // The age is drawn but is NOT part of the row's identity:
+                // the click highlight and the line cursor both find their
+                // row by the text drawn on it, so a row whose text ticked
+                // once a second threw the reader's cursor away — on the
+                // one row this timer exists to keep alive.
+                if let Some(secs) = running_secs {
+                    let age = format!(" · {secs} s");
+                    volatile.push((lines.len(), age.clone()));
+                    spans.push(Span::styled(age, Style::default().fg(t.dim)));
+                }
+                lines.push(Line::from(spans));
+            }
+            // ── Where the data came from, BEFORE the result body ────
+            // Every finished result gets the table: a row per source the
+            // tool named, each an openable reference, or one bold line
+            // saying the tool named none. A descriptor set gets its card
+            // under it, each value beside where it was computed from. A
+            // reader watching a live session must never have to wonder
+            // what they are looking at.
+            if let LineKind::ToolResult {
+                success: true,
+                tool_name,
+                evidence_class,
+                sources,
+                descriptors,
+                ..
+            } = kind
+            {
+                let indent = "    ";
+                let indent_cols = u16::try_from(indent.width()).unwrap_or(u16::MAX);
+                let width = transcript_content_width(width);
+                let bold = Style::default().fg(t.text).add_modifier(Modifier::BOLD);
+                if sources.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled(
+                            crate::sources::not_reported_line(tool_name),
+                            Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                } else {
+                    let badge = evidence_token(*evidence_class);
+                    let layout = crate::sources::layout(width, &badge);
+                    lines.push(Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled(crate::sources::header_line(layout), bold),
+                    ]));
+                    for row in sources {
+                        let (cell, rest) = crate::sources::row_cells(row, &badge, layout);
+                        let visible = cell.trim_end().to_string();
+                        let pad = " ".repeat(cell.len().saturating_sub(visible.len()));
+                        let end = indent_cols
+                            .saturating_add(u16::try_from(visible.width()).unwrap_or(u16::MAX));
+                        marks.push((lines.len(), indent_cols, end, row.id.clone()));
+                        lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(visible, crate::refs::mark_style(t)),
+                            Span::raw(pad),
+                            Span::styled(rest, Style::default().fg(t.text)),
+                        ]));
+                    }
+                    lines.push(Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled(
+                            crate::sources::reason_line(&badge, *evidence_class),
+                            Style::default().fg(evidence_color(*evidence_class, t)),
+                        ),
+                    ]));
+                }
+                if !descriptors.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled(crate::sources::descriptor_header(width), bold),
+                    ]));
+                    for row in descriptors {
+                        let style = if row.origin.is_some() {
+                            Style::default().fg(t.text)
+                        } else {
+                            Style::default().fg(t.warn).add_modifier(Modifier::BOLD)
+                        };
+                        for text in crate::sources::descriptor_lines(row, width) {
+                            lines.push(Line::from(vec![
+                                Span::raw(indent),
+                                Span::styled(text, style),
+                            ]));
+                        }
+                    }
+                }
+            }
+            let rest: Vec<&str> = body.collect();
+            if render_body_as_markdown && !rest.join("").trim().is_empty() {
+                // Width is reduced by the 4-column indent so a table sizes
+                // its columns to the room it will actually occupy.
+                //
+                // Annotated like assistant prose, and for a stronger
+                // reason: identities are BORN here. A structure's
+                // `cache://…` appears in the result that stored it long
+                // before any reply paraphrases it, so a result body that
+                // is not annotated leaves the reference system reachable
+                // only through prose that happens to repeat the id.
+                let (annotated, refs) = crate::refs::annotate_references(
+                    markdown::markdown_lines(
+                        &rest.join("\n"),
+                        t,
+                        u16::try_from(transcript_content_width(width)).unwrap_or(u16::MAX),
+                    ),
+                    &app.references,
+                    t,
+                );
+                for (n, md) in annotated.into_iter().enumerate() {
+                    let indent = Span::raw("    ");
+                    // Measured from the span itself, same rule as the head
+                    // line above: the region shifts by what is actually
+                    // drawn in front of it, nothing else.
+                    let indent_cols = u16::try_from(indent.width()).unwrap_or(u16::MAX);
+                    let mut spans = vec![indent];
+                    spans.extend(md.spans);
+                    for r in refs.iter().filter(|r| r.row == n) {
+                        marks.push((
+                            lines.len(),
+                            r.col_start.saturating_add(indent_cols),
+                            r.col_end.saturating_add(indent_cols),
+                            r.id.clone(),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                }
+            } else {
+                // Error BODIES are deliberately NOT annotated, for the
+                // same reason they are not markdown-rendered: the whole
+                // card is painted red so a failure reads as one, and a
+                // reference mark would repaint words of that message in
+                // the accent colour — trading the one signal the colour
+                // carries there (this failed) for a pointer. The tool's
+                // NAME is the exception, and it is marked on the HEAD
+                // line above, not here — so a tool that has only ever
+                // failed is still reachable without repainting a word of
+                // its error message.
+                for line_text in rest {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(line_text.to_string(), style),
+                    ]));
+                }
+            }
+            // Reserve room for each figure and remember where it goes. The
+            // rows are blank on purpose: the transcript is one wrapped
+            // `Paragraph`, so a picture cannot be a `Line`. It is painted
+            // over these rows afterwards, once the scroll offset is known.
+            if let LineKind::ToolResult { image_paths, .. } = kind {
+                for path in image_paths {
+                    figures.push((lines.len(), path.clone()));
+                    for _ in 0..FIGURE_ROWS {
+                        lines.push(Line::raw(""));
+                    }
+                }
+            }
+        }
+        // ── System: status lines, errors, approval records ──────
+        _ => {
+            let style = match &msg.kind {
+                LineKind::Error(..) => Style::default().fg(t.err),
+                LineKind::Approval { .. } => {
+                    Style::default().fg(t.approval).add_modifier(Modifier::BOLD)
+                }
+                _ => Style::default().fg(t.system),
+            };
+            for (i, line_text) in msg.text.lines().enumerate() {
+                let lead = if i == 0 {
+                    Span::styled("· ", Style::default().fg(t.system))
+                } else {
+                    Span::raw("  ")
+                };
+                lines.push(Line::from(vec![
+                    lead,
+                    Span::styled(line_text.to_string(), style),
+                ]));
+            }
+        }
+    }
+
+    // Blank line between turns; consecutive tool rows stay grouped.
+    Built::finish(
+        width,
+        lines,
+        user_header,
+        figures,
+        marks,
+        volatile,
+        false,
+        sets_shown,
+    )
+}
+
 fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     // The transcript's own focus mark. The footer tag is the first thing a
@@ -512,7 +1056,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
             t.dim
         })
         .add_modifier(Modifier::BOLD);
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let mut thinking_shown = false;
     // Index in `lines` of the newest `❯ You` header, for the scroll anchor.
     let mut last_user_line: Option<usize> = None;
@@ -528,470 +1072,63 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // Rows carrying text that changes on its own, as (index in `lines`, the
     // tail that changes) — today only a running tool's age. The identity a
     // row is FOUND by is stripped of it; the text it is QUOTED by is not.
-    let mut volatile_tails: Vec<(usize, String)> = Vec::new();
     // Reference marks: (index in `lines`, col_start, col_end, id). Screen rows
     // are resolved after the wrapped-row measurement below, the same way
     // figures and the anchor are.
     let mut reference_marks: Vec<(usize, u16, u16, String)> = Vec::new();
 
+    let width = area.width;
+    let mut cache = app.transcript_cache.borrow_mut();
+    cache.truncate(app.messages.len());
+    // Rows before each line: `prefix[i]` is the wrapped-row offset of line
+    // `i`, so placing lines on screen is arithmetic on counts measured once.
+    let mut prefix: Vec<u32> = vec![0];
     for (idx, msg) in app.messages.iter().enumerate() {
-        message_lines.push((lines.len(), idx));
-        // Thinking tokens: show collapsed indicator or full text
-        if matches!(msg.kind, LineKind::Thinking) {
-            if app.thinking_expanded {
-                // Show full thinking text, dimmed
-                for (i, line_text) in msg.text.lines().enumerate() {
-                    if i == 0 {
-                        lines.push(Line::from(vec![
-                            Span::styled("◇ ", Style::default().fg(t.system)),
-                            Span::styled(line_text.to_string(), Style::default().fg(t.dim)),
-                        ]));
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(line_text.to_string(), Style::default().fg(t.dim)),
-                        ]));
-                    }
-                }
-                if lines.last().is_some() {
-                    lines.push(Line::raw(""));
-                }
-            } else if !thinking_shown {
-                // Show a single collapsed indicator
-                let char_count = msg.text.chars().count();
-                lines.push(Line::from(vec![
-                    Span::styled("◇ ", Style::default().fg(t.system)),
-                    Span::styled(
-                        format!("[thinking… {} chars — Ctrl-T to expand]", char_count),
-                        Style::default().fg(t.dim),
-                    ),
-                ]));
-                thinking_shown = true;
-            }
-            continue;
+        let offset = lines.len();
+        message_lines.push((offset, idx));
+        let key = message_key(app, msg, width, thinking_shown);
+        let built = cache.get_or_build(idx, key, || {
+            build_message(app, t, gutter, width, msg, &mut thinking_shown)
+        });
+        if built.sets_thinking_shown {
+            thinking_shown = true;
         }
-
-        match (&msg.role, &msg.kind) {
-            // ── User turn: labeled header + colored gutter bar ──────
-            (Role::User, LineKind::Text) => {
-                // Recorded BEFORE the header is pushed, so the anchor lands on
-                // the header row itself rather than the first body row.
-                last_user_line = Some(lines.len());
-                lines.push(Line::from(vec![
-                    Span::styled("❯", gutter),
-                    Span::styled(
-                        " You",
-                        Style::default().fg(t.user).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                for line_text in msg.text.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled("▌ ", Style::default().fg(t.user)),
-                        Span::styled(line_text.to_string(), Style::default().fg(t.text)),
-                    ]));
-                }
-            }
-            // ── Assistant turn: labeled header + markdown body ──────
-            (Role::Assistant, LineKind::Text) => {
-                lines.push(Line::from(vec![
-                    Span::styled("◆", gutter),
-                    Span::styled(
-                        " PRISM",
-                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                // Mark the words backed by something openable. Coordinates
-                // come back in the coordinates of the ANNOTATED lines, so the
-                // two-space indent below is added to `col_start` rather than
-                // being present while matching — mixing those up would shift
-                // every region two cells left and hover the wrong word.
-                let (annotated, refs) = crate::refs::annotate_references(
-                    markdown::markdown_lines(&msg.text, t, area.width.saturating_sub(2)),
-                    &app.references,
-                    t,
-                );
-                for (n, md) in annotated.into_iter().enumerate() {
-                    let mut spans = vec![Span::raw("  ")];
-                    spans.extend(md.spans);
-                    // `lines.len()` is this line's index BEFORE the push, which
-                    // is what the wrapped-row measurement downstream keys on.
-                    for r in refs.iter().filter(|r| r.row == n) {
-                        reference_marks.push((
-                            lines.len(),
-                            r.col_start + 2,
-                            r.col_end + 2,
-                            r.id.clone(),
-                        ));
-                    }
-                    lines.push(Line::from(spans));
-                }
-            }
-            // ── Tool activity: indented + grouped under the turn ────
-            (Role::Tool, kind) => {
-                let (glyph, gcolor, style) = match kind {
-                    LineKind::ToolResult { success: false, .. } | LineKind::Error(..) => {
-                        ("✗", t.err, Style::default().fg(t.err))
-                    }
-                    // Tool RESULTS are content the user reads, not chrome:
-                    // they carry the numbers and citations the whole product
-                    // exists to produce, so they get `text` like any other
-                    // body copy. `dim` made the most substantive thing on
-                    // screen the hardest to read.
-                    LineKind::ToolResult { .. } => ("✓", t.ok, Style::default().fg(t.text)),
-                    // The "⚙ Running x" progress line IS chrome — it stays
-                    // secondary so the eye goes to the result, not the noise.
-                    _ => ("⚙", t.warn, Style::default().fg(t.dim)),
-                };
-                // Two different absences, so two levels. The OUTER `None`
-                // means "this line is not a tool result at all" and gets no
-                // badge. The INNER `None` means "it is a tool result and the
-                // tool said nothing about its grounding", which does get a
-                // badge — a muted `[unclassified]`, because an unmarked result
-                // reads as a verified one.
-                let evidence_class: Option<Option<EvidenceClass>> = match kind {
-                    LineKind::ToolResult { evidence_class, .. } => Some(*evidence_class),
-                    LineKind::Error(..) => Some(Some(EvidenceClass::Indeterminate)),
-                    _ => None,
-                };
-                // A finished RESULT is prose the reader studies, so its body
-                // goes through the SAME markdown renderer as PRISM's own
-                // replies. It never did: `markdown_lines` was called from
-                // exactly one place — the assistant branch a few lines above —
-                // so a table a tool emitted arrived as raw `|` pipes and `$x^2$`
-                // as literal dollar signs, while identical content written by
-                // PRISM rendered as a bordered, aligned table. Same bytes, two
-                // different qualities of display, decided by who said it.
-                //
-                // Progress and error lines are NOT routed through it: they are
-                // chrome, they carry their own colour (dim / red), and markdown
-                // styling would override the very distinction that keeps the
-                // eye on the result instead of the noise.
-                let render_body_as_markdown =
-                    matches!(kind, LineKind::ToolResult { success: true, .. });
-                // A ToolStart whose result has not landed is still running:
-                // its start Instant is held in `running_tools` under its
-                // call_id, so the head line can name how long it has run. The
-                // result arm removes the entry, so a finished tool's start row
-                // shows no stale clock and the result carries the final ms.
-                let running_secs = match kind {
-                    LineKind::ToolStart {
-                        call_id: Some(cid), ..
-                    } => app.running_tools.get(cid).map(|start| {
-                        std::time::Instant::now()
-                            .saturating_duration_since(*start)
-                            .as_secs()
-                    }),
-                    _ => None,
-                };
-                let mut body = msg.text.lines();
-                if let Some(line_text) = body.next() {
-                    let mut spans = vec![Span::raw("  ")];
-                    // WHICH agent did this. Only delegated work carries a
-                    // name; the parent's own lines render byte-identical to
-                    // before. The reference-mark math below measures the
-                    // prefix width from these spans, so marks stay correct.
-                    if let Some(agent) = tool_line_agent(kind) {
-                        spans.push(Span::styled(
-                            format!("{agent} "),
-                            Style::default().fg(t.dim),
-                        ));
-                    }
-                    spans.push(Span::styled(
-                        format!("{glyph} "),
-                        Style::default().fg(gcolor),
-                    ));
-                    let remainder = if let Some(evidence_class) = evidence_class {
-                        let token = evidence_token(evidence_class);
-                        spans.push(Span::styled(
-                            token.clone(),
-                            Style::default()
-                                .fg(evidence_color(evidence_class, t))
-                                .add_modifier(Modifier::BOLD),
-                        ));
-                        line_text
-                            .strip_prefix(&token)
-                            .unwrap_or(line_text)
-                            .to_string()
-                    } else {
-                        line_text.to_string()
-                    };
-                    if render_body_as_markdown {
-                        // This line carries the tool's own name — the most
-                        // pointed-at word on screen — so it gets the same
-                        // annotation as assistant prose. The regions come back
-                        // in the coordinates of the remainder alone, and shift
-                        // right by the width of the prefix spans ALREADY
-                        // pushed. That width is measured from those spans, not
-                        // counted from a format string: the glyph is one
-                        // column but three bytes, and the evidence badge
-                        // varies per class — a hand-kept count would drift the
-                        // day either changes and every mark would land on the
-                        // wrong word, silently.
-                        let prefix_cols =
-                            u16::try_from(spans.iter().map(Span::width).sum::<usize>())
-                                .unwrap_or(u16::MAX);
-                        let (annotated, refs) = crate::refs::annotate_references(
-                            vec![Line::from(Span::styled(remainder, style))],
-                            &app.references,
-                            t,
-                        );
-                        for r in &refs {
-                            reference_marks.push((
-                                lines.len(),
-                                r.col_start.saturating_add(prefix_cols),
-                                r.col_end.saturating_add(prefix_cols),
-                                r.id.clone(),
-                            ));
-                        }
-                        for annotated_line in annotated {
-                            spans.extend(annotated_line.spans);
-                        }
-                    } else {
-                        // A FAILED result stays red and its body stays
-                        // unannotated — the colour is the signal — but the
-                        // tool's NAME on this head line is still marked. The
-                        // name is not part of the error message: it is the
-                        // identity of the thing that failed, and a tool that
-                        // has ONLY ever failed is exactly the one a reader
-                        // most wants to interrogate. Without this, its
-                        // `tool://` entry (registered from every ToolResult,
-                        // failures included) had zero clickable cells
-                        // anywhere on screen.
-                        let failed_tool_mark = match kind {
-                            LineKind::ToolResult {
-                                success: false,
-                                tool_name,
-                                ..
-                            } => {
-                                let id = format!("tool://{tool_name}");
-                                (app.references.get(&id).is_some())
-                                    .then(|| remainder.find(tool_name.as_str()))
-                                    .flatten()
-                                    .map(|at| (at, tool_name.len(), id))
-                            }
-                            _ => None,
-                        };
-                        if let Some((at, len, id)) = failed_tool_mark {
-                            // Same rule as the successful head line above:
-                            // the region shifts by the width of what is
-                            // actually drawn in front of it, measured from
-                            // the spans, never counted from a format string.
-                            let prefix_cols =
-                                u16::try_from(spans.iter().map(Span::width).sum::<usize>())
-                                    .unwrap_or(u16::MAX);
-                            let head = remainder[..at].to_string();
-                            let name = remainder[at..at + len].to_string();
-                            let tail = remainder[at + len..].to_string();
-                            let head_w = u16::try_from(head.width()).unwrap_or(u16::MAX);
-                            let name_w = u16::try_from(name.width()).unwrap_or(u16::MAX);
-                            let col = prefix_cols.saturating_add(head_w);
-                            reference_marks.push((
-                                lines.len(),
-                                col,
-                                col.saturating_add(name_w),
-                                id,
-                            ));
-                            spans.push(Span::styled(head, style));
-                            spans.push(Span::styled(name, crate::refs::mark_style(t)));
-                            spans.push(Span::styled(tail, style));
-                        } else {
-                            spans.push(Span::styled(remainder, style));
-                        }
-                    }
-                    // A running tool names its age here, so a stuck call and a
-                    // fast one no longer look identical. Chrome, so it takes
-                    // the dim of the progress line, not the reference colour.
-                    //
-                    // The age is drawn but is NOT part of the row's identity:
-                    // the click highlight and the line cursor both find their
-                    // row by the text drawn on it, so a row whose text ticked
-                    // once a second threw the reader's cursor away — on the
-                    // one row this timer exists to keep alive.
-                    if let Some(secs) = running_secs {
-                        let age = format!(" · {secs} s");
-                        volatile_tails.push((lines.len(), age.clone()));
-                        spans.push(Span::styled(age, Style::default().fg(t.dim)));
-                    }
-                    lines.push(Line::from(spans));
-                }
-                // ── Where the data came from, BEFORE the result body ────
-                // Every finished result gets the table: a row per source the
-                // tool named, each an openable reference, or one bold line
-                // saying the tool named none. A descriptor set gets its card
-                // under it, each value beside where it was computed from. A
-                // reader watching a live session must never have to wonder
-                // what they are looking at.
-                if let LineKind::ToolResult {
-                    success: true,
-                    tool_name,
-                    evidence_class,
-                    sources,
-                    descriptors,
-                    ..
-                } = kind
-                {
-                    let indent = "    ";
-                    let indent_cols = u16::try_from(indent.width()).unwrap_or(u16::MAX);
-                    let width = transcript_content_width(area.width);
-                    let bold = Style::default().fg(t.text).add_modifier(Modifier::BOLD);
-                    if sources.is_empty() {
-                        lines.push(Line::from(vec![
-                            Span::raw(indent),
-                            Span::styled(
-                                crate::sources::not_reported_line(tool_name),
-                                Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    } else {
-                        let badge = evidence_token(*evidence_class);
-                        let layout = crate::sources::layout(width, &badge);
-                        lines.push(Line::from(vec![
-                            Span::raw(indent),
-                            Span::styled(crate::sources::header_line(layout), bold),
-                        ]));
-                        for row in sources {
-                            let (cell, rest) = crate::sources::row_cells(row, &badge, layout);
-                            let visible = cell.trim_end().to_string();
-                            let pad = " ".repeat(cell.len().saturating_sub(visible.len()));
-                            let end = indent_cols
-                                .saturating_add(u16::try_from(visible.width()).unwrap_or(u16::MAX));
-                            reference_marks.push((lines.len(), indent_cols, end, row.id.clone()));
-                            lines.push(Line::from(vec![
-                                Span::raw(indent),
-                                Span::styled(visible, crate::refs::mark_style(t)),
-                                Span::raw(pad),
-                                Span::styled(rest, Style::default().fg(t.text)),
-                            ]));
-                        }
-                        lines.push(Line::from(vec![
-                            Span::raw(indent),
-                            Span::styled(
-                                crate::sources::reason_line(&badge, *evidence_class),
-                                Style::default().fg(evidence_color(*evidence_class, t)),
-                            ),
-                        ]));
-                    }
-                    if !descriptors.is_empty() {
-                        lines.push(Line::from(vec![
-                            Span::raw(indent),
-                            Span::styled(crate::sources::descriptor_header(width), bold),
-                        ]));
-                        for row in descriptors {
-                            let style = if row.origin.is_some() {
-                                Style::default().fg(t.text)
-                            } else {
-                                Style::default().fg(t.warn).add_modifier(Modifier::BOLD)
-                            };
-                            for text in crate::sources::descriptor_lines(row, width) {
-                                lines.push(Line::from(vec![
-                                    Span::raw(indent),
-                                    Span::styled(text, style),
-                                ]));
-                            }
-                        }
-                    }
-                }
-                let rest: Vec<&str> = body.collect();
-                if render_body_as_markdown && !rest.join("").trim().is_empty() {
-                    // Width is reduced by the 4-column indent so a table sizes
-                    // its columns to the room it will actually occupy.
-                    //
-                    // Annotated like assistant prose, and for a stronger
-                    // reason: identities are BORN here. A structure's
-                    // `cache://…` appears in the result that stored it long
-                    // before any reply paraphrases it, so a result body that
-                    // is not annotated leaves the reference system reachable
-                    // only through prose that happens to repeat the id.
-                    let (annotated, refs) = crate::refs::annotate_references(
-                        markdown::markdown_lines(
-                            &rest.join("\n"),
-                            t,
-                            u16::try_from(transcript_content_width(area.width)).unwrap_or(u16::MAX),
-                        ),
-                        &app.references,
-                        t,
-                    );
-                    for (n, md) in annotated.into_iter().enumerate() {
-                        let indent = Span::raw("    ");
-                        // Measured from the span itself, same rule as the head
-                        // line above: the region shifts by what is actually
-                        // drawn in front of it, nothing else.
-                        let indent_cols = u16::try_from(indent.width()).unwrap_or(u16::MAX);
-                        let mut spans = vec![indent];
-                        spans.extend(md.spans);
-                        for r in refs.iter().filter(|r| r.row == n) {
-                            reference_marks.push((
-                                lines.len(),
-                                r.col_start.saturating_add(indent_cols),
-                                r.col_end.saturating_add(indent_cols),
-                                r.id.clone(),
-                            ));
-                        }
-                        lines.push(Line::from(spans));
-                    }
-                } else {
-                    // Error BODIES are deliberately NOT annotated, for the
-                    // same reason they are not markdown-rendered: the whole
-                    // card is painted red so a failure reads as one, and a
-                    // reference mark would repaint words of that message in
-                    // the accent colour — trading the one signal the colour
-                    // carries there (this failed) for a pointer. The tool's
-                    // NAME is the exception, and it is marked on the HEAD
-                    // line above, not here — so a tool that has only ever
-                    // failed is still reachable without repainting a word of
-                    // its error message.
-                    for line_text in rest {
-                        lines.push(Line::from(vec![
-                            Span::raw("    "),
-                            Span::styled(line_text.to_string(), style),
-                        ]));
-                    }
-                }
-                // Reserve room for each figure and remember where it goes. The
-                // rows are blank on purpose: the transcript is one wrapped
-                // `Paragraph`, so a picture cannot be a `Line`. It is painted
-                // over these rows afterwards, once the scroll offset is known.
-                if let LineKind::ToolResult { image_paths, .. } = kind {
-                    for path in image_paths {
-                        inline_figures.push((lines.len(), path.clone()));
-                        for _ in 0..FIGURE_ROWS {
-                            lines.push(Line::raw(""));
-                        }
-                    }
-                }
-            }
-            // ── System: status lines, errors, approval records ──────
-            _ => {
-                let style = match &msg.kind {
-                    LineKind::Error(..) => Style::default().fg(t.err),
-                    LineKind::Approval { .. } => {
-                        Style::default().fg(t.approval).add_modifier(Modifier::BOLD)
-                    }
-                    _ => Style::default().fg(t.system),
-                };
-                for (i, line_text) in msg.text.lines().enumerate() {
-                    let lead = if i == 0 {
-                        Span::styled("· ", Style::default().fg(t.system))
-                    } else {
-                        Span::raw("  ")
-                    };
-                    lines.push(Line::from(vec![
-                        lead,
-                        Span::styled(line_text.to_string(), style),
-                    ]));
-                }
-            }
+        lines.extend(built.lines.iter().cloned());
+        for rows in &built.rows {
+            prefix.push(prefix.last().copied().unwrap_or(0) + u32::from(*rows));
         }
-
-        // Blank line between turns; consecutive tool rows stay grouped.
+        if let Some(header) = built.user_header {
+            last_user_line = Some(offset + header);
+        }
+        inline_figures.extend(
+            built
+                .figures
+                .iter()
+                .map(|(line, path)| (offset + line, path.clone())),
+        );
+        reference_marks.extend(
+            built
+                .refs
+                .iter()
+                .map(|(line, start, end, id)| (offset + line, *start, *end, id.clone())),
+        );
+        line_rows.extend(
+            built
+                .texts
+                .iter()
+                .map(|(line, text, identity)| (offset + line, idx, text.clone(), identity.clone())),
+        );
         let next_is_tool = app
             .messages
             .get(idx + 1)
             .is_some_and(|m| matches!(m.role, Role::Tool));
-        if !(matches!(msg.role, Role::Tool) && next_is_tool) {
+        let glued_to_next_tool = matches!(msg.role, Role::Tool) && next_is_tool;
+        if !(built.is_thinking || glued_to_next_tool) {
             lines.push(Line::raw(""));
+            prefix.push(prefix.last().copied().unwrap_or(0) + 1);
         }
     }
+    drop(cache);
 
     // If waiting and no tokens yet, show a loading spinner
     if app.is_waiting && app.first_token_time.is_none() {
@@ -1096,30 +1233,6 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // drawn on it. Done here rather than inside each match arm so it covers
     // ALL of them — prose, tool cards, thinking, errors — without eighteen
     // call sites that can drift apart.
-    for (n, (first, idx)) in message_lines.iter().enumerate() {
-        let end = message_lines
-            .get(n + 1)
-            .map(|(next, _)| *next)
-            .unwrap_or(lines.len());
-        for (offset, line) in lines[*first..end].iter().enumerate() {
-            let text: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
-            if text.trim().is_empty() {
-                continue;
-            }
-            // Two strings per row, because they answer two questions. `text`
-            // is what was on screen — what `e` quotes back, byte for byte.
-            // The identity is what the row is FOUND by, and it must hold
-            // still while the row is on screen, so anything that redraws
-            // itself (a running tool's age) is cut off the end of it.
-            let at = first + offset;
-            let identity = volatile_tails
-                .iter()
-                .find(|(row, _)| *row == at)
-                .and_then(|(_, tail)| text.strip_suffix(tail.as_str()))
-                .map_or_else(|| text.clone(), str::to_string);
-            line_rows.push((at, *idx, text, identity));
-        }
-    }
 
     let viewport = area.height;
     // Where the newest user turn sits, in WRAPPED rows — the same unit
@@ -1144,52 +1257,25 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // Message starts join the same pass. Adding marks costs almost nothing:
     // the chunks are disjoint, so cloning them all sums to one clone of the
     // whole transcript however finely it is cut.
-    let mut marks: Vec<usize> = inline_figures.iter().map(|(idx, _)| *idx).collect();
-    marks.extend(message_lines.iter().map(|(line, _)| *line));
-    // Reference lines must be measured too. Without this `rows_for` misses
-    // them and falls through to its `unwrap_or(0)`, putting every reference
-    // region on row 0 — the mark still PAINTS in the right place, so the word
-    // looks correct while its hit region sits at the top of the transcript and
-    // hovering the word does nothing.
-    marks.extend(reference_marks.iter().map(|(line, ..)| *line));
-    marks.extend(line_rows.iter().map(|(line, ..)| *line));
+    // Lines added after the loop (spinner, lanes) are measured here, once.
+    for line in &lines[prefix.len() - 1..] {
+        let rows = Paragraph::new(vec![line.clone()])
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .min(usize::from(u16::MAX)) as u32;
+        prefix.push(prefix.last().copied().unwrap_or(0) + rows);
+    }
     let anchor_idx = if app.anchor_user_turn.get() {
         last_user_line
     } else {
         None
     };
-    if let Some(idx) = anchor_idx {
-        marks.push(idx);
-    }
-    for m in &mut marks {
-        *m = (*m).min(lines.len());
-    }
-    marks.sort_unstable();
-    marks.dedup();
-
-    let measure = |chunk: &[Line<'_>]| -> u32 {
-        Paragraph::new(chunk.to_vec())
-            .wrap(Wrap { trim: false })
-            .line_count(area.width) as u32
-    };
-    let mut rows_at: Vec<(usize, u32)> = Vec::with_capacity(marks.len());
-    let mut acc: u32 = 0;
-    let mut prev = 0usize;
-    for idx in marks {
-        if idx > prev {
-            acc = acc.saturating_add(measure(&lines[prev..idx]));
-            prev = idx;
-        }
-        rows_at.push((idx, acc));
-    }
     let line_count = lines.len();
-    let rows_for = |idx: usize| -> u16 {
-        let idx = idx.min(line_count);
-        rows_at
-            .iter()
-            .find(|(at, _)| *at == idx)
-            .map(|(_, rows)| (*rows).min(u16::MAX as u32) as u16)
-            .unwrap_or(0)
+    let rows_for =
+        |idx: usize| -> u16 { prefix[idx.min(line_count)].min(u32::from(u16::MAX)) as u16 };
+    let rows_of = |idx: usize| -> u16 {
+        (prefix[(idx + 1).min(line_count)] - prefix[idx.min(line_count)]).min(u32::from(u16::MAX))
+            as u16
     };
     // Where each message starts, in wrapped rows — what a story box or a
     // reference jumps to. Measured here, once per frame, from the same
@@ -1205,7 +1291,6 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let anchor_rows = anchor_idx.map(rows_for);
     // The tail is only measured when the pass above already ran; with no marks
     // the paragraph measures itself below without cloning anything.
-    let tail_rows = (prev > 0).then(|| acc.saturating_add(measure(&lines[prev..])));
 
     // Prepare each marked line for wrap-aware hit-region resolution, while
     // `lines` is still ours to borrow — the paragraph takes ownership below.
@@ -1223,7 +1308,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                 line,
                 probe: probe_line(&lines[line], cols),
                 ids: std::mem::take(ids),
-                rows: measure(&lines[line..line + 1]).min(u32::from(u16::MAX)) as u16,
+                rows: rows_of(line),
             });
             cols.clear();
         };
@@ -1299,9 +1384,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let paragraph = Paragraph::new(lines)
         .style(Style::default().bg(t.overlay_bg))
         .wrap(Wrap { trim: false });
-    let content_lines = tail_rows
-        .unwrap_or_else(|| paragraph.line_count(area.width) as u32)
-        .min(u16::MAX as u32) as u16;
+    let content_lines = rows_for(line_count);
     let max_scroll = content_lines.saturating_sub(viewport);
     app.view_max_scroll.set(max_scroll);
     let effective_scroll = if anchor_rows.is_some() || app.auto_scroll {
@@ -7067,6 +7150,60 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Live complaint 2026-09-06: "after PRISM has run for a while it becomes
+    /// too slow to scroll." Every frame rebuilt every transcript line and
+    /// re-wrapped the whole paragraph to count rows, at ten frames a second
+    /// even idle, so cost grew with the session. A second draw of an unchanged
+    /// transcript must reuse what the first one built, and appending one
+    /// message must rebuild only that message.
+    #[test]
+    fn an_unchanged_transcript_is_not_rebuilt_on_the_next_frame() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        for i in 0..400 {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            let text = (0..20)
+                .map(|k| format!("line {k} of message {i}: some prose about nickel alloys"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            app.messages.push(ChatLine {
+                role,
+                text,
+                kind: LineKind::Text,
+            });
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let built_first = app.transcript_cache.borrow().lines_built();
+        assert!(built_first > 0, "the first frame must build lines");
+
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let built_second = app.transcript_cache.borrow().lines_built() - built_first;
+        assert!(
+            built_second * 20 < built_first,
+            "second frame rebuilt {built_second} of {built_first} lines; the cache is not caching"
+        );
+
+        app.messages.push(ChatLine {
+            role: Role::Assistant,
+            text: "one more".into(),
+            kind: LineKind::Text,
+        });
+        let before = app.transcript_cache.borrow().lines_built();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let built_third = app.transcript_cache.borrow().lines_built() - before;
+        assert!(
+            built_third < 40,
+            "appending one message rebuilt {built_third} lines; invalidation is too broad"
+        );
+    }
 
     #[test]
     fn wrapping_prefers_a_space_and_never_hides_content() {

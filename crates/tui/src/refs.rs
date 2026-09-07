@@ -81,12 +81,16 @@ pub struct ReferenceRegistry {
     /// still abbreviate to the same word — the re-registered entry would
     /// steal it back.
     contested: std::collections::BTreeSet<String>,
+    /// Bumped on every insert, so a cache keyed on it refreshes exactly when
+    /// annotation could change.
+    generation: u64,
 }
 
 impl ReferenceRegistry {
     /// Add or replace an entry. Re-inserting the same id replaces it, because
     /// a re-run of the same tool describes the same thing more recently.
     pub fn insert(&mut self, entry: ReferenceEntry) {
+        self.generation += 1;
         for token in &entry.tokens {
             if !token.is_empty()
                 && self
@@ -116,6 +120,11 @@ impl ReferenceRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 

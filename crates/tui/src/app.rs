@@ -992,6 +992,9 @@ pub struct App {
     /// Wrapped transcript row at which each message starts, as measured by
     /// the last frame (`(row, message index)`); what a jump scrolls to.
     pub message_rows: std::cell::RefCell<Vec<(u16, usize)>>,
+    /// Built transcript lines per message, reused across frames until the
+    /// message, the width, the theme or the references change.
+    pub transcript_cache: std::cell::RefCell<crate::transcript_cache::TranscriptCache>,
     pub workspace_expanded: bool,
     /// Domain objects (structures, alloys, simulations, …) shown in the
     /// Objects tab. Upserted by `id` from `ui.object.update` notifications.
@@ -1282,6 +1285,7 @@ impl App {
             story: Vec::new(),
             call_index: std::collections::HashMap::new(),
             message_rows: std::cell::RefCell::new(Vec::new()),
+            transcript_cache: std::cell::RefCell::new(Default::default()),
             workspace_selected: 0,
             workspace_expanded: false,
             objects: Vec::new(),

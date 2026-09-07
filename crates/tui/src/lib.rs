@@ -61,6 +61,7 @@ pub mod structure_view;
 pub mod structures;
 pub mod theme;
 pub mod toast;
+pub mod transcript_cache;
 
 use anyhow::Result;
 use crossterm::{
